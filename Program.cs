@@ -35,18 +35,31 @@ AppConfigFile appConfig = configLoad.Config;
 string configPath = configLoad.ConfigPath;
 bool configFileExisted = configLoad.ConfigFileExisted;
 LlmRuntimeConfig llmConfig = AppConfigStore.ResolveLlm(appConfig);
+HunyuanRuntimeConfig hunyuanConfig = AppConfigStore.ResolveHunyuan(appConfig);
 OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromAppConfig(appConfig);
 
 // ocr.mode=llm needs a usable LLM; otherwise fall back to local with a clear warning.
+// ForceMode does not re-read MINIOCR_OCR_MODE, so an unusable env mode can actually fall back.
 if (runtimeConfig.IsLlmMode && !llmConfig.IsUsable)
 {
     bootstrapLogger.LogWarning(
         "ocr.mode=llm but LLM is not usable (need llm.enabled + apiKey + baseUrl + model); falling back to local Paddle OCR");
-    runtimeConfig = runtimeConfig.WithMode("local");
+    runtimeConfig = runtimeConfig.ForceMode("local");
+}
+else if (runtimeConfig.IsHunyuanMode && !hunyuanConfig.IsUsable)
+{
+    bootstrapLogger.LogWarning(
+        "ocr.mode=hunyuan but Hunyuan client is not usable (need hunyuan.enabled + baseUrl + model); falling back to local Paddle OCR");
+    runtimeConfig = runtimeConfig.ForceMode("local");
 }
 
 string apiKeyStatus = string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)";
+string hunyuanKeyStatus = string.IsNullOrEmpty(hunyuanConfig.ApiKey) ? "(empty)" : "(set)";
 bool llmOcrMode = runtimeConfig.IsLlmMode;
+bool hunyuanOcrMode = runtimeConfig.IsHunyuanMode;
+string hunyuanPromptPreview = hunyuanConfig.Prompt.Length <= 80
+    ? hunyuanConfig.Prompt
+    : hunyuanConfig.Prompt[..80] + "…";
 
 Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
 Console.WriteLine($"OS: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
@@ -64,11 +77,27 @@ Console.WriteLine(
     $"maxConcurrency={llmConfig.MaxConcurrency}, maxCharsPerRequest={llmConfig.MaxCharsPerRequest}, " +
     $"ocrConcurrency={llmConfig.OcrConcurrency}, ocrJpegQuality={llmConfig.OcrJpegQuality}, " +
     $"thinking={llmConfig.Thinking}, fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
+Console.WriteLine(
+    $"Hunyuan: enabled={hunyuanConfig.Enabled}, usable={hunyuanConfig.IsUsable}, " +
+    $"model={hunyuanConfig.Model}, baseUrl={hunyuanConfig.BaseUrl}, " +
+    $"concurrency={hunyuanConfig.Concurrency}, jpegQuality={hunyuanConfig.JpegQuality}, " +
+    $"maxTokens={hunyuanConfig.MaxTokens}, timeoutSeconds={hunyuanConfig.TimeoutSeconds}, " +
+    $"apiKey={hunyuanKeyStatus}, prompt={hunyuanPromptPreview}");
+
+if (hunyuanOcrMode && !llmConfig.IsUsable && !llmConfig.FallbackToHeuristics)
+{
+    bootstrapLogger.LogWarning(
+        "ocr.mode=hunyuan returns page text only. B04/B06 stay empty unless llm NER is usable or llm.fallbackToHeuristics=true.");
+}
 
 OcrEngine? engine = null;
 if (llmOcrMode)
 {
     Console.WriteLine("Skipping ChineseV6Tiny / PaddleOcrAll — ocr.mode=llm (vision OCR).");
+}
+else if (hunyuanOcrMode)
+{
+    Console.WriteLine("Skipping ChineseV6Tiny / PaddleOcrAll — ocr.mode=hunyuan (local HunyuanOCR server).");
 }
 else
 {
@@ -80,6 +109,7 @@ else
 
 builder.Services.AddSingleton(runtimeConfig);
 builder.Services.AddSingleton(llmConfig);
+builder.Services.AddSingleton(hunyuanConfig);
 if (engine is not null)
     builder.Services.AddSingleton(engine);
 
@@ -115,6 +145,22 @@ builder.Services.AddSingleton<LlmVisionOcr>(sp =>
         sp.GetRequiredService<ILogger<LlmVisionOcr>>());
 });
 
+builder.Services.AddHttpClient(nameof(HunyuanVisionOcr), (sp, client) =>
+{
+    HunyuanRuntimeConfig cfg = sp.GetRequiredService<HunyuanRuntimeConfig>();
+    client.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("MiniOcr/1.0 (+HunyuanOCR)");
+});
+builder.Services.AddSingleton<HunyuanVisionOcr>(sp =>
+{
+    IHttpClientFactory factory = sp.GetRequiredService<IHttpClientFactory>();
+    HttpClient http = factory.CreateClient(nameof(HunyuanVisionOcr));
+    return new HunyuanVisionOcr(
+        http,
+        sp.GetRequiredService<HunyuanRuntimeConfig>(),
+        sp.GetRequiredService<ILogger<HunyuanVisionOcr>>());
+});
+
 builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
 {
     OcrRuntimeConfig cfg = sp.GetRequiredService<OcrRuntimeConfig>();
@@ -123,7 +169,8 @@ builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
         sp.GetRequiredService<ILogger<PdfOcrPipeline>>(),
         engine: sp.GetService<OcrEngine>(),
         llm: sp.GetService<LlmEntityExtractor>(),
-        vision: sp.GetService<LlmVisionOcr>());
+        vision: sp.GetService<LlmVisionOcr>(),
+        hunyuan: sp.GetService<HunyuanVisionOcr>());
 });
 builder.Services.AddSingleton<ChallengeJobService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChallengeJobService>());
@@ -170,6 +217,11 @@ app.MapGet("/health", (IServiceProvider sp) =>
             LlmBaseUrl = llm.BaseUrl,
             LlmFallbackToHeuristics = llm.FallbackToHeuristics,
             LlmApiKey = apiKeyStatus,
+            HunyuanUsable = hunyuanConfig.IsUsable,
+            HunyuanModel = hunyuanConfig.Model,
+            HunyuanBaseUrl = hunyuanConfig.BaseUrl,
+            HunyuanConcurrency = hunyuanConfig.Concurrency,
+            HunyuanApiKey = hunyuanKeyStatus,
         },
         AppJsonContext.Default.HealthResponse);
 });
@@ -382,8 +434,20 @@ app.MapPost("/ocr", async Task<IResult> (
         {
             string fileId = file.FileId ?? "f1";
             string url = file.Url!;
-            ParallelPdfDownloader.DownloadResult download =
-                await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+            ParallelPdfDownloader.DownloadResult download;
+            try
+            {
+                download = await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+            }
+            catch (HttpRequestException ex)
+            {
+                logger.LogWarning(ex, "Debug /ocr download failed");
+                return Results.Json(
+                    new ChallengeAckResponse { Ok = false, Error = "Failed to download PDF: " + ex.Message },
+                    AppJsonContext.Default.ChallengeAckResponse,
+                    statusCode: StatusCodes.Status502BadGateway);
+            }
+
             using (download.Buffer)
             {
                 OcrResponse ocr = await pipeline
@@ -402,9 +466,9 @@ app.MapPost("/ocr", async Task<IResult> (
     }
     catch (HttpRequestException ex)
     {
-        logger.LogWarning(ex, "Debug /ocr download failed");
+        logger.LogWarning(ex, "Debug /ocr upstream HTTP failed");
         return Results.Json(
-            new ChallengeAckResponse { Ok = false, Error = "Failed to download PDF: " + ex.Message },
+            new ChallengeAckResponse { Ok = false, Error = "OCR request failed: " + ex.Message },
             AppJsonContext.Default.ChallengeAckResponse,
             statusCode: StatusCodes.Status502BadGateway);
     }
@@ -443,15 +507,17 @@ app.MapGet("/", () => Results.Text(
     "  or legacy {\"url\":\"https://.../file.pdf\"} / ?dpi=96\n" +
     "GET  /health\n" +
     $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} " +
-    $"ocr.mode={runtimeConfig.Mode} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
+    $"ocr.mode={runtimeConfig.Mode} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus} " +
+    $"hunyuan.usable={hunyuanConfig.IsUsable} hunyuanModel={hunyuanConfig.Model}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
-    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n",
+    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
+    "Env HUNYUAN: MINIOCR_HUNYUAN_BASE_URL MINIOCR_HUNYUAN_API_KEY MINIOCR_HUNYUAN_MODEL MINIOCR_HUNYUAN_CONCURRENCY MINIOCR_HUNYUAN_JPEG_QUALITY MINIOCR_HUNYUAN_MAX_TOKENS MINIOCR_HUNYUAN_PROMPT MINIOCR_HUNYUAN_TIMEOUT MINIOCR_HUNYUAN_ENABLED\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));
 logger.LogInformation(
-    "MiniOcr ready — mode={Mode}, ProcessorCount={Cores}, engines={Engines}, lineWorkers={LineWorkers}, det={Det}, raster={Raster}, dpi={Dpi}, useCls={UseCls}, llmUsable={Llm}, ocrConcurrency={OcrConc}, listening={Urls}",
+    "MiniOcr ready — mode={Mode}, ProcessorCount={Cores}, engines={Engines}, lineWorkers={LineWorkers}, det={Det}, raster={Raster}, dpi={Dpi}, useCls={UseCls}, llmUsable={Llm}, ocrConcurrency={OcrConc}, hunyuanUsable={Hunyuan}, hunyuanConcurrency={HyConc}, listening={Urls}",
     runtimeConfig.Mode,
     runtimeConfig.ProcessorCount,
     engine?.EngineCount ?? 0,
@@ -462,6 +528,8 @@ logger.LogInformation(
     runtimeConfig.UseDirectionClassification,
     llmConfig.IsUsable,
     llmConfig.OcrConcurrency,
+    hunyuanConfig.IsUsable,
+    hunyuanConfig.Concurrency,
     urls);
 
 await app.RunAsync();

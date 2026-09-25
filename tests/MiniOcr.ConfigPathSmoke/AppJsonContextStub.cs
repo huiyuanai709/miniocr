@@ -9,4 +9,11 @@ namespace MiniOcr;
 [JsonSerializable(typeof(AppConfigFile))]
 [JsonSerializable(typeof(LlmFileConfig))]
 [JsonSerializable(typeof(OcrFileConfig))]
+[JsonSerializable(typeof(HunyuanFileConfig))]
+[JsonSerializable(typeof(HunyuanChatCompletionRequest))]
+[JsonSerializable(typeof(HunyuanChatMessage))]
+[JsonSerializable(typeof(HunyuanContentPart))]
+[JsonSerializable(typeof(HunyuanImageUrl))]
+[JsonSerializable(typeof(List<HunyuanChatMessage>))]
+[JsonSerializable(typeof(List<HunyuanContentPart>))]
 internal partial class AppJsonContext : JsonSerializerContext;
