@@ -8,6 +8,7 @@
 
 - **`local`（默认）**：本地 PP-OCRv6 **ChineseV6Tiny**；实体抽取优先 OpenAI 兼容 LLM NER，可回退启发式。
 - **`llm`**：跳过本地 Paddle 模型加载；将每页 JPEG 以 `image_url` data URL 发给多模态 Chat Completions，一次调用尽量直接返回竞赛形状的 B04/B06 `ruleList`（可配高并发，I/O 密集）。
+- **`hunyuan`**：同样跳过 Paddle。把每页彩色 JPEG 发给**本机**已启动的 [HunyuanOCR](https://huggingface.co/tencent/HunyuanOCR) OpenAI 兼容服务（vLLM 或 llama.cpp `llama-server`），使用官方文档解析提示词。页文本出来后，B04/B06 仍走与 `local` 相同的 NER。不是进程内引擎，也**达不到** 2000 页 / 5 分钟（见下方专节）。
 
 ## 竞赛协议（serviceUrl）
 
@@ -250,21 +251,34 @@ cd artifacts/linux-x64-singlefile
     "rasterWorkers": null,
     "useCls": false,
     "autoScaleFromCpu": true
+  },
+  "hunyuan": {
+    "enabled": true,
+    "baseUrl": "http://127.0.0.1:8000",
+    "apiKey": "",
+    "model": "tencent/HunyuanOCR",
+    "timeoutSeconds": 180,
+    "concurrency": 2,
+    "jpegQuality": 85,
+    "maxTokens": 8000,
+    "prompt": ""
   }
 }
 ```
 
 **优先级：**
 
-- OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`。
+- OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`（`local` / `llm` / `hunyuan`）。
 - LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_OCR_CONCURRENCY` / `MINIOCR_LLM_OCR_JPEG_QUALITY` / `MINIOCR_LLM_THINKING` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
+- Hunyuan：`MINIOCR_HUNYUAN_BASE_URL` / `MINIOCR_HUNYUAN_API_KEY` / `MINIOCR_HUNYUAN_MODEL` / `MINIOCR_HUNYUAN_CONCURRENCY` / `MINIOCR_HUNYUAN_JPEG_QUALITY` / `MINIOCR_HUNYUAN_MAX_TOKENS` / `MINIOCR_HUNYUAN_PROMPT` / `MINIOCR_HUNYUAN_TIMEOUT` / `MINIOCR_HUNYUAN_ENABLED` 覆盖 `hunyuan` 段。同样不打印 apiKey。
 
-#### OCR 模式：`local` vs `llm`（视觉 OCR）
+#### OCR 模式：`local` / `llm` / `hunyuan`
 
 | `ocr.mode` | 行为 | 何时用 |
 | --- | --- | --- |
-| `local`（默认） | 加载 ChineseV6Tiny / `PaddleOcrAll`；栅格后本地 OCR；可选 LLM **文本** NER | 离线、控成本、低延迟本机推理 |
+| `local`（默认） | 加载 ChineseV6Tiny / `PaddleOcrAll`；栅格后本地 OCR；可选 LLM **文本** NER | 离线、控成本、低延迟本机推理；竞赛时延主路径 |
 | `llm` | **不加载**本地 Paddle 模型（更快启动、更省 RAM）；栅格→JPEG→多模态 Chat Completions（与视觉 **流水线重叠**） | 有视觉模型配额、希望直接出 B04/B06 |
+| `hunyuan` | **不加载** Paddle；彩色栅格→JPEG→本机 HunyuanOCR 服务（官方文档解析提示词）→ 与 `local` 相同的文本 NER | 要 HunyuanOCR 的版面/正文质量，且另有 GPU 或能接受很慢的 CPU |
 
 设置方式：
 
@@ -272,7 +286,7 @@ cd artifacts/linux-x64-singlefile
 "ocr": { "mode": "llm" }
 ```
 
-或：`export MINIOCR_OCR_MODE=llm`。未在配置/`MINIOCR_DPI` 中显式设置 DPI 时，`llm` 默认 **72**（`local` 仍为 **96**）；需要更高清晰度可设 `"dpi": 96` 或 `150`。
+或：`export MINIOCR_OCR_MODE=llm`。未在配置/`MINIOCR_DPI` 中显式设置 DPI 时，`llm` 默认 **72**，`hunyuan` 默认 **144**（`local` 仍为 **96**）；需要更高清晰度可设 `"dpi": 96` 或 `150`。示例 `config.json` 里写了 `"dpi": 96`，切换 mode 时这个显式值仍然优先。
 
 **`llm` 模式要求** `llm.enabled` + 非空 `apiKey`（及 `baseUrl` / `model`）。若缺失，启动时会 **明确告警并回退到 `local`**，避免服务起不来。
 
@@ -295,6 +309,75 @@ cd artifacts/linux-x64-singlefile
 | 其他 OpenAI 兼容网关 | 带视觉的 chat 模型 | `baseUrl` 指到网关根（无 `/v1` 后缀） |
 
 `llm.ocrMaxCharsHint`（默认 8000）写入提示词，限制模型返回的页文本长度。
+
+#### HunyuanOCR（`ocr.mode=hunyuan`）
+
+腾讯 [HunyuanOCR](https://huggingface.co/tencent/HunyuanOCR)（约 **1B** 参数，架构 HunYuanVL）是端到端 OCR 视觉语言模型，不是 Paddle 那种可以嵌进 Native AOT 的小检测/识别网络。
+
+**进程内不可行（因此本模式是 HTTP 客户端，不是第二个 `OcrEngine`）：**
+
+| 运行时 | 官方现状 | 能否放进本仓库的 Native AOT |
+| --- | --- | --- |
+| transformers ≥ 5.13（`HunYuanVLForConditionalGeneration`） | Python 推理 | 否 |
+| vLLM OpenAI 服务（CUDA） | 官方服务端 | 否，独立进程 |
+| llama.cpp GGUF + mmproj，`llama-server`（上游 ≥ b11103，含 DFlash） | 官方 CPU / 消费级 GPU 路径，同样是 OpenAI HTTP | 否。交付形态是 `llama-server`，没有可供 AOT P/Invoke 的稳定多模态绑定 |
+| ONNX Runtime | 无官方导出 | 否 |
+
+权重不进 git（语言 GGUF 的 fp16 就大约 2GB，再加上视觉 mmproj）。配置里只写服务地址。
+
+**2000 页 / 5 分钟不现实。** 竞赛目标约 **6.7 页/秒**。官方数字来自上游 `docs/benchmark.md`（单卡 NVIDIA H20 80GB，并发 1，`max_tokens=8000`，OmnidocBench）和 `docs/llama_cpp.md` 的样例，不是本仓库这台机器实测：
+
+| 配置 | 延迟 | 吞吐 | 2000 页外推（单流） |
+| --- | ---: | ---: | ---: |
+| H20，HunyuanOCR AR | 3.03 秒/页 | 0.330 页/秒 | **约 101 分钟** |
+| H20，HunyuanOCR + DFlash | 1.41 秒/页 | 0.706 页/秒 | **约 47 分钟** |
+| Apple M5 Pro Metal，文档样例 | 6.885 秒/页 | 0.145 页/秒 | **约 3.8 小时** |
+
+即便乐观假设同一张 H20 上批处理能线性放大 8 倍（官方没给这个数，图像 prefill 通常做不到线性），DFlash 也只有约 5.6 页/秒，仍低于 6.7。CPU 更慢：1B 级模型常见大约每秒数个到几十个 token，官方 markdown 提示词一页经常是数百到数千 token。按 10 token/秒 × 800 token ≈ **80 秒/页**（2000 页约 **44 小时**）；按 30 token/秒 × 400 token ≈ **13 秒/页**（仍约 **7 小时**），还没算视觉编码器 prefill。对照本仓库 Paddle：DPI 96 约 4.4 页/秒（2000 页约 7.6 分钟），DPI 45 约 8 页/秒（约 4.2 分钟）。Hunyuan 是质量路径，不是时延路径。
+
+**请求：** `POST {baseUrl}/v1/chat/completions`，`temperature=0`，`max_tokens` 默认 8000。用户消息先图后文，提示词默认官方文档解析句（`prompt` 为空时）：
+
+```text
+提取文档图片中正文的所有信息用markdown格式表示，其中页眉、页脚部分忽略，表格用html格式表达，文档中公式用latex格式表示，按照阅读顺序组织进行解析。
+```
+
+想少生成 token 可把 `prompt` 改成 `提取图中的文字。`。不要改成竞赛 `ruleList` JSON：上游说明换掉模型自己的提示词会伤准确率。返回的是页文本；B04/B06 再走 `LlmEntityExtractor`（要 `llm.enabled` + apiKey）或 `llm.fallbackToHeuristics=true`。两者都没有时，启动会告警，回调里的 `ruleList` 为空。栅格是**彩色**（`local` / `llm` 仍灰度），JPEG 质量默认 85，与栅格流水线重叠，不把整本 JPEG 攒在内存里。
+
+`hunyuan.enabled=false` 或缺少 `baseUrl` / `model` 时，启动告警并回退 `local`（`ForceMode`，不会被 `MINIOCR_OCR_MODE` 再次盖回去）。回退时已经解析好的 DPI 保持不变，所以没写 `dpi` 的 hunyuan 配置回退后仍是 144。服务进程可以先于 vLLM / llama-server 启动；上游连不上时该页请求失败并返回明确的 HTTP 错误，不会把整本栅格堵在队列里。
+
+**vLLM（NVIDIA，官方主路径）** — 按上游 `docs/inference` 装环境，权重用 Hugging Face，不要提交进本仓库：
+
+```bash
+vllm serve tencent/HunyuanOCR --host 127.0.0.1 --port 8000
+```
+
+```json
+"ocr": { "mode": "hunyuan" },
+"hunyuan": { "baseUrl": "http://127.0.0.1:8000", "model": "tencent/HunyuanOCR", "concurrency": 2 }
+```
+
+`baseUrl` 不要带 `/v1`（写了 `/v1` 也会被剥掉，避免请求变成 `/v1/v1/...`）。显存够可以把 `concurrency` 调高；默认 2。
+
+**llama.cpp（CPU 或消费级 GPU）** — 上游 `docs/llama_cpp.md`，构建 ≥ b11103。转换出语言 GGUF 和 mmproj（可选 DFlash），然后：
+
+```bash
+llama-server \
+  --model ./HunyuanOCR/hyocr-f16.gguf \
+  --mmproj ./HunyuanOCR/mmproj-hyocr-f16.gguf \
+  --host 127.0.0.1 --port 8080 --alias HYVL \
+  --ctx-size 10240 --n-predict 4096 \
+  -fa on --jinja
+```
+
+```json
+"hunyuan": {
+  "baseUrl": "http://127.0.0.1:8080",
+  "model": "HYVL",
+  "concurrency": 1
+}
+```
+
+DFlash 时上游建议 `llama-server --parallel 1`，客户端并发也设为 1。apiKey 留空则不发 `Authorization`；需要的话填 `EMPTY` 之类，会作为 Bearer 发送，日志只显示 `(set)`。
 
 #### 配置 OpenAI / 兼容接口（DeepSeek、Azure、本地）
 
@@ -321,16 +404,18 @@ cd artifacts/linux-x64-singlefile
 
 | 变量 | 文件字段 | 默认（auto-scale，约 8 核） | 说明 |
 | --- | --- | ---: | --- |
-| `MINIOCR_OCR_MODE` | `ocr.mode` | **local** | `local`（Paddle）或 `llm`（视觉；跳过本地模型） |
+| `MINIOCR_OCR_MODE` | `ocr.mode` | **local** | `local`（Paddle）、`llm`（视觉）或 `hunyuan`（本机 HunyuanOCR 服务）；后两者跳过本地模型 |
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | **32**（1–256） | `ocr.mode=llm` 时页级视觉并发 |
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | **70**（40–95） | `ocr.mode=llm` 时页图 JPEG 质量（更低=更快编码/更小上传） |
 | `MINIOCR_LLM_THINKING` | `llm.thinking` | **false**（disabled） | DeepSeek 思考模式；`0/1/false/true/disabled/enabled`；默认关闭并显式发送 `thinking.type=disabled` |
 | `MINIOCR_ENGINES` | `ocr.engines` | **4**（`Clamp(cores/2, 1, min(16,cores))`） | 页级并行 `PaddleOcrAll` 实例数（仅 local） |
-| `MINIOCR_DPI` | `ocr.dpi` | **96**（local）/ **72**（llm，未显式设置时） | 栅格化 DPI（也可在 JSON/`?dpi=` 覆盖） |
+| `MINIOCR_DPI` | `ocr.dpi` | **96**（local）/ **72**（llm）/ **144**（hunyuan）；均仅在未显式设置时 | 栅格化 DPI（也可在 JSON/`?dpi=` 覆盖） |
+| `MINIOCR_HUNYUAN_CONCURRENCY` | `hunyuan.concurrency` | **2**（1–64） | `ocr.mode=hunyuan` 页级请求并发；llama-server DFlash 请设 1 |
+| `MINIOCR_HUNYUAN_MAX_TOKENS` | `hunyuan.maxTokens` | **8000**（256–16384） | 发给 HunyuanOCR 的 `max_tokens` |
 | `MINIOCR_LINE_WORKERS` | `ocr.lineWorkers` | 自动 | 页内 CLS/REC 并行 |
 | `MINIOCR_DET_THREADS` | `ocr.detThreads` | 自动 | 检测图内卷积线程 |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | **false** | 是否启用方向分类 |
-| `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm：`min(8,cores)`） | 并行 PDF 栅格生产者（封顶 8） |
+| `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm / hunyuan：`min(8,cores)`） | 并行 PDF 栅格生产者（封顶 8） |
 | `MINIOCR_REC_BATCH` | — | **8** | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | — | **960** | 检测 `LimitSideLength` |
 
@@ -512,7 +597,7 @@ The current CPU is missing one or more of the required instruction sets.
    - `miniocr-osx-arm64`（**Apple Silicon only**）/ `miniocr-linux-arm64`（AOT，NEON 基线）
    - `miniocr-win-x64-singlefile` / `miniocr-linux-x64-singlefile`（**真正单文件**，非 AOT，运行时自动探测 SIMD）
    - 不再提供 `osx-x64` / Intel Mac 包
-3. 若通过 **Release** / `v*` 标签触发，zip 也会尽量挂到该 GitHub Release 上，可直接从 Releases 页下载。
+3. 若通过 **Release** / `v*` 标签触发，zip 也会尽量挂到该 GitHub Release 上，可直接从 Releases 页下载。Actions 制品只保留 **3 天**（包很大，避免占满 GitHub 存储）；Release 附件不走这个保留期。
 
 **AOT zip：** 解压后含可执行文件 + 原生依赖（`libSkiaSharp` / `pdfium` 的 `.dll` / `.so` / `.dylib`），以及示例 PDF（若打包时存在）；x64 包要求 CPU 满足所选的 SIMD 档位，不满足会在启动时报错退出。  
 **单文件 zip：** 解压后通常只有一个 `MiniOcr`（或 `MiniOcr.exe`），拷走即可运行。
@@ -522,8 +607,8 @@ The current CPU is missing one or more of the required instruction sets.
 | 环节 | 策略 |
 | --- | --- |
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
-| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`；`AntiAliasing=None` + `Grayscale`；多生产者写入有界 Channel，**绝不**同时持有全部页位图。llm 默认更多 raster workers（`min(8,cores)`）。 |
-| OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
+| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**，**hunyuan** 未显式配置时默认 **144 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`；`AntiAliasing=None`；`local`/`llm` 为 `Grayscale`，`hunyuan` 为彩色；多生产者写入有界 Channel，**绝不**同时持有全部页位图。`llm` / `hunyuan` 默认 raster workers 为 `min(8,cores)`。 |
+| OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。**hunyuan**：不加载 Paddle；彩色 JPEG 发给本机 HunyuanOCR（官方文档解析提示词，`max_tokens` 默认 8000），页文本再走与 local 相同的 NER。 |
 | 实体 | 优先 `LlmEntityExtractor`（Chat Completions 分批）；失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
 
@@ -568,6 +653,7 @@ miniocr/
     ParallelPdfDownloader.cs
     RentedBuffer.cs
     OcrEngine.cs
+    HunyuanVisionOcr.cs  # ocr.mode=hunyuan → 本机 vLLM / llama-server
     PdfOcrPipeline.cs
     EntityExtractor.cs    # 启发式回退
     ChallengeJobService.cs # 竞赛异步队列 + 回调

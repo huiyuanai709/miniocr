@@ -9,7 +9,7 @@ namespace MiniOcr.Services;
 /// </summary>
 public sealed class OcrRuntimeConfig
 {
-    /// <summary><c>local</c> (Paddle) or <c>llm</c> (vision). Default local.</summary>
+    /// <summary><c>local</c> (Paddle), <c>llm</c> (vision), or <c>hunyuan</c> (local HunyuanOCR server). Default local.</summary>
     public string Mode { get; init; } = "local";
     public int EngineCount { get; init; }
     public int DefaultDpi { get; init; }
@@ -68,17 +68,23 @@ public sealed class OcrRuntimeConfig
         det = Math.Clamp(det, 1, 16);
 
         // local default 96; llm default 72 when dpi unset (vision is IO-bound; fewer pixels = faster encode/upload).
+        // hunyuan default 144: the 1B VLM wants a sharper page than the cloud-vision default.
         // Explicit ocr.dpi or MINIOCR_DPI always wins — do not change local's 96 when mode=local.
-        int dpiFallback = ocr.Dpi ?? (string.Equals(mode, "llm", StringComparison.OrdinalIgnoreCase) ? 72 : 96);
+        int dpiFallback = ocr.Dpi ?? mode switch
+        {
+            "llm" => 72,
+            "hunyuan" => 144,
+            _ => 96,
+        };
         int dpi = Math.Clamp(ReadInt("MINIOCR_DPI", dpiFallback), 36, 300);
 
         bool useClsFile = ocr.UseCls ?? false;
         bool useCls = ReadBool("MINIOCR_USE_CLS", useClsFile);
 
-        // Vision OCR is IO-bound: leave CPU free for PDFium — default raster workers = min(8, cores).
-        bool llmMode = string.Equals(mode, "llm", StringComparison.OrdinalIgnoreCase);
+        // Remote vision (llm / hunyuan) is IO-bound relative to PDFium: default raster workers = min(8, cores).
+        bool remoteVision = mode is "llm" or "hunyuan";
         int rasterDefault;
-        if (llmMode)
+        if (remoteVision)
             rasterDefault = Math.Clamp(Math.Min(8, cores), 1, 8);
         else if (autoScale)
             rasterDefault = forEngines.RasterWorkers;
@@ -88,7 +94,7 @@ public sealed class OcrRuntimeConfig
             "MINIOCR_RASTER_WORKERS",
             ocr.RasterWorkers,
             rasterDefault,
-            autoScale || llmMode,
+            autoScale || remoteVision,
             rasterDefault);
         raster = Math.Clamp(raster, 1, 8);
 
@@ -176,10 +182,19 @@ public sealed class OcrRuntimeConfig
         return autoScale ? autoDefault : fixedFallback;
     }
 
-    /// <summary>Copy with a different OCR mode (e.g. llm→local fallback).</summary>
-    public OcrRuntimeConfig WithMode(string mode) => new()
+    /// <summary>
+    /// Copy with a different OCR mode, re-applying <c>MINIOCR_OCR_MODE</c>.
+    /// Startup fallback must use <see cref="ForceMode"/> so an unusable env mode
+    /// can actually drop back to local.
+    /// </summary>
+    public OcrRuntimeConfig WithMode(string mode) => CopyWithMode(ResolveMode(mode));
+
+    /// <summary>Set mode literally. Does not re-read <c>MINIOCR_OCR_MODE</c>.</summary>
+    public OcrRuntimeConfig ForceMode(string mode) => CopyWithMode(NormalizeMode(mode));
+
+    private OcrRuntimeConfig CopyWithMode(string mode) => new()
     {
-        Mode = ResolveMode(mode),
+        Mode = mode,
         EngineCount = EngineCount,
         DefaultDpi = DefaultDpi,
         LineWorkerCount = LineWorkerCount,
@@ -195,16 +210,27 @@ public sealed class OcrRuntimeConfig
     public bool IsLlmMode =>
         string.Equals(Mode, "llm", StringComparison.OrdinalIgnoreCase);
 
+    public bool IsHunyuanMode =>
+        string.Equals(Mode, "hunyuan", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
-    /// Env MINIOCR_OCR_MODE overrides file. Accepts local|llm (case-insensitive).
+    /// Env MINIOCR_OCR_MODE overrides file. Accepts local|llm|hunyuan (case-insensitive).
     /// Unknown values fall back to local.
     /// </summary>
     public static string ResolveMode(string? fileMode)
     {
         string? env = Environment.GetEnvironmentVariable("MINIOCR_OCR_MODE");
         string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "local");
+        return NormalizeMode(raw);
+    }
+
+    /// <summary>Map a raw mode string. Unknown values become <c>local</c>.</summary>
+    public static string NormalizeMode(string? raw)
+    {
         if (string.Equals(raw, "llm", StringComparison.OrdinalIgnoreCase))
             return "llm";
+        if (string.Equals(raw, "hunyuan", StringComparison.OrdinalIgnoreCase))
+            return "hunyuan";
         return "local";
     }
 

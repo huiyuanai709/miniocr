@@ -165,7 +165,10 @@ jobs:
           name: miniocr-${{ matrix.rid }}${{ matrix.suffix }}
           path: dist/miniocr-${{ matrix.rid }}${{ matrix.suffix }}.zip
           if-no-files-found: error
-          retention-days: 30
+          # AOT zips are large; keep Actions artifacts briefly so the repo
+          # does not pile up against GitHub storage limits. Release assets
+          # attached below are separate and are not governed by this.
+          retention-days: 3
 
       - name: Attach zip to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'

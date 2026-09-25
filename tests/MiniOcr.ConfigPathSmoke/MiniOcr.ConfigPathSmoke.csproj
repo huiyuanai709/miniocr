@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\..\Services\AppConfigStore.cs" Link="AppConfigStore.cs" />
+    <Compile Include="..\..\Services\OcrRuntimeConfig.cs" Link="OcrRuntimeConfig.cs" />
     <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
     <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
   </ItemGroup>

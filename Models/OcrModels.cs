@@ -93,4 +93,10 @@ public sealed class HealthResponse
     public bool LlmFallbackToHeuristics { get; set; }
     /// <summary>Never the raw key — only "(set)" or "(empty)".</summary>
     public string LlmApiKey { get; set; } = "(empty)";
+    public bool HunyuanUsable { get; set; }
+    public string HunyuanModel { get; set; } = "";
+    public string HunyuanBaseUrl { get; set; } = "";
+    public int HunyuanConcurrency { get; set; }
+    /// <summary>Never the raw key — only "(set)" or "(empty)".</summary>
+    public string HunyuanApiKey { get; set; } = "(empty)";
 }

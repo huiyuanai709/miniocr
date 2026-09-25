@@ -202,6 +202,64 @@ public static class AppConfigStore
         };
     }
 
+    /// <summary>Merge <c>hunyuan</c> file section with <c>MINIOCR_HUNYUAN_*</c> overrides. Never logs the api key.</summary>
+    public static HunyuanRuntimeConfig ResolveHunyuan(AppConfigFile file)
+    {
+        HunyuanFileConfig hy = file.Hunyuan ?? new HunyuanFileConfig();
+
+        string baseUrl = FirstNonEmpty(
+            Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_BASE_URL"),
+            hy.BaseUrl) ?? "http://127.0.0.1:8000";
+
+        string apiKey = FirstNonEmpty(
+            Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_API_KEY"),
+            hy.ApiKey) ?? "";
+
+        string model = FirstNonEmpty(
+            Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_MODEL"),
+            hy.Model) ?? "tencent/HunyuanOCR";
+
+        int concurrency = hy.Concurrency <= 0 ? 2 : hy.Concurrency;
+        if (int.TryParse(Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_CONCURRENCY"), out int parsedConcurrency))
+            concurrency = parsedConcurrency;
+
+        int jpegQuality = hy.JpegQuality <= 0 ? 85 : hy.JpegQuality;
+        if (int.TryParse(Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_JPEG_QUALITY"), out int parsedJpeg))
+            jpegQuality = parsedJpeg;
+
+        int maxTokens = hy.MaxTokens <= 0 ? 8000 : hy.MaxTokens;
+        if (int.TryParse(Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_MAX_TOKENS"), out int parsedMaxTokens))
+            maxTokens = parsedMaxTokens;
+
+        int timeout = hy.TimeoutSeconds <= 0 ? 180 : hy.TimeoutSeconds;
+        if (int.TryParse(Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_TIMEOUT"), out int parsedTimeout))
+            timeout = parsedTimeout;
+
+        bool enabled = hy.Enabled;
+        string? envEnabled = Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_ENABLED");
+        if (!string.IsNullOrWhiteSpace(envEnabled))
+            enabled = ThinkingConfigJsonConverter.ParseThinkingString(envEnabled);
+
+        string prompt = FirstNonEmpty(
+            Environment.GetEnvironmentVariable("MINIOCR_HUNYUAN_PROMPT"),
+            hy.Prompt) ?? HunyuanRuntimeConfig.DefaultDocumentPrompt;
+        if (string.IsNullOrWhiteSpace(prompt))
+            prompt = HunyuanRuntimeConfig.DefaultDocumentPrompt;
+
+        return new HunyuanRuntimeConfig
+        {
+            Enabled = enabled,
+            BaseUrl = baseUrl.TrimEnd('/'),
+            ApiKey = apiKey,
+            Model = model.Trim(),
+            TimeoutSeconds = Math.Clamp(timeout, 10, 600),
+            Concurrency = Math.Clamp(concurrency, 1, 64),
+            JpegQuality = Math.Clamp(jpegQuality, 40, 95),
+            MaxTokens = Math.Clamp(maxTokens, 256, 16384),
+            Prompt = prompt.Trim(),
+        };
+    }
+
     /// <summary>Candidate paths in preference order (may include duplicates; caller should de-dupe).</summary>
     public static IEnumerable<string> EnumerateCandidatePaths(
         OSPlatform platform,
@@ -393,6 +451,17 @@ public static class AppConfigStore
             "rasterWorkers": null,
             "useCls": false,
             "autoScaleFromCpu": true
+          },
+          "hunyuan": {
+            "enabled": true,
+            "baseUrl": "http://127.0.0.1:8000",
+            "apiKey": "",
+            "model": "tencent/HunyuanOCR",
+            "timeoutSeconds": 180,
+            "concurrency": 2,
+            "jpegQuality": 85,
+            "maxTokens": 8000,
+            "prompt": ""
           }
         }
         """;

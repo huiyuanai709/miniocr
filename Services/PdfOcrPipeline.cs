@@ -13,6 +13,7 @@ public sealed class PdfOcrPipeline
     private readonly ILogger<PdfOcrPipeline> _logger;
     private readonly LlmEntityExtractor? _llm;
     private readonly LlmVisionOcr? _vision;
+    private readonly HunyuanVisionOcr? _hunyuan;
     private readonly OcrRuntimeConfig _config;
     private readonly int _pageWindow;
     private readonly int _defaultDpi;
@@ -23,13 +24,15 @@ public sealed class PdfOcrPipeline
         ILogger<PdfOcrPipeline> logger,
         OcrEngine? engine = null,
         LlmEntityExtractor? llm = null,
-        LlmVisionOcr? vision = null)
+        LlmVisionOcr? vision = null,
+        HunyuanVisionOcr? hunyuan = null)
     {
         _config = config;
         _logger = logger;
         _engine = engine;
         _llm = llm;
         _vision = vision;
+        _hunyuan = hunyuan;
         _defaultDpi = config.DefaultDpi;
         _rasterWorkers = config.RasterWorkerCount;
 
@@ -39,6 +42,13 @@ public sealed class PdfOcrPipeline
                 throw new InvalidOperationException(
                     "ocr.mode=llm requires a usable LLM (enabled + apiKey + baseUrl + model).");
             _pageWindow = Math.Max(4, Math.Min(vision.OcrConcurrency, 64));
+        }
+        else if (config.IsHunyuanMode)
+        {
+            if (hunyuan is null || !hunyuan.IsUsable)
+                throw new InvalidOperationException(
+                    "ocr.mode=hunyuan requires hunyuan.enabled + baseUrl + model (local OpenAI-compatible server).");
+            _pageWindow = Math.Max(4, Math.Min(hunyuan.Concurrency, 64));
         }
         else
         {
@@ -87,6 +97,16 @@ public sealed class PdfOcrPipeline
                 "OCR pipeline (llm vision): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, ocrConcurrency={Conc}, rasterWorkers={Raster}",
                 pageCount, pdfByteCount, dpi, _vision!.OcrConcurrency, _rasterWorkers);
             return await ProcessWithVisionAsync(
+                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct)
+                .ConfigureAwait(false);
+        }
+
+        if (_config.IsHunyuanMode)
+        {
+            _logger.LogInformation(
+                "OCR pipeline (hunyuan): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, concurrency={Conc}, rasterWorkers={Raster}, model={Model}",
+                pageCount, pdfByteCount, dpi, _hunyuan!.Concurrency, _rasterWorkers, _hunyuan.Config.Model);
+            return await ProcessWithHunyuanAsync(
                 pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct)
                 .ConfigureAwait(false);
         }
@@ -277,6 +297,218 @@ public sealed class PdfOcrPipeline
         };
     }
 
+    private async Task<OcrResponse> ProcessWithHunyuanAsync(
+        byte[] pdfBytes,
+        int pdfByteCount,
+        int pageCount,
+        int dpi,
+        double downloadMs,
+        string downloadMode,
+        Stopwatch totalSw,
+        CancellationToken ct)
+    {
+        // Color raster: HunyuanOCR is trained on document images, not the grayscale
+        // pages used by Paddle / the cloud-vision path.
+        RenderOptions renderOptions = CreateRenderOptions(dpi, grayscale: false);
+        int concurrency = _hunyuan!.Concurrency;
+        int jpegQuality = _hunyuan.JpegQuality;
+
+        Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(_pageWindow)
+            {
+                SingleWriter = false,
+                SingleReader = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+
+        int jpegCapacity = Math.Min(
+            Math.Max(1, pageCount),
+            Math.Max(2, Math.Max(_pageWindow, concurrency * 2)));
+        Channel<PageJpeg> jpegs = Channel.CreateBounded<PageJpeg>(new BoundedChannelOptions(jpegCapacity)
+        {
+            SingleWriter = false,
+            SingleReader = false,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+
+        OcrPageResult[] pages = new OcrPageResult[pageCount];
+        double rasterTotal = 0;
+        double ocrTotal = 0;
+        object timingLock = new();
+        int firstJpegFlag = 0;
+        int firstRequestFlag = 0;
+
+        Stopwatch sinceDownload = Stopwatch.StartNew();
+        _logger.LogInformation(
+            "Hunyuan pipeline: download done (mode={Mode}, downloadMs={DownloadMs:F1}); " +
+            "starting overlapped raster+encode→server; pages={Pages}, dpi={Dpi}, " +
+            "jpegQuality={JpegQ}, rasterWorkers={Raster}, concurrency={Conc}, " +
+            "jpegQueueCapacity={JpegCap}, maxTokens={MaxTokens}",
+            downloadMode,
+            downloadMs,
+            pageCount,
+            dpi,
+            jpegQuality,
+            _rasterWorkers,
+            concurrency,
+            jpegCapacity,
+            _hunyuan.Config.MaxTokens);
+
+        Task producer = ProduceParallelAsync(
+            pdfBytes, pdfByteCount, pageCount, renderOptions, rasterized.Writer, ct);
+
+        async Task EncodeConsumerAsync()
+        {
+            await foreach (var (index, bitmap, rasterMs) in rasterized.Reader.ReadAllAsync(ct)
+                               .ConfigureAwait(false))
+            {
+                using (bitmap)
+                {
+                    int width = bitmap.Width;
+                    int height = bitmap.Height;
+                    byte[] jpeg = LlmVisionOcr.EncodeJpeg(bitmap, jpegQuality);
+                    PageJpeg item = new(index, width, height, jpeg, rasterMs);
+                    lock (timingLock)
+                        rasterTotal += rasterMs;
+
+                    if (Interlocked.CompareExchange(ref firstJpegFlag, 1, 0) == 0)
+                    {
+                        _logger.LogInformation(
+                            "Hunyuan pipeline: first page JPEG ready (page={Page}, {W}x{H}, jpegBytes={Bytes}) " +
+                            "at t+{Elapsed:F0}ms after download handoff",
+                            index + 1,
+                            width,
+                            height,
+                            jpeg.Length,
+                            sinceDownload.Elapsed.TotalMilliseconds);
+                    }
+
+                    await jpegs.Writer.WriteAsync(item, ct).ConfigureAwait(false);
+                }
+            }
+        }
+
+        async Task HunyuanConsumerAsync()
+        {
+            await foreach (PageJpeg img in jpegs.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                if (img.Jpeg is null)
+                    continue;
+
+                if (Interlocked.CompareExchange(ref firstRequestFlag, 1, 0) == 0)
+                {
+                    _logger.LogInformation(
+                        "Hunyuan pipeline: first request (page={Page}) " +
+                        "at t+{Elapsed:F0}ms after download handoff",
+                        img.Index + 1,
+                        sinceDownload.Elapsed.TotalMilliseconds);
+                }
+
+                OcrPageResult page = await _hunyuan
+                    .RecognizePageAsync(img.Index + 1, img.Width, img.Height, img.Jpeg, img.RasterMs, ct)
+                    .ConfigureAwait(false);
+                pages[img.Index] = page;
+                lock (timingLock)
+                    ocrTotal += page.OcrMs;
+            }
+        }
+
+        int encodeWorkers = Math.Clamp(_rasterWorkers, 1, 8);
+        Task[] encoders = Enumerable.Range(0, encodeWorkers)
+            .Select(_ => EncodeConsumerAsync())
+            .ToArray();
+
+        // A dead server must not stall the raster/encode side on a full channel.
+        Exception? hunyuanFailed = null;
+        async Task HunyuanGuardedAsync()
+        {
+            try
+            {
+                await HunyuanConsumerAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Interlocked.CompareExchange(ref hunyuanFailed, ex, null);
+                jpegs.Writer.TryComplete(ex);
+                rasterized.Writer.TryComplete(ex);
+                throw;
+            }
+        }
+
+        int hunyuanWorkers = Math.Clamp(concurrency, 1, Math.Max(1, pageCount));
+        Task[] hunyuanTasks = Enumerable.Range(0, hunyuanWorkers)
+            .Select(_ => HunyuanGuardedAsync())
+            .ToArray();
+
+        // Close the JPEG channel only after encode finishes, so consumers' ReadAllAsync can end.
+        // Completing it earlier deadlocks the success path; completing it only after consumers
+        // also deadlocks, because they wait for the writer. A failed request completes both
+        // writers immediately inside HunyuanGuardedAsync.
+        Task encodeAndProduce = Task.WhenAll(producer, Task.WhenAll(encoders));
+        _ = encodeAndProduce.ContinueWith(
+            t =>
+            {
+                Exception? encodeError = t.Exception?.InnerException;
+                jpegs.Writer.TryComplete(encodeError);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.None,
+            TaskScheduler.Default);
+
+        try
+        {
+            await Task.WhenAll(encodeAndProduce, Task.WhenAll(hunyuanTasks)).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            if (hunyuanFailed is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(hunyuanFailed).Throw();
+            throw;
+        }
+        finally
+        {
+            jpegs.Writer.TryComplete();
+            rasterized.Writer.TryComplete();
+            while (rasterized.Reader.TryRead(out var leftover))
+                leftover.Bitmap.Dispose();
+        }
+
+        for (int i = 0; i < pageCount; i++)
+        {
+            if (pages[i] is null)
+                throw new InvalidOperationException($"Missing Hunyuan OCR result for page index {i}.");
+        }
+
+        // Page text only. B04/B06 come from the same NER path as local Paddle.
+        OcrEntities entities = await ExtractEntitiesAsync(pages, ct).ConfigureAwait(false);
+
+        totalSw.Stop();
+
+        _logger.LogInformation(
+            "Hunyuan pipeline done: totalMs={Total:F1}, companies={Companies}, persons={Persons}",
+            totalSw.Elapsed.TotalMilliseconds,
+            entities.Companies.Count,
+            entities.Persons.Count);
+
+        return new OcrResponse
+        {
+            Ok = true,
+            PageCount = pageCount,
+            PdfBytes = pdfByteCount,
+            DownloadMode = downloadMode,
+            Dpi = dpi,
+            Timings = new OcrTimings
+            {
+                DownloadMs = Math.Round(downloadMs, 1),
+                RasterizeMs = Math.Round(rasterTotal, 1),
+                OcrMs = Math.Round(ocrTotal, 1),
+                TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
+            },
+            Pages = pages.ToList(),
+            Entities = entities,
+        };
+    }
+
     private async Task<OcrResponse> ProcessWithLocalAsync(
         byte[] pdfBytes,
         int pdfByteCount,
@@ -389,13 +621,13 @@ public sealed class PdfOcrPipeline
         };
     }
 
-    private static RenderOptions CreateRenderOptions(int dpi) =>
+    private static RenderOptions CreateRenderOptions(int dpi, bool grayscale = true) =>
         new(
             Dpi: dpi,
             WithAnnotations: false,
             WithFormFill: false,
             AntiAliasing: PdfAntiAliasing.None,
-            Grayscale: true);
+            Grayscale: grayscale);
 
     private static OcrEntities EntitiesFromVisionPages(OcrPageResult[] pages)
     {
