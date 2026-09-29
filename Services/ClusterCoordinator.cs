@@ -445,6 +445,10 @@ public sealed class ClusterCoordinator : IHostedService
                 MaxChars = _llm.Config.MaxCharsPerRequest,
                 LeaseMs = leaseMs,
                 LocalNodeId = _config.NodeId,
+                // Reserve a few seconds for workers that have NER capacity but have not issued
+                // their first long-poll yet, then keep assigning to the least-loaded active node.
+                FairHoldMs = 3_000,
+                ActiveMs = 5_000,
             });
             ner.SetNerCapacity(_config.NodeId, localNerCap);
             foreach (ClusterRemote remote in remotes)
@@ -658,26 +662,55 @@ public sealed class ClusterCoordinator : IHostedService
 
     public readonly record struct ClusterRunResult(string JobId, bool UsedDistributedNer, OcrEntities? Entities);
 
-    public ClusterNerClaimResponse ClaimNer(ClusterJob job, string nodeId, bool llmConfigured, int nerConcurrency)
+    /// <summary>How long <c>/ner/claim</c> stays open when no group is handed out. Workers block here instead of polling.</summary>
+    public const int NerClaimWaitMs = 15_000;
+
+    public async Task<ClusterNerClaimResponse> ClaimNerAsync(
+        ClusterJob job,
+        string nodeId,
+        bool llmConfigured,
+        int nerConcurrency,
+        int waitMs,
+        CancellationToken ct)
+    {
+        ClusterNerClaimResponse first = ClaimNerOnce(job, nodeId, llmConfigured, nerConcurrency);
+        if (first.Done || !first.Wait || job.Ner is null || !llmConfigured || nerConcurrency <= 0)
+            return first;
+
+        int hold = waitMs <= 0 ? NerClaimWaitMs : Math.Clamp(waitMs, 1, 25_000);
+        job.Ner.EnterWait(nodeId, DateTimeOffset.UtcNow);
+        try
+        {
+            await job.Ner.WaitForChangeAsync(first.Version, TimeSpan.FromMilliseconds(hold), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            job.Ner.LeaveWait(nodeId);
+        }
+
+        return ClaimNerOnce(job, nodeId, llmConfigured, nerConcurrency);
+    }
+
+    private ClusterNerClaimResponse ClaimNerOnce(ClusterJob job, string nodeId, bool llmConfigured, int nerConcurrency)
     {
         if (job.IsFinished || job.Ner is null)
-            return new ClusterNerClaimResponse { Done = true };
+            return new ClusterNerClaimResponse { Done = true, Version = job.Ner?.Version ?? 0 };
 
         if (!llmConfigured || nerConcurrency <= 0)
         {
             job.Ner.SetNerCapacity(nodeId, 0);
             return job.Ner.IsComplete
-                ? new ClusterNerClaimResponse { Done = true }
-                : new ClusterNerClaimResponse { Wait = true, RetryAfterMs = 500 };
+                ? new ClusterNerClaimResponse { Done = true, Version = job.Ner.Version }
+                : new ClusterNerClaimResponse { Wait = true, RetryAfterMs = 500, Version = job.Ner.Version };
         }
 
         job.Ner.SetNerCapacity(nodeId, nerConcurrency);
         ClusterNerAssignment claim = job.Ner.Claim(nodeId, DateTimeOffset.UtcNow);
         LogNerExpiries(job);
         if (claim.Kind == ClusterNerClaimKind.Done)
-            return new ClusterNerClaimResponse { Done = true };
+            return new ClusterNerClaimResponse { Done = true, Version = claim.Version };
         if (claim.Kind != ClusterNerClaimKind.Group)
-            return new ClusterNerClaimResponse { Wait = true, RetryAfterMs = claim.RetryAfterMs };
+            return new ClusterNerClaimResponse { Wait = true, RetryAfterMs = claim.RetryAfterMs, Version = claim.Version };
 
         ClusterJobLog.NerClaim(
             _logger,
@@ -700,6 +733,7 @@ public sealed class ClusterCoordinator : IHostedService
             LookaheadPage = claim.LookaheadPage,
             LeaseMs = claim.LeaseMs,
             RetryAfterMs = claim.RetryAfterMs,
+            Version = claim.Version,
         };
     }
 
@@ -777,7 +811,17 @@ public sealed class ClusterCoordinator : IHostedService
                 return;
             if (claim.Kind != ClusterNerClaimKind.Group)
             {
-                await ner.WaitForChangeAsync(claim.Version, TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+                DateTimeOffset waited = DateTimeOffset.UtcNow;
+                ner.EnterWait(_config.NodeId, waited);
+                try
+                {
+                    await ner.WaitForChangeAsync(claim.Version, TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    ner.LeaveWait(_config.NodeId);
+                }
+
                 continue;
             }
 

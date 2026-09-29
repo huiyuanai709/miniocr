@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using MiniOcr.Models;
 using MiniOcr.Services;
@@ -711,6 +713,109 @@ Console.WriteLine("=== NER capacity and give-up ===");
         $"  estimated LLM-stage speedup for 2000 non-empty pages / 10: {singleWaves} waves on one node vs {tripleWaves} waves on three ({singleWaves / (double)tripleWaves:F1}x), assuming each node has its own key and the provider accepts the aggregate concurrency");
 }
 
+Console.WriteLine("=== NER fair dispatch ===");
+{
+    DateTimeOffset now = new(2026, 5, 1, 0, 0, 0, TimeSpan.Zero);
+    ClusterNerScheduler fair = new(new ClusterNerOptions
+    {
+        PageCount = 4,
+        PagesPerRequest = 1,
+        MaxChars = 50_000,
+        LeaseMs = 30_000,
+        LocalNodeId = "coord",
+        FairHoldMs = 5_000,
+        ActiveMs = 5_000,
+    });
+    fair.SetNerCapacity("coord", 8);
+    fair.SetNerCapacity("w1", 8);
+    fair.SetNerCapacity("w2", 8);
+    for (int page = 1; page <= 4; page++)
+        fair.AddPage(new OcrPageResult { Page = page, Text = "第" + page + "页正文" });
+    fair.Seal();
+
+    ClusterNerAssignment first = fair.Claim("coord", now);
+    AssertTrue(first.Kind == ClusterNerClaimKind.Group, "fair dispatch still gives the coordinator the first tied group");
+    ClusterNerAssignment hog = fair.Claim("coord", now);
+    AssertTrue(hog.Kind == ClusterNerClaimKind.Wait, "coordinator yields while reserved workers have a lower load");
+    ClusterNerAssignment w1 = fair.Claim("w1", now);
+    ClusterNerAssignment w2 = fair.Claim("w2", now);
+    AssertTrue(w1.Kind == ClusterNerClaimKind.Group && w2.Kind == ClusterNerClaimKind.Group && w1.GroupId != w2.GroupId,
+        "each waiting worker receives its own group");
+    ClusterNerAssignment again = fair.Claim("coord", now.AddSeconds(1));
+    AssertTrue(again.Kind == ClusterNerClaimKind.Group, "once loads match, the coordinator can take the next group");
+
+    ClusterNerScheduler expiredHold = new(new ClusterNerOptions
+    {
+        PageCount = 2,
+        PagesPerRequest = 1,
+        MaxChars = 50_000,
+        LeaseMs = 30_000,
+        LocalNodeId = "coord",
+        FairHoldMs = 1_000,
+    });
+    expiredHold.SetNerCapacity("coord", 8);
+    expiredHold.SetNerCapacity("absent", 8);
+    expiredHold.AddPage(new OcrPageResult { Page = 1, Text = "第一页正文" });
+    expiredHold.AddPage(new OcrPageResult { Page = 2, Text = "第二页正文" });
+    expiredHold.Seal();
+    AssertTrue(expiredHold.Claim("coord", now).Kind == ClusterNerClaimKind.Group, "hold starts by giving the local node one group");
+    AssertTrue(expiredHold.Claim("coord", now).Kind == ClusterNerClaimKind.Wait, "local node waits inside the fair-hold window");
+    AssertTrue(expiredHold.Claim("coord", now.AddMilliseconds(1_500)).Kind == ClusterNerClaimKind.Group,
+        "after the fair-hold window a worker that never claimed is no longer reserved");
+}
+
+Console.WriteLine("=== NER fair dispatch under 2s latency ===");
+{
+    const int groups = 6;
+    const int llmMs = 2_000;
+    string[] cluster = ["coord", "w1", "w2"];
+
+    (Dictionary<string, int> ByNode, double WallMs) before = SimulateNer(fair: false, cap: 8, groups, llmMs, workerLag: true, cluster).GetAwaiter().GetResult();
+    (Dictionary<string, int> ByNode, double WallMs) afterWide = SimulateNer(fair: true, cap: 8, groups, llmMs, workerLag: false, cluster).GetAwaiter().GetResult();
+    (Dictionary<string, int> ByNode, double WallMs) single = SimulateNer(fair: true, cap: 2, groups, llmMs, workerLag: false, ["coord"]).GetAwaiter().GetResult();
+    (Dictionary<string, int> ByNode, double WallMs) after = SimulateNer(fair: true, cap: 2, groups, llmMs, workerLag: false, cluster).GetAwaiter().GetResult();
+
+    int Count(Dictionary<string, int> map, string node) => map.GetValueOrDefault(node);
+    string Spread(Dictionary<string, int> map) =>
+        "coord=" + Count(map, "coord") + " w1=" + Count(map, "w1") + " w2=" + Count(map, "w2");
+
+    Console.WriteLine($"  before FCFS cap=8 workerPoll=500ms: {Spread(before.ByNode)} wallMs={before.WallMs:F0}");
+    Console.WriteLine($"  after fair long-poll cap=8: {Spread(afterWide.ByNode)} wallMs={afterWide.WallMs:F0}");
+    Console.WriteLine($"  single node cap=2: {Spread(single.ByNode)} wallMs={single.WallMs:F0}");
+    Console.WriteLine($"  after fair long-poll cap=2 x3: {Spread(after.ByNode)} wallMs={after.WallMs:F0} speedup={single.WallMs / Math.Max(1, after.WallMs):F2}x vs single");
+
+    AssertTrue(Count(before.ByNode, "coord") == groups && Count(before.ByNode, "w1") == 0 && Count(before.ByNode, "w2") == 0,
+        "before the fix, a coordinator under its cap leases every group");
+    AssertTrue(Count(afterWide.ByNode, "coord") < groups && Count(afterWide.ByNode, "w1") > 0 && Count(afterWide.ByNode, "w2") > 0,
+        "after the fix, the same cap spreads groups off the coordinator");
+    AssertTrue(Count(after.ByNode, "coord") > 0 && Count(after.ByNode, "w1") > 0 && Count(after.ByNode, "w2") > 0
+        && Count(after.ByNode, "coord") + Count(after.ByNode, "w1") + Count(after.ByNode, "w2") == groups,
+        "1 coordinator + 2 workers each finish some of the 6 groups");
+    AssertTrue(after.WallMs < single.WallMs * 0.6,
+        $"fair cluster wall {after.WallMs:F0}ms beats single-node wall {single.WallMs:F0}ms");
+
+    string ner = ClusterJobLog.FormatNer(new ClusterNerSnapshot
+    {
+        Done = groups,
+        Formed = groups,
+        InFlight = 0,
+        Sealed = true,
+        Complete = true,
+        Nodes =
+        [
+            new ClusterNodeLoad { NodeId = "coord", PagesCommitted = Count(after.ByNode, "coord") },
+            new ClusterNodeLoad { NodeId = "w1", PagesCommitted = Count(after.ByNode, "w1") },
+            new ClusterNodeLoad { NodeId = "w2", PagesCommitted = Count(after.ByNode, "w2") },
+        ],
+    });
+    string doneLine = "Cluster job job done: pages=6 elapsedMs=2000 3.0 pages/s byNode=coord=2 " + ner;
+    AssertTrue(doneLine.Contains("nerByNode=", StringComparison.Ordinal)
+        && doneLine.Contains("coord=", StringComparison.Ordinal)
+        && doneLine.Contains("w1=", StringComparison.Ordinal)
+        && doneLine.Contains("w2=", StringComparison.Ordinal),
+        "final job log line includes per-node NER counts (" + ner + ")");
+}
+
 Console.WriteLine("=== NER dispatch logs stay quiet ===");
 {
     var lines = new List<(LogLevel Level, string Text)>();
@@ -725,6 +830,95 @@ Console.WriteLine("=== NER dispatch logs stay quiet ===");
     ClusterJobLog.Progress(info, "job", 4, 10, 40, 1.5, 2, "coord=4", "ner=1/2 nerInFlight=1 nerByNode=worker-a=1");
     AssertTrue(lines.Any(l => l.Level == LogLevel.Information && l.Text.Contains("ner=1/2", StringComparison.Ordinal)),
         "progress summary includes NER progress");
+}
+
+async Task<(Dictionary<string, int> ByNode, double WallMs)> SimulateNer(
+    bool fair,
+    int cap,
+    int groups,
+    int llmMs,
+    bool workerLag,
+    string[] nodes)
+{
+    var sched = new ClusterNerScheduler(new ClusterNerOptions
+    {
+        PageCount = groups,
+        PagesPerRequest = 1,
+        MaxChars = 100_000,
+        LeaseMs = 60_000,
+        LocalNodeId = "coord",
+        FairDispatch = fair,
+        FairHoldMs = fair ? 5_000 : 0,
+        ActiveMs = 5_000,
+    });
+    foreach (string node in nodes)
+        sched.SetNerCapacity(node, cap);
+    for (int page = 1; page <= groups; page++)
+        sched.AddPage(new OcrPageResult { Page = page, Text = "第" + page + "页正文足够组成一组" });
+    sched.Seal();
+
+    var done = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+    var pumps = new List<Task>(nodes.Length * cap);
+    Stopwatch wall = Stopwatch.StartNew();
+    foreach (string node in nodes)
+    {
+        bool lag = workerLag && !string.Equals(node, "coord", StringComparison.Ordinal);
+        for (int i = 0; i < cap; i++)
+        {
+            string id = node;
+            pumps.Add(Task.Run(() => PumpNer(sched, id, llmMs, lag, done, cts.Token), cts.Token));
+        }
+    }
+
+    await Task.WhenAll(pumps).ConfigureAwait(false);
+    wall.Stop();
+    return (done.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal), wall.Elapsed.TotalMilliseconds);
+}
+
+async Task PumpNer(
+    ClusterNerScheduler sched,
+    string node,
+    int llmMs,
+    bool lag,
+    ConcurrentDictionary<string, int> done,
+    CancellationToken ct)
+{
+    if (lag)
+        await Task.Delay(500, ct).ConfigureAwait(false);
+    while (!ct.IsCancellationRequested)
+    {
+        if (sched.IsComplete)
+            return;
+        ClusterNerAssignment claim = sched.Claim(node, DateTimeOffset.UtcNow);
+        if (claim.Kind == ClusterNerClaimKind.Done)
+            return;
+        if (claim.Kind != ClusterNerClaimKind.Group)
+        {
+            if (lag)
+            {
+                await Task.Delay(500, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                sched.EnterWait(node, DateTimeOffset.UtcNow);
+                try
+                {
+                    await sched.WaitForChangeAsync(claim.Version, TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    sched.LeaveWait(node);
+                }
+            }
+
+            continue;
+        }
+
+        await Task.Delay(llmMs, ct).ConfigureAwait(false);
+        if (sched.TryComplete(claim.GroupId, node, [], [], []))
+            done.AddOrUpdate(node, 1, static (_, count) => count + 1);
+    }
 }
 
 if (failed > 0)

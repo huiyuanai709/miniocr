@@ -634,10 +634,16 @@ public sealed class ClusterWorkerHost : IHostedService
             ClusterNerClaimResponse? claim = await ClaimNerAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
             if (claim is null || claim.Done)
                 return;
-            if (claim.Wait || string.IsNullOrWhiteSpace(claim.GroupId) || string.IsNullOrWhiteSpace(claim.PromptText))
+            if (claim.Wait)
             {
                 ClusterJobLog.ClaimWait(_logger, _config.VerboseDispatch, _self.NodeId, jobId);
-                await Task.Delay(Math.Clamp(claim?.RetryAfterMs ?? 300, 50, 2000), ct).ConfigureAwait(false);
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(claim.GroupId) || string.IsNullOrWhiteSpace(claim.PromptText))
+            {
+                ClusterJobLog.ClaimWait(_logger, _config.VerboseDispatch, _self.NodeId, jobId);
+                await Task.Delay(Math.Clamp(claim.RetryAfterMs <= 0 ? 300 : claim.RetryAfterMs, 50, 2000), ct).ConfigureAwait(false);
                 continue;
             }
 
@@ -703,6 +709,7 @@ public sealed class ClusterWorkerHost : IHostedService
             NodeId = _self.NodeId,
             LlmConfigured = true,
             NerConcurrency = AdvertisedNerConcurrency,
+            WaitMs = ClusterCoordinator.NerClaimWaitMs,
         };
         using HttpRequestMessage req = new(HttpMethod.Post, coordinatorUrl + "/cluster/jobs/" + jobId + "/ner/claim");
         AddAuth(req);

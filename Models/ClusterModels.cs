@@ -237,6 +237,8 @@ public sealed class ClusterNerClaimRequest
     public string NodeId { get; set; } = "";
     public bool LlmConfigured { get; set; }
     public int NerConcurrency { get; set; }
+    /// <summary>How long the coordinator may hold this call waiting for a group. Zero uses the server default.</summary>
+    public int WaitMs { get; set; }
 }
 
 public sealed class ClusterNerPageText
@@ -258,6 +260,8 @@ public sealed class ClusterNerClaimResponse
     public int LookaheadPage { get; set; }
     public int LeaseMs { get; set; }
     public int RetryAfterMs { get; set; }
+    /// <summary>Scheduler version observed with this response. Long-poll waits until it changes.</summary>
+    public long Version { get; set; }
 }
 
 public sealed class ClusterNerEntityHit
