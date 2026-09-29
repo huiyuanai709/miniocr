@@ -314,11 +314,13 @@ public static partial class ClusterEndpoints
 
             if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
                 return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
-            ClusterNerClaimResponse claim = coordinator.ClaimNer(
+            ClusterNerClaimResponse claim = await coordinator.ClaimNerAsync(
                 job!,
                 body.NodeId.Trim(),
                 body.LlmConfigured,
-                body.NerConcurrency);
+                body.NerConcurrency,
+                body.WaitMs,
+                ct).ConfigureAwait(false);
             return Results.Json(claim, AppJsonContext.Default.ClusterNerClaimResponse);
         });
 

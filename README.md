@@ -764,13 +764,16 @@ OCR 仍按页批租约拉。文本 NER（`local` 模式，不是 `ocr.mode=llm` 
 1. 协调节点按和单机相同的规则切 NER 组：连续非空页、每组最多 `llm.pagesPerRequest`（默认 10）、超过 `maxCharsPerRequest` 提前拆开、空白页不进组。
 2. 一组在**下一非空页的前 240 字**已经知道（或全书 OCR 结束）之后才可被领取。领取报文带上这 240 字。工人把它附在提示词末尾，只用于接上被页边界拆开的名字；协调节点最后仍用**全书原文**做对齐，所以组落在不同节点上时，跨节点的拆名不会丢。
 3. 有 LLM key 的节点用**自己的** `llm.apiKey` / `llm.maxConcurrency` 调 Chat Completions，回传公司名、人名，以及带页码、`count`、`originText` 的实体。协调节点把各组合并、去重，再跑和单机一样的 `EntityPostProcessor`，回调格式不变。
-4. 没配 key 的工人只做 OCR。NER 组由其它有 key 的节点（含协调节点）领取。
-5. 工人 LLM 失败、租约到期或节点被判不健康时，该组重新排队，别的节点或协调节点重做。同一组最多尝试 8 次，避免一条坏请求把任务挂死。协调节点自己没有 key、到了 `jobDeadlineSeconds` 仍无人能跑时，放弃剩余组并记警告，已完成的 OCR 页仍在。
-6. `GET /health` 的 `cluster.nodes[]` 带 `llmConfigured` 和 `nerConcurrency`。`cluster.distributedNer` 也在 `cluster` 对象上。
+4. 组按负载分，不按谁先抢到。节点在途组数 / 自己的 `maxConcurrency` 更低，并且正在拉取（或正停在下面的长轮询里）时优先。负载相同才给当前调用方，所以协调节点不能在自己还没打满、工人更空的时候把组全部租走。已经登记了 NER 容量、但还没发出第一次领取的工人，在**第一组可领之后的约 3 秒**内仍算在内。没配 key 的工人只做 OCR，不参与这次分配。
+5. 工人 `POST /cluster/jobs/{jobId}/ner/claim` 会长轮询（默认约 15 秒）直到领到组、任务结束或超时，不再每 500ms 空转一次。协调节点本地的 NER 循环本来就是被信号唤醒的，和这次对齐。
+6. 工人 LLM 失败、租约到期或节点被判不健康时，该组重新排队，别的节点或协调节点重做。同一组最多尝试 8 次，避免一条坏请求把任务挂死。协调节点自己没有 key、到了 `jobDeadlineSeconds` 仍无人能跑时，放弃剩余组并记警告，已完成的 OCR 页仍在。
+7. `GET /health` 的 `cluster.nodes[]` 带 `llmConfigured` 和 `nerConcurrency`。`cluster.distributedNer` 也在 `cluster` 对象上。结束日志仍是一行：`byNode=` 是 OCR 页，后面的 `ner=已完成/已成组 nerInFlight= nerByNode=` 是各节点完成的 NER 组数。
+
+OCR 页调度没有做同样的改动。本地节点在途页数达到自己的容量后就会停手，剩余页留给工人；`joinGraceMs` 内还有一个本地窗口。长 PDF 上工人拿得到页。NER 之前的问题是：LLM 一组要十几秒，本地并发往往还没到 `maxConcurrency`，每次有组就绪都是本地先醒，工人的 500ms 轮询看不到队列。
 
 进度汇总在原来的 OCR `byNode=` 之外加上 `ner=已完成/已成组 nerInFlight=… nerByNode=…`。每组领取和完成默认是 Debug，`verboseDispatch` 时升到 Information。
 
-**速度（估算，不是端到端实测）：** 2000 页、几乎无空白时大约 200 个 NER 组。单协调节点 `maxConcurrency=8` 约 25 波 LLM 调用；3 台各自 concurrency 8（合计 24）约 9 波，LLM 阶段大约 **2.8×**。前提是每台用自己的 key、提供商吃得下合计并发，并且 OCR 已经把组喂出来。共享一个 key 时提供商限流会把加速吃掉。视觉模式（`ocr.mode=llm`）的实体来自页级 `ruleList`，不走这条分布式文本 NER。
+**速度：** 2000 页、几乎无空白时大约 200 个 NER 组。单协调节点 `maxConcurrency=8` 约 25 波 LLM 调用；3 台各自 concurrency 8（合计 24）约 9 波，LLM 阶段大约 **2.8×**（估算，不是端到端实测）。前提是每台用自己的 key、提供商吃得下合计并发，并且 OCR 已经把组喂出来。共享一个 key 时提供商限流会把加速吃掉。冒烟测试用 2 秒的假 LLM、6 个组：修复前协调节点 cap=8 时 6 组全在本地（工人 0，墙钟 2509ms）；修复后三台各 2 组（2001ms）。同一 cap=2 时，单节点 6005ms，三台 2001ms，约 **3.0×**。视觉模式（`ocr.mode=llm`）的实体来自页级 `ruleList`，不走这条分布式文本 NER。
 
 两边 DPI、`ocr.mode`、模型保持一致（都用默认 `local` + ChineseV6Tiny）。Mac 用 `osx-arm64` 包，Windows 用 `win-x64`（或 `win-x64-avx512v2`）包，Linux 工人用对应 RID。协议是 HTTP + JSON，不共享进程或原生库。
 

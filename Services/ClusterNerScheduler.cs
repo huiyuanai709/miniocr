@@ -34,6 +34,19 @@ public sealed class ClusterNerOptions
     public int LeaseMs { get; init; } = 135_000;
     public int MaxAttempts { get; init; } = 8;
     public string LocalNodeId { get; init; } = "local";
+    /// <summary>
+    /// When true, a caller does not take a group while another active LLM node has a strictly lower
+    /// in-flight/capacity ratio. Ties still go to the caller. Tests can turn this off to measure the old race.
+    /// </summary>
+    public bool FairDispatch { get; init; } = true;
+    /// <summary>A node that has claimed recently stays eligible for fair dispatch for this long.</summary>
+    public int ActiveMs { get; init; } = 5_000;
+    /// <summary>
+    /// After the first claimable group appears, remote nodes that already have NER capacity but have not
+    /// claimed yet still count as active for this long. Stops the coordinator from leasing every group
+    /// in the gap before the first worker poll. Zero disables that reservation.
+    /// </summary>
+    public int FairHoldMs { get; init; }
 }
 
 public sealed class ClusterNerSnapshot
@@ -54,7 +67,9 @@ public readonly record struct ClusterNerGiveUp(string GroupId, int[] Pages, int 
 /// until the next non-empty page's first 240 characters are known (or OCR is sealed), so
 /// the node that runs the group can join a name cut by the group boundary. Leases expire
 /// and failed groups are retried by another LLM-capable node. Nodes with NER capacity 0
-/// (no API key) are not given groups.
+/// (no API key) are not given groups. Among active LLM nodes, a group goes to a caller only when
+/// no other active node has a strictly lower in-flight/capacity ratio, so the coordinator cannot
+/// lease every group before workers poll.
 /// </summary>
 public sealed class ClusterNerScheduler
 {
@@ -63,12 +78,16 @@ public sealed class ClusterNerScheduler
     private readonly string _localNodeId;
     private readonly int _leaseMs;
     private readonly int _maxAttempts;
+    private readonly bool _fair;
+    private readonly TimeSpan _activeWindow;
+    private readonly int _fairHoldMs;
     private readonly LlmPageGrouper.OrderedBuffer _buffer;
     private readonly OcrPageResult?[] _accepted;
     private readonly Dictionary<string, Group> _groups = new(StringComparer.Ordinal);
     private readonly Queue<string> _ready = new();
     private readonly Dictionary<string, int> _caps = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _completedBy = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Peer> _peers = new(StringComparer.Ordinal);
     private readonly List<TaskCompletionSource<bool>> _waiters = [];
     private readonly List<ClusterLeaseExpiry> _expiries = [];
     private readonly List<ClusterNerGiveUp> _giveUps = [];
@@ -77,6 +96,7 @@ public sealed class ClusterNerScheduler
     private long _version;
     private bool _sealed;
     private bool _sawSuccess;
+    private DateTimeOffset _fairHoldUntil;
 
     public ClusterNerScheduler(ClusterNerOptions options)
     {
@@ -86,6 +106,9 @@ public sealed class ClusterNerScheduler
         _localNodeId = string.IsNullOrWhiteSpace(options.LocalNodeId) ? "local" : options.LocalNodeId;
         _leaseMs = Math.Clamp(options.LeaseMs <= 0 ? 135_000 : options.LeaseMs, 1_000, 600_000);
         _maxAttempts = Math.Clamp(options.MaxAttempts <= 0 ? 8 : options.MaxAttempts, 1, 32);
+        _fair = options.FairDispatch;
+        _activeWindow = TimeSpan.FromMilliseconds(Math.Clamp(options.ActiveMs <= 0 ? 5_000 : options.ActiveMs, 200, 120_000));
+        _fairHoldMs = Math.Clamp(options.FairHoldMs, 0, 60_000);
         _buffer = new LlmPageGrouper.OrderedBuffer(
             options.PageCount,
             Math.Max(1, options.PagesPerRequest),
@@ -206,7 +229,11 @@ public sealed class ClusterNerScheduler
             int cap = _caps.GetValueOrDefault(nodeId);
             if (cap <= 0 || string.IsNullOrWhiteSpace(nodeId))
                 return WaitClaim();
+            NotePullCore(nodeId, now);
+            EnsureFairHoldCore(now);
             if (InFlightCore(nodeId) >= cap)
+                return WaitClaim();
+            if (ShouldYieldCore(nodeId, now))
                 return WaitClaim();
 
             bool deferred = false;
@@ -443,6 +470,31 @@ public sealed class ClusterNerScheduler
         }
     }
 
+    /// <summary>The node is blocked in a long-poll (or the local wait loop) and should keep its fair-dispatch slot.</summary>
+    public void EnterWait(string nodeId, DateTimeOffset now)
+    {
+        if (string.IsNullOrWhiteSpace(nodeId))
+            return;
+        lock (_gate)
+        {
+            Peer peer = PeerOf(nodeId);
+            peer.Waiting++;
+            peer.LastPull = now;
+        }
+    }
+
+    public void LeaveWait(string nodeId)
+    {
+        if (string.IsNullOrWhiteSpace(nodeId))
+            return;
+        lock (_gate)
+        {
+            Peer peer = PeerOf(nodeId);
+            if (peer.Waiting > 0)
+                peer.Waiting--;
+        }
+    }
+
     public Task WaitForChangeAsync(long seenVersion, TimeSpan timeout, CancellationToken ct)
     {
         TaskCompletionSource<bool> tcs;
@@ -600,6 +652,92 @@ public sealed class ClusterNerScheduler
             ReleaseCore(id, expired: true);
     }
 
+    private void NotePullCore(string nodeId, DateTimeOffset now)
+    {
+        PeerOf(nodeId).LastPull = now;
+    }
+
+    private void EnsureFairHoldCore(DateTimeOffset now)
+    {
+        if (!_fair || _fairHoldMs <= 0 || _fairHoldUntil != default || _ready.Count == 0)
+            return;
+        foreach ((string id, int cap) in _caps)
+        {
+            if (cap > 0 && !string.Equals(id, _localNodeId, StringComparison.Ordinal))
+            {
+                _fairHoldUntil = now.AddMilliseconds(_fairHoldMs);
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// True when some other active node is less loaded and can accept a queued group.
+    /// Equal ratios do not yield, so a single assignment breaks the tie and the next claim prefers the node that fell behind.
+    /// </summary>
+    private bool ShouldYieldCore(string caller, DateTimeOffset now)
+    {
+        if (!_fair || !HasTakeableCore(caller))
+            return false;
+        double callerLoad = LoadCore(caller);
+        foreach ((string id, int cap) in _caps)
+        {
+            if (cap <= 0 || string.Equals(id, caller, StringComparison.Ordinal))
+                continue;
+            if (InFlightCore(id) >= cap || !IsActiveCore(id, now))
+                continue;
+            if (LoadCore(id) < callerLoad && HasTakeableCore(id))
+                return true;
+        }
+
+        return false;
+    }
+
+    private double LoadCore(string nodeId)
+    {
+        int cap = _caps.GetValueOrDefault(nodeId);
+        if (cap <= 0)
+            return 1;
+        return InFlightCore(nodeId) / (double)cap;
+    }
+
+    private bool IsActiveCore(string nodeId, DateTimeOffset now)
+    {
+        if (_caps.GetValueOrDefault(nodeId) <= 0)
+            return false;
+        Peer peer = PeerOf(nodeId);
+        if (peer.Waiting > 0 || InFlightCore(nodeId) > 0)
+            return true;
+        if (peer.LastPull != default && now - peer.LastPull <= _activeWindow)
+            return true;
+        return peer.LastPull == default && _fairHoldUntil != default && now <= _fairHoldUntil;
+    }
+
+    private bool HasTakeableCore(string nodeId)
+    {
+        foreach (string id in _ready)
+        {
+            if (!_groups.TryGetValue(id, out Group? group) || group.Done || group.Owner is not null)
+                continue;
+            if (string.Equals(group.LastFailedBy, nodeId, StringComparison.Ordinal) && OthersCanTakeCore(nodeId))
+                continue;
+            return true;
+        }
+
+        return false;
+    }
+
+    private Peer PeerOf(string nodeId)
+    {
+        if (!_peers.TryGetValue(nodeId, out Peer? peer))
+        {
+            peer = new Peer();
+            _peers[nodeId] = peer;
+        }
+
+        return peer;
+    }
+
     private int InFlightCore(string nodeId)
     {
         int n = 0;
@@ -695,6 +833,12 @@ public sealed class ClusterNerScheduler
         foreach (TaskCompletionSource<bool> waiter in _waiters)
             waiter.TrySetResult(true);
         _waiters.Clear();
+    }
+
+    private sealed class Peer
+    {
+        public int Waiting;
+        public DateTimeOffset LastPull;
     }
 
     private sealed class Group
