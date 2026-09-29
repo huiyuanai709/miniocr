@@ -204,6 +204,13 @@ public sealed class NacosClient
         }
     }
 
+    private static bool IsAbsoluteUrl(string? url)
+    {
+        return !string.IsNullOrWhiteSpace(url) &&
+               Uri.TryCreate(url, UriKind.Absolute, out Uri? u) &&
+               (u.Scheme == Uri.UriSchemeHttp || u.Scheme == Uri.UriSchemeHttps);
+    }
+
     /// <summary>
     /// Resolves the full URL for a nacos instance, preferring <c>uri</c> from metadata,
     /// then <c>url</c>, then <c>advertiseUrl</c>, and falling back to <c>http://{ip}:{port}</c>.
