@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging.Abstractions;
 using MiniOcr.Models;
 
 namespace MiniOcr.Services;
@@ -22,11 +23,13 @@ public sealed class ClusterNodeRegistry
     private readonly Dictionary<string, Node> _nodes = new(StringComparer.Ordinal);
     private readonly ClusterSelf _self;
     private readonly int _heartbeatFreshMs;
+    private readonly ILogger<ClusterNodeRegistry> _logger;
 
-    public ClusterNodeRegistry(ClusterSelf self, int heartbeatFreshMs)
+    public ClusterNodeRegistry(ClusterSelf self, int heartbeatFreshMs, ILogger<ClusterNodeRegistry>? logger = null)
     {
         _self = self;
         _heartbeatFreshMs = Math.Max(1000, heartbeatFreshMs);
+        _logger = logger ?? NullLogger<ClusterNodeRegistry>.Instance;
         _nodes[self.NodeId] = new Node
         {
             Id = self.NodeId,
@@ -221,6 +224,43 @@ public sealed class ClusterNodeRegistry
         }
     }
 
+    /// <summary>Mark nodes active in this Nacos poll cycle; prune those not seen recently.</summary>
+    public void PruneStaleNacosNodes(TimeSpan maxAge, IReadOnlySet<string> activeNodeIds)
+    {
+        lock (_gate)
+        {
+            DateTimeOffset cutoff = DateTimeOffset.UtcNow - maxAge;
+            List<string> toRemove = [];
+            foreach ((string id, Node node) in _nodes)
+            {
+                if (node.Local || node.Hidden)
+                    continue;
+                // Keep nodes from static config (Configured) and nodes that are still active in Nacos.
+                if (node.Configured)
+                    continue;
+                if (activeNodeIds.Contains(id) && node.LastNacosSeen > cutoff)
+                    continue;
+                toRemove.Add(id);
+            }
+
+            foreach (string id in toRemove)
+            {
+                _nodes.Remove(id);
+                _logger.LogDebug("Nacos node {NodeId} pruned (age > {MaxAge})", id, maxAge);
+            }
+        }
+    }
+
+    /// <summary>Record that a node was seen in the current Nacos poll.</summary>
+    public void MarkNacosSeen(string nodeId)
+    {
+        lock (_gate)
+        {
+            if (_nodes.TryGetValue(nodeId, out Node? node) && !node.Local)
+                node.LastNacosSeen = DateTimeOffset.UtcNow;
+        }
+    }
+
     public ClusterHealthInfo BuildHealth(
         IReadOnlyList<ClusterScheduleSnapshot> active,
         ClusterLastJobHealth? lastJob)
@@ -345,6 +385,7 @@ public sealed class ClusterNodeRegistry
         public string Model { get; set; } = "";
         public string? Warning { get; set; }
         public DateTimeOffset LastHeartbeat { get; set; }
+        public DateTimeOffset LastNacosSeen { get; set; }
     }
 }
 

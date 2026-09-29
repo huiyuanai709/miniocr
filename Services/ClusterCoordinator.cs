@@ -128,6 +128,7 @@ public sealed class ClusterCoordinator : IHostedService
     private readonly ClusterRuntimeConfig _config;
     private readonly ClusterNodeRegistry _registry;
     private readonly IHttpClientFactory _httpFactory;
+    private readonly NacosClient? _nacos;
     private readonly ILogger<ClusterCoordinator> _logger;
     private readonly ConcurrentDictionary<string, ClusterJob> _jobs = new(StringComparer.Ordinal);
     private readonly object _publish = new();
@@ -139,11 +140,13 @@ public sealed class ClusterCoordinator : IHostedService
         ClusterRuntimeConfig config,
         ClusterNodeRegistry registry,
         IHttpClientFactory httpFactory,
-        ILogger<ClusterCoordinator> logger)
+        ILogger<ClusterCoordinator> logger,
+        NacosClient? nacos = null)
     {
         _config = config;
         _registry = registry;
         _httpFactory = httpFactory;
+        _nacos = nacos;
         _logger = logger;
     }
 
@@ -695,6 +698,7 @@ public sealed class ClusterCoordinator : IHostedService
             while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
             {
                 await ProbeOnceAsync(ct).ConfigureAwait(false);
+                await SyncNacosNodesAsync(ct).ConfigureAwait(false);
                 DateTimeOffset now = DateTimeOffset.UtcNow;
                 foreach (ClusterJob job in _jobs.Values)
                 {
@@ -750,6 +754,88 @@ public sealed class ClusterCoordinator : IHostedService
                 remote.Url);
             foreach (ClusterJob job in _jobs.Values)
                 job.Scheduler.DropNode(remote.NodeId, DateTimeOffset.UtcNow);
+        }
+    }
+
+    private async Task SyncNacosNodesAsync(CancellationToken ct)
+    {
+        if (_nacos is null || !_config.UseNacos)
+            return;
+
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            List<NacosInstance> instances = await _nacos.ListInstancesAsync(timeout.Token).ConfigureAwait(false);
+
+            var activeIds = new HashSet<string>(StringComparer.Ordinal);
+
+            if (instances.Count > 0)
+            {
+                foreach (NacosInstance instance in instances)
+                {
+                    if (!instance.Healthy || !instance.Enabled)
+                        continue;
+
+                    string nodeId = instance.Metadata?.GetValueOrDefault("nodeId") ?? instance.InstanceId ?? "";
+                    if (string.IsNullOrWhiteSpace(nodeId))
+                        continue;
+
+                    activeIds.Add(nodeId);
+
+                    // Skip self.
+                    if (string.Equals(nodeId, _config.NodeId, StringComparison.Ordinal))
+                        continue;
+
+                    string url = NacosClient.ResolveUrl(instance);
+                    if (string.IsNullOrWhiteSpace(url))
+                        continue;
+
+                    string ocrMode = instance.Metadata?.GetValueOrDefault("ocrMode") ?? "";
+                    string model = instance.Metadata?.GetValueOrDefault("model") ?? "";
+                    int dpi = int.TryParse(instance.Metadata?.GetValueOrDefault("dpi"), out int pd) ? pd : 0;
+                    int capacity = int.TryParse(instance.Metadata?.GetValueOrDefault("capacity"), out int pc) ? pc : 1;
+                    int engineCount = int.TryParse(instance.Metadata?.GetValueOrDefault("engineCount"), out int pe) ? pe : 0;
+
+                    var req = new ClusterRegisterRequest
+                    {
+                        NodeId = nodeId,
+                        BaseUrl = url,
+                        Capacity = Math.Max(1, capacity),
+                        OcrMode = ocrMode,
+                        Model = model,
+                        Dpi = dpi,
+                        EngineCount = engineCount,
+                    };
+
+                    string? warning = _registry.Register(req);
+                    _registry.MarkNacosSeen(nodeId);
+                    if (!string.IsNullOrWhiteSpace(warning))
+                    {
+                        _logger.LogDebug(
+                            "Nacos node {NodeId} at {Url} differs from coordinator ({Warning}). Page text may differ across machines.",
+                            nodeId,
+                            url,
+                            warning);
+                    }
+
+                    // Also update capacity on active jobs.
+                    foreach (ClusterJob job in _jobs.Values)
+                        job.Scheduler.SetCapacity(nodeId, Math.Max(1, capacity));
+                }
+            }
+
+            // Prune nodes that haven't been seen in 3 poll cycles.
+            _registry.PruneStaleNacosNodes(
+                TimeSpan.FromMilliseconds(_config.HealthIntervalMs * 3 + 2000),
+                activeIds);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Nacos sync nodes failed");
         }
     }
 

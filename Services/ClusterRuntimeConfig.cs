@@ -31,6 +31,12 @@ public sealed class ClusterRuntimeConfig
     /// <summary>Set when a request to enable clustering was ignored (empty token).</summary>
     public string? DisabledReason { get; init; }
 
+    /// <summary>Nacos configuration, if enabled. Null when Nacos is off or the nacos section is missing.</summary>
+    public NacosFileConfig? Nacos { get; init; }
+
+    /// <summary>True when Nacos-based service discovery should be used.</summary>
+    public bool UseNacos => Enabled && Nacos is { Enabled: true };
+
     public bool IsCoordinator =>
         string.Equals(Role, "coordinator", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(Role, "both", StringComparison.OrdinalIgnoreCase);
@@ -108,6 +114,15 @@ public sealed class ClusterRuntimeConfig
         if (!string.IsNullOrWhiteSpace(envVerbose))
             verboseDispatch = ParseBool(envVerbose, verboseDispatch);
 
+        // ---- Nacos ----
+        NacosFileConfig? nacos = null;
+        if (enabled)
+        {
+            nacos = ResolveNacos(file?.Nacos, env);
+            if (nacos is not null && !nacos.Enabled)
+                nacos = null;
+        }
+
         List<ClusterWorkerEndpoint> workers = [];
         string? envWorkers = env("MINIOCR_CLUSTER_WORKERS");
         if (!string.IsNullOrWhiteSpace(envWorkers))
@@ -150,6 +165,7 @@ public sealed class ClusterRuntimeConfig
             VerboseDispatch = verboseDispatch,
             Workers = workers,
             DisabledReason = disabledReason,
+            Nacos = nacos,
         };
     }
 
@@ -194,6 +210,44 @@ public sealed class ClusterRuntimeConfig
         if (string.IsNullOrWhiteSpace(url))
             return null;
         return url.Trim().TrimEnd('/');
+    }
+
+    private static NacosFileConfig? ResolveNacos(NacosFileConfig? file, Func<string, string?> env)
+    {
+        NacosFileConfig? section = file;
+        bool enabled = section?.Enabled ?? false;
+        string? envEnabled = env("MINIOCR_NACOS_ENABLED");
+        if (!string.IsNullOrWhiteSpace(envEnabled))
+            enabled = ParseBool(envEnabled, enabled);
+
+        string serverAddr = FirstNonEmpty(env("MINIOCR_NACOS_SERVER_ADDR"), section?.ServerAddr) ?? "";
+        serverAddr = (serverAddr ?? "").Trim().TrimEnd('/');
+        if (!enabled || serverAddr.Length == 0)
+            return null;
+
+        return new NacosFileConfig
+        {
+            Enabled = true,
+            ServerAddr = serverAddr,
+            Namespace = FirstNonEmpty(env("MINIOCR_NACOS_NAMESPACE"), section?.Namespace) ?? "",
+            ServiceName = FirstNonEmpty(env("MINIOCR_NACOS_SERVICE_NAME"), section?.ServiceName) ?? "miniocr-cluster",
+            GroupName = FirstNonEmpty(env("MINIOCR_NACOS_GROUP"), section?.GroupName) ?? "DEFAULT_GROUP",
+            ClusterName = FirstNonEmpty(env("MINIOCR_NACOS_CLUSTER_NAME"), section?.ClusterName) ?? "DEFAULT",
+            Weight = ParseDouble(env("MINIOCR_NACOS_WEIGHT"), section?.Weight) ?? 1.0,
+            AccessToken = FirstNonEmpty(env("MINIOCR_NACOS_ACCESS_TOKEN"), section?.AccessToken) ?? "",
+            Username = FirstNonEmpty(env("MINIOCR_NACOS_USERNAME"), section?.Username) ?? "",
+            Password = FirstNonEmpty(env("MINIOCR_NACOS_PASSWORD"), section?.Password) ?? "",
+            HeartbeatIntervalSeconds = ReadInt(env, "MINIOCR_NACOS_HEARTBEAT_INTERVAL", section?.HeartbeatIntervalSeconds ?? 5),
+            HealthyCheckSeconds = ParseDouble(env("MINIOCR_NACOS_HEALTHY_CHECK"), section?.HealthyCheckSeconds) ?? 6.0,
+            Metadata = section?.Metadata,
+        };
+    }
+
+    private static double? ParseDouble(string? raw, double? fallback)
+    {
+        if (double.TryParse(raw, out double v))
+            return v;
+        return fallback;
     }
 }
 

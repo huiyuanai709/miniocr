@@ -73,5 +73,11 @@ namespace MiniOcr;
 [JsonSerializable(typeof(ClusterResultRequest))]
 [JsonSerializable(typeof(ClusterFailRequest))]
 [JsonSerializable(typeof(ClusterAck))]
+[JsonSerializable(typeof(NacosInstanceListResponse))]
+[JsonSerializable(typeof(NacosInstance))]
+[JsonSerializable(typeof(List<NacosInstance>))]
+[JsonSerializable(typeof(NacosLoginResponse))]
+[JsonSerializable(typeof(Dictionary<string, string>))]
+[JsonSerializable(typeof(NacosFileConfig))]
 [JsonSerializable(typeof(List<int>))]
 internal partial class AppJsonContext : JsonSerializerContext;

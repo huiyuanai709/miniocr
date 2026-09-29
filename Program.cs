@@ -261,6 +261,26 @@ if (clusterConfig.Enabled)
         $"capacity={clusterCapacity} model={clusterModel} dpi={runtimeConfig.DefaultDpi} " +
         $"workers={clusterConfig.Workers.Count} advertise={clusterConfig.AdvertiseUrl} " +
         $"coordinator={clusterConfig.CoordinatorUrl} verboseDispatch={(clusterConfig.VerboseDispatch ? "on" : "off")} token=(set)");
+
+    // Nacos service discovery: register this node and pull worker list from Nacos.
+    if (clusterConfig.UseNacos && clusterConfig.Nacos is not null)
+    {
+        builder.Services.AddHttpClient<NacosClient>("MiniOcr.Nacos", client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(10);
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("MiniOcr/1.0 (+nacos)");
+        });
+        builder.Services.AddSingleton(sp =>
+        {
+            IHttpClientFactory factory = sp.GetRequiredService<IHttpClientFactory>();
+            HttpClient http = factory.CreateClient("MiniOcr.Nacos");
+            return new NacosClient(http, clusterConfig.Nacos, sp.GetRequiredService<ILogger<NacosClient>>());
+        });
+        Console.WriteLine(
+            $"Nacos: enabled server={clusterConfig.Nacos.ServerAddr} service={clusterConfig.Nacos.ServiceName} " +
+            $"group={clusterConfig.Nacos.GroupName} cluster={clusterConfig.Nacos.ClusterName} " +
+            $"namespace={clusterConfig.Nacos.Namespace} auth={(clusterConfig.Nacos.HasAuth() ? "on" : "off")}");
+    }
 }
 else
 {
@@ -286,6 +306,11 @@ if (clusterConfig.Enabled)
     builder.Services.AddSingleton<ClusterWorkerHost>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterCoordinator>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterWorkerHost>());
+    if (clusterConfig.UseNacos)
+    {
+        builder.Services.AddSingleton<NacosHostedService>();
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<NacosHostedService>());
+    }
 }
 
 builder.Services.AddSingleton<ChallengeJobService>();

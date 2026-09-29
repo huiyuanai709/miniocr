@@ -10,6 +10,8 @@ public sealed class AppConfigFile
     public OcrFileConfig? Ocr { get; set; }
     /// <summary>Optional multi-machine OCR. Missing or <c>enabled: false</c> keeps single-node behavior.</summary>
     public ClusterFileConfig? Cluster { get; set; }
+    /// <summary>Optional Nacos service discovery. Missing or <c>enabled: false</c> keeps static worker discovery.</summary>
+    public NacosFileConfig? Nacos { get; set; }
 }
 
 public sealed class LlmFileConfig
@@ -190,6 +192,40 @@ public sealed class ChatCompletionResponse
 public sealed class ChatChoice
 {
     public ChatMessage? Message { get; set; }
+}
+
+/// <summary>config.json <c>nacos</c> section for service discovery.</summary>
+public sealed class NacosFileConfig
+{
+    public bool Enabled { get; set; }
+    /// <summary>Nacos server address, e.g. "http://127.0.0.1:8848".</summary>
+    public string ServerAddr { get; set; } = "";
+    /// <summary>Namespace id. Empty = public namespace.</summary>
+    public string Namespace { get; set; } = "";
+    /// <summary>Service name to register under and discover from.</summary>
+    public string ServiceName { get; set; } = "miniocr-cluster";
+    /// <summary>Group name. Default "DEFAULT_GROUP".</summary>
+    public string GroupName { get; set; } = "DEFAULT_GROUP";
+    /// <summary>Cluster name for Nacos's cluster concept. Default "DEFAULT".</summary>
+    public string ClusterName { get; set; } = "DEFAULT";
+    /// <summary>Weight for this instance (1.0 = full). Default 1.0.</summary>
+    public double Weight { get; set; } = 1.0;
+    /// <summary>Access token for Nacos auth (optional).</summary>
+    public string AccessToken { get; set; } = "";
+    /// <summary>Username for Nacos auth (optional).</summary>
+    public string Username { get; set; } = "";
+    /// <summary>Password for Nacos auth (optional).</summary>
+    public string Password { get; set; } = "";
+    /// <summary>Health check interval in seconds for heartbeat. Default 5.</summary>
+    public int HeartbeatIntervalSeconds { get; set; } = 5;
+    /// <summary>Healthy check threshold. Default 1.2x heartbeat interval.</summary>
+    public double HealthyCheckSeconds { get; set; } = 6.0;
+    /// <summary>Map Nacos instance metadata to this node's metadata.</summary>
+    public Dictionary<string, string>? Metadata { get; set; }
+
+    public bool HasAuth() =>
+        !string.IsNullOrWhiteSpace(AccessToken) ||
+        (!string.IsNullOrWhiteSpace(Username) && !string.IsNullOrWhiteSpace(Password));
 }
 
 /// <summary>Strict LLM NER payload: {"companies":["..."],"persons":["..."]}.</summary>

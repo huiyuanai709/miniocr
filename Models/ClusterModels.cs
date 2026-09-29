@@ -209,3 +209,65 @@ public sealed class ClusterAck
     public string? Error { get; set; }
     public int Accepted { get; set; }
 }
+
+// ---- Nacos Open API DTOs ----
+
+/// <summary>Nacos instance registration body (POST /nacos/v1/ns/instance).</summary>
+public sealed class NacosInstanceRegister
+{
+    public string Ip { get; set; } = "";
+    public int Port { get; set; }
+    public string ServiceName { get; set; } = "";
+    public string NamespaceId { get; set; } = "";
+    public double Weight { get; set; } = 1.0;
+    public bool Enabled { get; set; } = true;
+    public bool Healthy { get; set; } = true;
+    public string? ClusterName { get; set; }
+    public string? Metadata { get; set; }
+    public string? GroupName { get; set; }
+    public bool Ephemeral { get; set; } = true;
+}
+
+/// <summary>Nacos heartbeat body (PUT /nacos/v1/ns/instance/beat).</summary>
+public sealed class NacosHeartbeatRequest
+{
+    public string ServiceName { get; set; } = "";
+    public string Ip { get; set; } = "";
+    public int Port { get; set; }
+    public string NamespaceId { get; set; } = "";
+    public string? GroupName { get; set; }
+    public string? ClusterName { get; set; }
+    public bool Ephemeral { get; set; } = true;
+    public string? Metadata { get; set; }
+}
+
+/// <summary>Nacos instance list response (GET /nacos/v1/ns/instance/list).</summary>
+public sealed class NacosInstanceListResponse
+{
+    public string? Dom { get; set; }
+    public string? Name { get; set; }
+    public List<NacosInstance>? Hosts { get; set; }
+}
+
+/// <summary>A single instance in the Nacos instance list response.</summary>
+public sealed class NacosInstance
+{
+    public string? InstanceId { get; set; }
+    public string Ip { get; set; } = "";
+    public int Port { get; set; }
+    public double Weight { get; set; } = 1.0;
+    public bool Healthy { get; set; } = true;
+    public bool Enabled { get; set; } = true;
+    public bool Ephemeral { get; set; } = true;
+    public string? ClusterName { get; set; }
+    public string? ServiceName { get; set; }
+    public Dictionary<string, string>? Metadata { get; set; }
+}
+
+/// <summary>Nacos login response (POST /nacos/v1/auth/login).</summary>
+public sealed class NacosLoginResponse
+{
+    public string? AccessToken { get; set; }
+    public int TokenTtl { get; set; }
+    public bool GlobalAdmin { get; set; }
+}
