@@ -622,7 +622,7 @@ The current CPU is missing one or more of the required instruction sets.
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
 | 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`；`AntiAliasing=None` + `Grayscale`；多生产者写入有界 Channel，**绝不**同时持有全部页位图。llm 默认更多 raster workers（`min(8,cores)`）。 |
 | OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
-| 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
+| 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。集群默认把这些组发给有 LLM key 的节点（`cluster.distributedNer`），协调节点合并去重。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
 
 ### 峰值内存（量级，非承诺值）
@@ -730,6 +730,7 @@ The current CPU is missing one or more of the required instruction sets.
     "jobDeadlineSeconds": 300,
     "speculativeTailPages": 4,
     "verboseDispatch": false,
+    "distributedNer": true,
     "workers": [
       { "url": "http://192.168.1.30:5081", "capacity": 0 }
     ]
@@ -755,6 +756,21 @@ The current CPU is missing one or more of the required instruction sets.
 ```
 
 `capacity: 0` 表示用本机引擎数。`workers[].capacity: 0` 表示等对方 `/cluster/info` 或注册报文里的容量。
+
+### 分布式文本 NER
+
+OCR 仍按页批租约拉。文本 NER（`local` 模式，不是 `ocr.mode=llm` 的视觉抽取）在 `cluster.distributedNer` 为开时（**默认开**）不再堆在协调节点上：
+
+1. 协调节点按和单机相同的规则切 NER 组：连续非空页、每组最多 `llm.pagesPerRequest`（默认 10）、超过 `maxCharsPerRequest` 提前拆开、空白页不进组。
+2. 一组在**下一非空页的前 240 字**已经知道（或全书 OCR 结束）之后才可被领取。领取报文带上这 240 字。工人把它附在提示词末尾，只用于接上被页边界拆开的名字；协调节点最后仍用**全书原文**做对齐，所以组落在不同节点上时，跨节点的拆名不会丢。
+3. 有 LLM key 的节点用**自己的** `llm.apiKey` / `llm.maxConcurrency` 调 Chat Completions，回传公司名、人名，以及带页码、`count`、`originText` 的实体。协调节点把各组合并、去重，再跑和单机一样的 `EntityPostProcessor`，回调格式不变。
+4. 没配 key 的工人只做 OCR。NER 组由其它有 key 的节点（含协调节点）领取。
+5. 工人 LLM 失败、租约到期或节点被判不健康时，该组重新排队，别的节点或协调节点重做。同一组最多尝试 8 次，避免一条坏请求把任务挂死。协调节点自己没有 key、到了 `jobDeadlineSeconds` 仍无人能跑时，放弃剩余组并记警告，已完成的 OCR 页仍在。
+6. `GET /health` 的 `cluster.nodes[]` 带 `llmConfigured` 和 `nerConcurrency`。`cluster.distributedNer` 也在 `cluster` 对象上。
+
+进度汇总在原来的 OCR `byNode=` 之外加上 `ner=已完成/已成组 nerInFlight=… nerByNode=…`。每组领取和完成默认是 Debug，`verboseDispatch` 时升到 Information。
+
+**速度（估算，不是端到端实测）：** 2000 页、几乎无空白时大约 200 个 NER 组。单协调节点 `maxConcurrency=8` 约 25 波 LLM 调用；3 台各自 concurrency 8（合计 24）约 9 波，LLM 阶段大约 **2.8×**。前提是每台用自己的 key、提供商吃得下合计并发，并且 OCR 已经把组喂出来。共享一个 key 时提供商限流会把加速吃掉。视觉模式（`ocr.mode=llm`）的实体来自页级 `ruleList`，不走这条分布式文本 NER。
 
 两边 DPI、`ocr.mode`、模型保持一致（都用默认 `local` + ChineseV6Tiny）。Mac 用 `osx-arm64` 包，Windows 用 `win-x64`（或 `win-x64-avx512v2`）包，Linux 工人用对应 RID。协议是 HTTP + JSON，不共享进程或原生库。
 
@@ -788,6 +804,7 @@ MiniOcr.exe --urls http://0.0.0.0:5080
 | `MINIOCR_CLUSTER_JOIN_GRACE_MS` | 开局留给工人下载 PDF 的本地窗口 |
 | `MINIOCR_CLUSTER_SPECULATIVE_TAIL` | 尾巴投机复制的页数上限 |
 | `MINIOCR_CLUSTER_VERBOSE_DISPATCH` | `1` / `true` 时把领页、心跳、批次完成、空轮询打到 Information。默认关闭（这些行在 Debug） |
+| `MINIOCR_CLUSTER_DISTRIBUTED_NER` | `cluster.distributedNer`。默认 **开**（集群启用时）。`0` / `off` 时文本 NER 仍全部在协调节点上 |
 
 ### 日志
 
@@ -796,14 +813,14 @@ MiniOcr.exe --urls http://0.0.0.0:5080
 默认 Information 保留：
 
 - 任务开始、PDF 下载、渲染 / OCR / NER 的阶段和耗时、任务结束
-- 进度汇总：大约每 3 秒，或每跨过 10%（两次至少隔 1 秒）：`done/total`、pages/s、`byNode=`。结束时仍有一行带 pages/s 的 `byNode=`
+- 进度汇总：大约每 3 秒，或每跨过 10%（两次至少隔 1 秒）：`done/total`、pages/s、`byNode=`。分布式 NER 打开时同一行带 `ner=已完成/已成组 nerInFlight= nerByNode=`。结束时仍有一行带 pages/s 的 `byNode=`（以及 NER 汇总）
 - 工人注册、加入任务、离开任务（离开行带本节点页数）
 - 租约到期后页被重新排队、投机重试
 - 全部 warning / error
 
 改到 Debug 的例行事件（没有任务时的空轮询以前不打应用日志，现在也只在 Debug）：
 
-- 每次领页 / 发放租约
+- 每次领页 / 发放 OCR 租约，以及每次领取 / 完成 NER 组
 - 心跳成功
 - 每批完成、协调节点收下一批结果
 - 空的 dispatch / claim 轮询
@@ -859,6 +876,7 @@ miniocr/
     OcrRuntimeConfig.cs   # 文件+环境变量+CPU 自动扩缩
     ClusterRuntimeConfig.cs
     ClusterPageScheduler.cs  # 拉模式页队列、租约、尾巴投机
+    ClusterNerScheduler.cs   # 分布式文本 NER 分组、240 字页头、失败重试
     ClusterCoordinator.cs
     ClusterWorkerHost.cs
     ClusterEndpoints.cs

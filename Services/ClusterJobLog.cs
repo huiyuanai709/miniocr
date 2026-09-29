@@ -57,6 +57,12 @@ internal static class ClusterJobLog
         return parts.Count == 0 ? "(none)" : string.Join(", ", parts);
     }
 
+    public static string FormatNer(ClusterNerSnapshot snap)
+    {
+        string by = FormatByNode(new ClusterScheduleSnapshot { Nodes = snap.Nodes });
+        return "ner=" + snap.Done + "/" + snap.Formed + " nerInFlight=" + snap.InFlight + " nerByNode=" + by;
+    }
+
     public static void Claim(
         ILogger logger,
         bool verbose,
@@ -100,6 +106,59 @@ internal static class ClusterJobLog
                 pages,
                 false,
                 leaseMs);
+        }
+    }
+
+    public static void NerClaim(
+        ILogger logger,
+        bool verbose,
+        string jobId,
+        string nodeId,
+        string groupId,
+        string pages,
+        int leaseMs)
+    {
+        if (verbose)
+        {
+            logger.LogInformation(
+                "Cluster job {JobId} NER claim node={Node} group={Group} pages={Pages} leaseMs={Lease}",
+                jobId,
+                nodeId,
+                groupId,
+                pages,
+                leaseMs);
+        }
+        else
+        {
+            logger.LogDebug(
+                "Cluster job {JobId} NER claim node={Node} group={Group} pages={Pages} leaseMs={Lease}",
+                jobId,
+                nodeId,
+                groupId,
+                pages,
+                leaseMs);
+        }
+    }
+
+    public static void NerDone(ILogger logger, bool verbose, string nodeId, string jobId, string groupId, int entities)
+    {
+        if (verbose)
+        {
+            logger.LogInformation(
+                "Cluster worker {NodeId} job {JobId} NER group {Group} done entities={Entities}",
+                nodeId,
+                jobId,
+                groupId,
+                entities);
+        }
+        else
+        {
+            logger.LogDebug(
+                "Cluster worker {NodeId} job {JobId} NER group {Group} done entities={Entities}",
+                nodeId,
+                jobId,
+                groupId,
+                entities);
         }
     }
 
@@ -186,16 +245,32 @@ internal static class ClusterJobLog
         int percent,
         double pagesPerSecond,
         int inFlight,
-        string byNode)
+        string byNode,
+        string? ner = null)
     {
+        if (string.IsNullOrEmpty(ner))
+        {
+            logger.LogInformation(
+                "Cluster job {JobId} progress: {Done}/{Total} ({Percent}%) {Rate:F1} pages/s inFlight={InFlight} byNode={ByNode}",
+                jobId,
+                done,
+                total,
+                percent,
+                pagesPerSecond,
+                inFlight,
+                byNode);
+            return;
+        }
+
         logger.LogInformation(
-            "Cluster job {JobId} progress: {Done}/{Total} ({Percent}%) {Rate:F1} pages/s inFlight={InFlight} byNode={ByNode}",
+            "Cluster job {JobId} progress: {Done}/{Total} ({Percent}%) {Rate:F1} pages/s inFlight={InFlight} byNode={ByNode} {Ner}",
             jobId,
             done,
             total,
             percent,
             pagesPerSecond,
             inFlight,
-            byNode);
+            byNode,
+            ner);
     }
 }

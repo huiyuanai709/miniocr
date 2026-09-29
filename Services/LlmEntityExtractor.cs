@@ -73,6 +73,26 @@ public sealed class LlmEntityExtractor
         return session.CompleteAsync();
     }
 
+    public Task<LlmEntityPayload> ExtractBatchAsync(
+        string userText,
+        IReadOnlyList<int> pageNumbers,
+        CancellationToken ct) =>
+        CompleteBatchAsync(new LlmPageGrouper.PageBatch(userText, pageNumbers as int[] ?? pageNumbers.ToArray()), ct);
+
+    public async Task<ClusterNerResultRequest> ExtractDistributedAsync(
+        ClusterNerAssignment claim,
+        CancellationToken ct)
+    {
+        string prompt = ClusterNerPrompt.WithLookahead(claim.PromptText, claim.Lookahead, claim.LookaheadPage);
+        LlmEntityPayload payload = await ExtractBatchAsync(prompt, claim.Pages, ct).ConfigureAwait(false);
+        return new ClusterNerResultRequest
+        {
+            Companies = payload.Companies,
+            Persons = payload.Persons,
+            Entities = ClusterNerAssembler.Build(claim.Bodies, claim.Lookahead, payload),
+        };
+    }
+
     /// <summary>
     /// Overlaps LLM NER with OCR. Not thread-safe for <see cref="CompleteAsync"/>
     /// racing <see cref="Add"/>; OCR workers may call <see cref="Add"/> concurrently.

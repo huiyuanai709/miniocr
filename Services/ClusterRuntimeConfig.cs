@@ -27,6 +27,11 @@ public sealed class ClusterRuntimeConfig
     public int SpeculativeTailPages { get; init; } = 4;
     /// <summary>Promote routine dispatch logs (claim, heartbeat, batch done, empty poll) to Information.</summary>
     public bool VerboseDispatch { get; init; }
+    /// <summary>
+    /// When the cluster is on, workers that have an LLM key run text NER for groups they claim.
+    /// Default true. <c>MINIOCR_CLUSTER_DISTRIBUTED_NER=0</c> keeps NER on the coordinator.
+    /// </summary>
+    public bool DistributedNer { get; init; } = true;
     public IReadOnlyList<ClusterWorkerEndpoint> Workers { get; init; } = [];
     /// <summary>Set when a request to enable clustering was ignored (empty token).</summary>
     public string? DisabledReason { get; init; }
@@ -114,6 +119,11 @@ public sealed class ClusterRuntimeConfig
         if (!string.IsNullOrWhiteSpace(envVerbose))
             verboseDispatch = ParseBool(envVerbose, verboseDispatch);
 
+        bool distributedNer = section.DistributedNer ?? true;
+        string? envNer = env("MINIOCR_CLUSTER_DISTRIBUTED_NER");
+        if (!string.IsNullOrWhiteSpace(envNer))
+            distributedNer = ParseBool(envNer, distributedNer);
+
         // ---- Nacos ----
         NacosFileConfig? nacos = null;
         if (enabled)
@@ -163,6 +173,7 @@ public sealed class ClusterRuntimeConfig
             JoinGraceMs = joinGrace,
             SpeculativeTailPages = tail,
             VerboseDispatch = verboseDispatch,
+            DistributedNer = distributedNer,
             Workers = workers,
             DisabledReason = disabledReason,
             Nacos = nacos,

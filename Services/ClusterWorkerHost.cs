@@ -17,6 +17,7 @@ public sealed class ClusterWorkerHost : IHostedService
     private readonly ClusterRuntimeConfig _config;
     private readonly ClusterSelf _self;
     private readonly PdfOcrPipeline _pipeline;
+    private readonly LlmEntityExtractor _llm;
     private readonly IHttpClientFactory _httpFactory;
     private readonly ILogger<ClusterWorkerHost> _logger;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _sessions = new(StringComparer.Ordinal);
@@ -29,15 +30,22 @@ public sealed class ClusterWorkerHost : IHostedService
         ClusterRuntimeConfig config,
         ClusterSelf self,
         PdfOcrPipeline pipeline,
+        LlmEntityExtractor llm,
         IHttpClientFactory httpFactory,
         ILogger<ClusterWorkerHost> logger)
     {
         _config = config;
         _self = self;
         _pipeline = pipeline;
+        _llm = llm;
         _httpFactory = httpFactory;
         _logger = logger;
     }
+
+    private bool RunsDistributedNer => _config.DistributedNer && _llm.IsUsable;
+
+    private int AdvertisedNerConcurrency =>
+        RunsDistributedNer ? Math.Clamp(_llm.Config.MaxConcurrency, 1, 32) : 0;
 
     public int ActiveSessions => _sessions.Count;
     public int PagesDone => Volatile.Read(ref _pagesDone);
@@ -54,6 +62,8 @@ public sealed class ClusterWorkerHost : IHostedService
         Healthy = true,
         ActiveSessions = _sessions.Count,
         PagesDone = PagesDone,
+        LlmConfigured = _llm.IsUsable,
+        NerConcurrency = AdvertisedNerConcurrency,
     };
 
     public ClusterHealthInfo BuildHealth() => new()
@@ -67,6 +77,7 @@ public sealed class ClusterWorkerHost : IHostedService
         Dpi = _self.Dpi,
         Capacity = _self.Capacity,
         TokenSet = true,
+        DistributedNer = _config.DistributedNer,
         Nodes =
         [
             new ClusterNodeHealth
@@ -81,6 +92,8 @@ public sealed class ClusterWorkerHost : IHostedService
                 OcrMode = _self.OcrMode,
                 Model = _self.Model,
                 Dpi = _self.Dpi,
+                LlmConfigured = _llm.IsUsable,
+                NerConcurrency = AdvertisedNerConcurrency,
             },
         ],
     };
@@ -211,8 +224,10 @@ public sealed class ClusterWorkerHost : IHostedService
     {
         CancellationToken ct = sessionCts.Token;
         int localDone = 0;
+        int nerGroups = 0;
         DateTimeOffset started = DateTimeOffset.UtcNow;
         DateTimeOffset progressAt = started;
+        Task? nerTask = null;
         try
         {
             _logger.LogInformation(
@@ -232,6 +247,9 @@ public sealed class ClusterWorkerHost : IHostedService
                 pdf.Length,
                 download.Elapsed.TotalMilliseconds);
             await JoinAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+            nerTask = RunsDistributedNer
+                ? RunNerConsumersAsync(coordinatorUrl, jobId, () => Interlocked.Increment(ref nerGroups), ct)
+                : null;
 
             while (!ct.IsCancellationRequested)
             {
@@ -276,13 +294,28 @@ public sealed class ClusterWorkerHost : IHostedService
                     if (now - progressAt >= ClusterJobLog.ProgressInterval)
                     {
                         double rate = localDone / Math.Max(0.001, (now - started).TotalSeconds);
-                        _logger.LogInformation(
-                            "Cluster worker {NodeId} job {JobId} progress: localPages={Pages} jobPages={Total} {Rate:F1} pages/s",
-                            _self.NodeId,
-                            jobId,
-                            localDone,
-                            pageCount,
-                            rate);
+                        if (nerTask is null)
+                        {
+                            _logger.LogInformation(
+                                "Cluster worker {NodeId} job {JobId} progress: localPages={Pages} jobPages={Total} {Rate:F1} pages/s",
+                                _self.NodeId,
+                                jobId,
+                                localDone,
+                                pageCount,
+                                rate);
+                        }
+                        else
+                        {
+                            _logger.LogInformation(
+                                "Cluster worker {NodeId} job {JobId} progress: localPages={Pages} jobPages={Total} {Rate:F1} pages/s nerGroups={NerGroups}",
+                                _self.NodeId,
+                                jobId,
+                                localDone,
+                                pageCount,
+                                rate,
+                                Volatile.Read(ref nerGroups));
+                        }
+
                         progressAt = now;
                     }
                 }
@@ -300,6 +333,9 @@ public sealed class ClusterWorkerHost : IHostedService
                     Interlocked.Add(ref _inFlight, -claim.Pages.Count);
                 }
             }
+
+            if (nerTask is not null)
+                await nerTask.ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -310,6 +346,19 @@ public sealed class ClusterWorkerHost : IHostedService
         }
         finally
         {
+            if (nerTask is not null && !nerTask.IsCompleted)
+            {
+                try
+                {
+                    await sessionCts.CancelAsync().ConfigureAwait(false);
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
+
+            if (nerTask is not null)
+                await Quiet(nerTask).ConfigureAwait(false);
             _sessions.TryRemove(jobId, out _);
             sessionCts.Dispose();
             _logger.LogInformation(
@@ -387,6 +436,8 @@ public sealed class ClusterWorkerHost : IHostedService
                     Capacity = _self.Capacity,
                     InFlight = Volatile.Read(ref _inFlight),
                     Healthy = true,
+                    LlmConfigured = _llm.IsUsable,
+                    NerConcurrency = AdvertisedNerConcurrency,
                 };
                 try
                 {
@@ -556,6 +607,162 @@ public sealed class ClusterWorkerHost : IHostedService
         }
     }
 
+    private async Task RunNerConsumersAsync(
+        string coordinatorUrl,
+        string jobId,
+        Action onGroupDone,
+        CancellationToken ct)
+    {
+        int consumers = AdvertisedNerConcurrency;
+        if (consumers <= 0)
+            return;
+        _logger.LogInformation(
+            "Cluster worker {NodeId} job {JobId} distributed NER: concurrency={Concurrency}",
+            _self.NodeId,
+            jobId,
+            consumers);
+        Task[] tasks = new Task[consumers];
+        for (int i = 0; i < consumers; i++)
+            tasks[i] = NerConsumerAsync(coordinatorUrl, jobId, onGroupDone, ct);
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+    }
+
+    private async Task NerConsumerAsync(string coordinatorUrl, string jobId, Action onGroupDone, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            ClusterNerClaimResponse? claim = await ClaimNerAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+            if (claim is null || claim.Done)
+                return;
+            if (claim.Wait || string.IsNullOrWhiteSpace(claim.GroupId) || string.IsNullOrWhiteSpace(claim.PromptText))
+            {
+                ClusterJobLog.ClaimWait(_logger, _config.VerboseDispatch, _self.NodeId, jobId);
+                await Task.Delay(Math.Clamp(claim?.RetryAfterMs ?? 300, 50, 2000), ct).ConfigureAwait(false);
+                continue;
+            }
+
+            var bodies = new OcrPageResult[claim.PageTexts?.Count ?? 0];
+            if (claim.PageTexts is not null)
+            {
+                for (int i = 0; i < claim.PageTexts.Count; i++)
+                {
+                    bodies[i] = new OcrPageResult
+                    {
+                        Page = claim.PageTexts[i].Page,
+                        Text = claim.PageTexts[i].Text ?? "",
+                    };
+                }
+            }
+
+            var assignment = new ClusterNerAssignment
+            {
+                Kind = ClusterNerClaimKind.Group,
+                GroupId = claim.GroupId,
+                Pages = claim.Pages?.ToArray() ?? [],
+                Bodies = bodies,
+                PromptText = claim.PromptText,
+                Lookahead = claim.Lookahead,
+                LookaheadPage = claim.LookaheadPage,
+                LeaseMs = claim.LeaseMs,
+            };
+
+            try
+            {
+                ClusterNerResultRequest result = await _llm.ExtractDistributedAsync(assignment, ct).ConfigureAwait(false);
+                result.NodeId = _self.NodeId;
+                result.GroupId = claim.GroupId;
+                int accepted = await PostNerAsync(coordinatorUrl, jobId, result, ct).ConfigureAwait(false);
+                if (accepted > 0)
+                {
+                    onGroupDone();
+                    ClusterJobLog.NerDone(
+                        _logger,
+                        _config.VerboseDispatch,
+                        _self.NodeId,
+                        jobId,
+                        claim.GroupId,
+                        result.Entities?.Count ?? 0);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Cluster worker {NodeId} NER group {Group} failed", _self.NodeId, claim.GroupId);
+                await PostNerFailAsync(coordinatorUrl, jobId, claim.GroupId, ex.Message, ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task<ClusterNerClaimResponse?> ClaimNerAsync(string coordinatorUrl, string jobId, CancellationToken ct)
+    {
+        var body = new ClusterNerClaimRequest
+        {
+            NodeId = _self.NodeId,
+            LlmConfigured = true,
+            NerConcurrency = AdvertisedNerConcurrency,
+        };
+        using HttpRequestMessage req = new(HttpMethod.Post, coordinatorUrl + "/cluster/jobs/" + jobId + "/ner/claim");
+        AddAuth(req);
+        req.Content = JsonContent.Create(body, AppJsonContext.Default.ClusterNerClaimRequest);
+        using HttpResponseMessage resp = await Client().SendAsync(req, ct).ConfigureAwait(false);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
+            return null;
+        resp.EnsureSuccessStatusCode();
+        await using Stream stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        return await JsonSerializer.DeserializeAsync(stream, AppJsonContext.Default.ClusterNerClaimResponse, ct)
+            .ConfigureAwait(false);
+    }
+
+    private async Task<int> PostNerAsync(string coordinatorUrl, string jobId, ClusterNerResultRequest body, CancellationToken ct)
+    {
+        Exception? last = null;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                using HttpRequestMessage req = new(HttpMethod.Post, coordinatorUrl + "/cluster/jobs/" + jobId + "/ner/result");
+                AddAuth(req);
+                req.Content = JsonContent.Create(body, AppJsonContext.Default.ClusterNerResultRequest);
+                using HttpResponseMessage resp = await Client().SendAsync(req, ct).ConfigureAwait(false);
+                resp.EnsureSuccessStatusCode();
+                await using Stream stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                ClusterAck? ack = await JsonSerializer.DeserializeAsync(stream, AppJsonContext.Default.ClusterAck, ct)
+                    .ConfigureAwait(false);
+                return ack?.Accepted ?? 0;
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested && ex is HttpRequestException or TaskCanceledException)
+            {
+                last = ex;
+            }
+        }
+
+        throw last ?? new HttpRequestException("NER result post failed");
+    }
+
+    private async Task PostNerFailAsync(string coordinatorUrl, string jobId, string groupId, string error, CancellationToken ct)
+    {
+        try
+        {
+            var body = new ClusterFailRequest
+            {
+                NodeId = _self.NodeId,
+                BatchId = groupId,
+                Error = error.Length > 300 ? error[..300] : error,
+            };
+            using HttpRequestMessage req = new(HttpMethod.Post, coordinatorUrl + "/cluster/jobs/" + jobId + "/ner/fail");
+            AddAuth(req);
+            req.Content = JsonContent.Create(body, AppJsonContext.Default.ClusterFailRequest);
+            using HttpResponseMessage resp = await Client().SendAsync(req, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Cluster NER fail callback could not be delivered");
+        }
+    }
+
     private ClusterRegisterRequest RegisterBody() => new()
     {
         NodeId = _self.NodeId,
@@ -565,6 +772,8 @@ public sealed class ClusterWorkerHost : IHostedService
         Model = _self.Model,
         Dpi = _self.Dpi,
         EngineCount = _self.EngineCount,
+        LlmConfigured = _llm.IsUsable,
+        NerConcurrency = AdvertisedNerConcurrency,
     };
 
     private HttpClient Client() => _httpFactory.CreateClient(ClusterCoordinator.HttpClientName);

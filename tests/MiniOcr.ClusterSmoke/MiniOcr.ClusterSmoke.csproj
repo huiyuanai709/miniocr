@@ -18,6 +18,10 @@
     <Compile Include="..\..\Services\ClusterRuntimeConfig.cs" Link="ClusterRuntimeConfig.cs" />
     <Compile Include="..\..\Services\ClusterAuth.cs" Link="ClusterAuth.cs" />
     <Compile Include="..\..\Services\LlmPageGrouper.cs" Link="LlmPageGrouper.cs" />
+    <Compile Include="..\..\Services\ClusterNerScheduler.cs" Link="ClusterNerScheduler.cs" />
+    <Compile Include="..\..\Services\EntityText.cs" Link="EntityText.cs" />
+    <Compile Include="..\..\Services\EntityPostProcessor.cs" Link="EntityPostProcessor.cs" />
+    <Compile Include="..\..\Services\ChallengeResultMapper.cs" Link="ChallengeResultMapper.cs" />
     <Compile Include="..\..\Models\ClusterModels.cs" Link="ClusterModels.cs" />
     <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
     <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />

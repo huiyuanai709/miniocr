@@ -438,6 +438,295 @@ Console.WriteLine("=== dispatch log level (before/after at Information) ===");
     Console.WriteLine("--- suppressed at Information: " + before.Count + " routine lines; progress, speculative retry, and lease expiry kept ---");
 }
 
+Console.WriteLine("=== distributed NER config ===");
+{
+    ClusterRuntimeConfig defaults = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile { Cluster = new ClusterFileConfig { Enabled = true, Token = "t" } },
+        _ => null);
+    AssertTrue(defaults.DistributedNer, "distributed NER defaults on when unset");
+    ClusterRuntimeConfig fileOff = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile { Cluster = new ClusterFileConfig { Enabled = true, Token = "t", DistributedNer = false } },
+        _ => null);
+    AssertTrue(!fileOff.DistributedNer, "file distributedNer false");
+    ClusterRuntimeConfig envOn = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile { Cluster = new ClusterFileConfig { Enabled = true, Token = "t", DistributedNer = false } },
+        name => name == "MINIOCR_CLUSTER_DISTRIBUTED_NER" ? "1" : null);
+    AssertTrue(envOn.DistributedNer, "MINIOCR_CLUSTER_DISTRIBUTED_NER=1 overrides file");
+    ClusterRuntimeConfig envOff = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile { Cluster = new ClusterFileConfig { Enabled = true, Token = "t" } },
+        name => name == "MINIOCR_CLUSTER_DISTRIBUTED_NER" ? "off" : null);
+    AssertTrue(!envOff.DistributedNer, "MINIOCR_CLUSTER_DISTRIBUTED_NER=off");
+
+    var self = new ClusterSelf
+    {
+        NodeId = "coord",
+        Role = "coordinator",
+        Capacity = 2,
+        EngineCount = 2,
+        OcrMode = "local",
+        Model = "ChineseV6Tiny",
+        Dpi = 96,
+        AdvertiseUrl = "http://127.0.0.1:5080",
+        LlmConfigured = true,
+        NerConcurrency = 8,
+    };
+    ClusterHealthInfo health = new ClusterNodeRegistry(self, 3_000).BuildHealth([], null);
+    ClusterNodeHealth local = health.Nodes.Single(n => n.Local);
+    AssertTrue(local.LlmConfigured && local.NerConcurrency == 8, "health reports that the local node has an LLM key");
+}
+
+Console.WriteLine("=== distributed NER groups, lookahead, failure, merge ===");
+{
+    string page2 = "腾科技有限公司法定代表人张伟签署本合同正文内容补充说明" + new string('。', 280);
+    string page4 = "乙方北京华腾科技有限公司再次出现，联系人张伟确认条款有效并签字。";
+    OcrPageResult[] doc =
+    [
+        new() { Page = 1, Text = "甲方北京华" },
+        new() { Page = 2, Text = page2 },
+        new() { Page = 3, Text = "   " },
+        new() { Page = 4, Text = page4 },
+    ];
+
+    ClusterNerScheduler sched = new(new ClusterNerOptions
+    {
+        PageCount = 4,
+        PagesPerRequest = 1,
+        MaxChars = 100_000,
+        LeaseMs = 5_000,
+        MaxAttempts = 4,
+        LocalNodeId = "coord",
+    });
+    sched.SetNerCapacity("worker-a", 1);
+    sched.SetNerCapacity("worker-b", 2);
+    sched.SetNerCapacity("no-key", 0);
+    foreach (OcrPageResult page in doc)
+        sched.AddPage(page);
+
+    DateTimeOffset now = new(2026, 3, 1, 0, 0, 0, TimeSpan.Zero);
+    ClusterNerAssignment blocked = sched.Claim("no-key", now);
+    AssertTrue(blocked.Kind == ClusterNerClaimKind.Wait, "node without an LLM key is not given a NER group");
+
+    ClusterNerAssignment first = sched.Claim("worker-a", now);
+    AssertTrue(first.Kind == ClusterNerClaimKind.Group && first.Pages.SequenceEqual([1]), "first group is page 1");
+    AssertTrue(first.LookaheadPage == 2, "page 1 group carries the next page number");
+    AssertTrue(first.Lookahead is not null && first.Lookahead.Length == 240, "lookahead is the 240-char head");
+    AssertTrue(first.Lookahead!.Contains("腾科技有限公司", StringComparison.Ordinal), "lookahead includes the split company tail");
+    AssertTrue(!first.Lookahead.Contains(page4, StringComparison.Ordinal), "lookahead is not the whole following page");
+    string prompt = ClusterNerPrompt.WithLookahead(first.PromptText, first.Lookahead, first.LookaheadPage);
+    AssertTrue(prompt.Contains("下一页开头", StringComparison.Ordinal), "prompt marks the next-page head as context");
+    AssertTrue(prompt.Contains("甲方北京华", StringComparison.Ordinal) && prompt.Contains("腾科技有限公司", StringComparison.Ordinal),
+        "owning node sees both halves of a cross-group name");
+
+    LlmEntityPayload Fake(ClusterNerAssignment claim)
+    {
+        string text = ClusterNerPrompt.WithLookahead(claim.PromptText, claim.Lookahead, claim.LookaheadPage);
+        List<string> companies = [];
+        List<string> persons = [];
+        if (text.Contains("北京华", StringComparison.Ordinal) && text.Contains("腾科技有限公司", StringComparison.Ordinal))
+            companies.Add("北京华腾科技有限公司");
+        else if (text.Contains("北京华腾科技有限公司", StringComparison.Ordinal))
+            companies.Add("北京华腾科技有限公司");
+        if (text.Contains("张伟", StringComparison.Ordinal))
+            persons.Add("张伟");
+        return new LlmEntityPayload { Companies = companies, Persons = persons };
+    }
+
+    bool CommitFake(ClusterNerAssignment claim, string nodeId)
+    {
+        LlmEntityPayload payload = Fake(claim);
+        return sched.TryComplete(
+            claim.GroupId,
+            nodeId,
+            payload.Companies,
+            payload.Persons,
+            ClusterNerAssembler.Build(claim.Bodies, claim.Lookahead, payload));
+    }
+
+    List<ClusterNerEntityHit> firstHits = ClusterNerAssembler.Build(first.Bodies, first.Lookahead, Fake(first));
+    ClusterNerEntityHit? boundary = firstHits.FirstOrDefault(h => h.Kind == "company" && h.Page == 1);
+    AssertTrue(boundary is not null, "worker returns a company hit on the boundary page");
+    AssertTrue(boundary!.OriginText.Count > 0 && boundary.OriginText.All(t => t.Length is >= 10 and <= 100),
+        "originText is 10–100 chars");
+    AssertTrue(boundary.OriginText.All(t => t.Contains("北京华腾科技有限公司", StringComparison.Ordinal)),
+        "originText contains the joined company name");
+    AssertTrue(CommitFake(first, "worker-a"), "page 1 group commits");
+
+    ClusterNerAssignment second = sched.Claim("worker-b", now);
+    AssertTrue(second.Kind == ClusterNerClaimKind.Group && second.Pages.SequenceEqual([2]), "next group is page 2 (blank page skipped)");
+    AssertTrue(CommitFake(second, "worker-b"), "page 2 group commits");
+
+    sched.Seal();
+    ClusterNerAssignment last = sched.Claim("worker-a", now);
+    AssertTrue(last.Kind == ClusterNerClaimKind.Group && last.Pages.SequenceEqual([4]), "tail group is page 4 after seal");
+    AssertTrue(string.IsNullOrEmpty(last.Lookahead), "last group has no next page");
+    AssertTrue(CommitFake(last, "worker-a"), "tail group commits");
+    AssertTrue(sched.IsComplete, "every non-empty page's group completed");
+    AssertTrue(sched.Claim("no-key", now).Kind == ClusterNerClaimKind.Done, "no-key node sees the job done");
+
+    OcrEntities merged = sched.Merge();
+    EntityHit? company = merged.Companies.SingleOrDefault(c => c.Name == "北京华腾科技有限公司");
+    EntityHit? person = merged.Persons.SingleOrDefault(p => p.Name == "张伟");
+    AssertTrue(company is not null && person is not null, "merge keeps the company and the person");
+    AssertTrue(merged.Companies.Count == 1 && merged.Persons.Count == 1, "duplicate LLM returns collapse to one name each");
+    AssertTrue(company!.Pages.SequenceEqual([1, 4]) && company.Count == 2,
+        $"joined company is on pages 1 and 4 once each (pages={string.Join(",", company.Pages)} count={company.Count})");
+    AssertTrue(person!.Pages.SequenceEqual([2, 4]) && person.Count == 2,
+        $"person stays on the pages that contain it (pages={string.Join(",", person.Pages)} count={person.Count})");
+
+    ChallengeFileResult protocol = ChallengeResultMapper.BuildFileResult(
+        "f1",
+        doc.Where(p => !string.IsNullOrWhiteSpace(p.Text)).ToList(),
+        merged.Companies.Select(c => c.Name).ToList(),
+        merged.Persons.Select(p => p.Name).ToList());
+    int originCount = protocol.Pages.SelectMany(p => p.RuleList).SelectMany(r => r.RuleItemList).Sum(i => i.OriginText.Count);
+    AssertTrue(originCount >= 2, "coordinator protocol output still has originText");
+}
+
+Console.WriteLine("=== NER failure and lease expiry ===");
+{
+    DateTimeOffset now = new(2026, 4, 1, 0, 0, 0, TimeSpan.Zero);
+    ClusterNerScheduler failSched = new(new ClusterNerOptions
+    {
+        PageCount = 1,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LeaseMs = 5_000,
+        LocalNodeId = "coord",
+    });
+    failSched.SetNerCapacity("worker-a", 1);
+    failSched.SetNerCapacity("worker-b", 1);
+    failSched.AddPage(new OcrPageResult { Page = 1, Text = "甲方北京华腾科技有限公司与张伟签订" });
+    failSched.Seal();
+    ClusterNerAssignment owned = failSched.Claim("worker-a", now);
+    AssertTrue(owned.Kind == ClusterNerClaimKind.Group, "failure fixture leased the only group");
+    failSched.Fail(owned.GroupId, "worker-a");
+    ClusterNerAssignment again = failSched.Claim("worker-a", now);
+    AssertTrue(again.Kind == ClusterNerClaimKind.Wait, "the node that just failed waits while another LLM node can take the group");
+    ClusterNerAssignment retry = failSched.Claim("worker-b", now);
+    AssertTrue(retry.Kind == ClusterNerClaimKind.Group && retry.GroupId == owned.GroupId, "another node redoes the failed group");
+    AssertTrue(!failSched.TryComplete(owned.GroupId, "worker-a", ["北京华腾科技有限公司"], ["张伟"], null),
+        "late result from the failed node is rejected");
+    AssertTrue(failSched.TryComplete(retry.GroupId, "worker-b", ["北京华腾科技有限公司"], ["张伟"], null),
+        "the retry node commits");
+
+    ClusterNerScheduler leaseSched = new(new ClusterNerOptions
+    {
+        PageCount = 1,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LeaseMs = 5_000,
+        LocalNodeId = "coord",
+    });
+    leaseSched.SetNerCapacity("worker-a", 1);
+    leaseSched.SetNerCapacity("worker-b", 1);
+    leaseSched.AddPage(new OcrPageResult { Page = 1, Text = "页二正文里有张伟和一段足够长的说明文字" });
+    leaseSched.Seal();
+    ClusterNerAssignment held = leaseSched.Claim("worker-a", now);
+    AssertTrue(held.Kind == ClusterNerClaimKind.Group, "expiry fixture leased the group");
+    ClusterNerAssignment tooSoon = leaseSched.Claim("worker-b", now.AddSeconds(1));
+    AssertTrue(tooSoon.Kind == ClusterNerClaimKind.Wait, "the other node waits while the NER lease holds");
+    ClusterNerAssignment expired = leaseSched.Claim("worker-b", now.AddMilliseconds(held.LeaseMs + 1));
+    AssertTrue(expired.Kind == ClusterNerClaimKind.Group && expired.GroupId == held.GroupId, "expired NER lease is retried by the other node");
+    ClusterLeaseExpiry[] expiries = leaseSched.DrainExpiries();
+    AssertTrue(expiries.Length == 1 && expiries[0].NodeId == "worker-a" && expiries[0].Pages.SequenceEqual(held.Pages),
+        "NER lease expiry is recorded");
+    AssertTrue(!leaseSched.TryComplete(held.GroupId, "worker-a", ["张伟"], null, null), "expired owner cannot commit");
+    AssertTrue(leaseSched.TryComplete(expired.GroupId, "worker-b", ["张伟"], null, null), "the node that retried the lease commits");
+    AssertTrue(leaseSched.IsComplete, "job completes on the retry node");
+}
+
+Console.WriteLine("=== NER capacity and give-up ===");
+{
+    ClusterNerScheduler sched = new(new ClusterNerOptions
+    {
+        PageCount = 6,
+        PagesPerRequest = 1,
+        MaxChars = 50_000,
+        LeaseMs = 30_000,
+        MaxAttempts = 2,
+        LocalNodeId = "coord",
+    });
+    sched.SetNerCapacity("fast", 2);
+    sched.SetNerCapacity("slow", 1);
+    for (int page = 1; page <= 6; page++)
+        sched.AddPage(new OcrPageResult { Page = page, Text = "页" + page + "正文足够长以便分组" });
+    sched.Seal();
+    DateTimeOffset now = DateTimeOffset.UtcNow;
+    ClusterNerAssignment a = sched.Claim("fast", now);
+    ClusterNerAssignment b = sched.Claim("fast", now);
+    ClusterNerAssignment c = sched.Claim("fast", now);
+    AssertTrue(a.Kind == ClusterNerClaimKind.Group && b.Kind == ClusterNerClaimKind.Group, "fast node holds two groups");
+    AssertTrue(c.Kind == ClusterNerClaimKind.Wait, "fast node cannot exceed its NER concurrency");
+    AssertTrue(sched.TryComplete(a.GroupId, "fast", [], [], []), "release one fast slot");
+    AssertTrue(sched.TryComplete(b.GroupId, "fast", [], [], []), "release the other fast slot");
+
+    int fastDone = 2;
+    int slowDone = 0;
+    int guard = 0;
+    while (!sched.IsComplete && guard++ < 20)
+    {
+        ClusterNerAssignment fast = sched.Claim("fast", now);
+        if (fast.Kind == ClusterNerClaimKind.Group &&
+            sched.TryComplete(fast.GroupId, "fast", [], [], []))
+            fastDone++;
+        ClusterNerAssignment fast2 = sched.Claim("fast", now);
+        if (fast2.Kind == ClusterNerClaimKind.Group &&
+            sched.TryComplete(fast2.GroupId, "fast", [], [], []))
+            fastDone++;
+        ClusterNerAssignment slow = sched.Claim("slow", now);
+        if (slow.Kind == ClusterNerClaimKind.Group &&
+            sched.TryComplete(slow.GroupId, "slow", [], [], []))
+            slowDone++;
+    }
+
+    AssertTrue(sched.IsComplete && fastDone + slowDone == 6, $"all 6 groups finished ({fastDone}+{slowDone})");
+    AssertTrue(fastDone > slowDone, $"higher NER concurrency finishes more groups (fast={fastDone} slow={slowDone})");
+
+    ClusterNerScheduler poison = new(new ClusterNerOptions
+    {
+        PageCount = 1,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LeaseMs = 5_000,
+        MaxAttempts = 2,
+        LocalNodeId = "coord",
+    });
+    poison.SetNerCapacity("only", 1);
+    poison.AddPage(new OcrPageResult { Page = 1, Text = "只有一页的合同正文" });
+    poison.Seal();
+    ClusterNerAssignment bad = poison.Claim("only", now);
+    poison.Fail(bad.GroupId, "only");
+    ClusterNerAssignment bad2 = poison.Claim("only", now);
+    AssertTrue(bad2.Kind == ClusterNerClaimKind.Group && bad2.GroupId == bad.GroupId, "the only LLM node may retry");
+    poison.Fail(bad2.GroupId, "only");
+    AssertTrue(poison.IsComplete, "giving up after max attempts still finishes the job");
+    AssertTrue(poison.DrainGiveUps().Length == 1, "give-up is reported");
+    AssertTrue(poison.Merge().Companies.Count == 0 && poison.Merge().Persons.Count == 0, "abandoned group adds no names");
+
+    int singleWaves = (200 + 8 - 1) / 8;
+    int tripleWaves = (200 + 24 - 1) / 24;
+    AssertTrue(tripleWaves < singleWaves && singleWaves >= tripleWaves * 2,
+        $"200 groups: 1x8 needs {singleWaves} waves, 3x8 needs {tripleWaves} (~{singleWaves / (double)tripleWaves:F1}x)");
+    Console.WriteLine(
+        $"  estimated LLM-stage speedup for 2000 non-empty pages / 10: {singleWaves} waves on one node vs {tripleWaves} waves on three ({singleWaves / (double)tripleWaves:F1}x), assuming each node has its own key and the provider accepts the aggregate concurrency");
+}
+
+Console.WriteLine("=== NER dispatch logs stay quiet ===");
+{
+    var lines = new List<(LogLevel Level, string Text)>();
+    var info = new MemoryLogger(lines, LogLevel.Information);
+    ClusterJobLog.NerClaim(info, verbose: false, "job", "worker-a", "ner-1", "1,2", 20_000);
+    ClusterJobLog.NerDone(info, verbose: false, "worker-a", "job", "ner-1", 2);
+    AssertTrue(lines.Count == 0, "NER claim/done are hidden at Information by default");
+    var debug = new MemoryLogger(lines, LogLevel.Debug);
+    ClusterJobLog.NerClaim(debug, verbose: false, "job", "worker-a", "ner-1", "1,2", 20_000);
+    AssertTrue(lines.Any(l => l.Level == LogLevel.Debug && l.Text.Contains("NER claim", StringComparison.Ordinal)),
+        "NER claim is Debug");
+    ClusterJobLog.Progress(info, "job", 4, 10, 40, 1.5, 2, "coord=4", "ner=1/2 nerInFlight=1 nerByNode=worker-a=1");
+    AssertTrue(lines.Any(l => l.Level == LogLevel.Information && l.Text.Contains("ner=1/2", StringComparison.Ordinal)),
+        "progress summary includes NER progress");
+}
+
 if (failed > 0)
 {
     Console.WriteLine($"FAILED {failed}");

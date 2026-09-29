@@ -523,8 +523,9 @@ public sealed class PdfOcrPipeline
 
     /// <summary>
     /// Coordinator path. Remote nodes pull the PDF and page batches; this process is the
-    /// local node. NER still sees pages through <see cref="LlmEntityExtractor.LlmExtractionSession.Add"/>
-    /// as soon as each page is committed, in document order inside the grouper.
+    /// local node. When <c>cluster.distributedNer</c> is on, each LLM-capable node extracts
+    /// names for NER groups it claims. Otherwise NER still sees pages through
+    /// <see cref="LlmEntityExtractor.LlmExtractionSession.Add"/> as soon as each page is committed.
     /// </summary>
     private async Task<OcrResponse> ProcessDistributedAsync(
         byte[] pdfBytes,
@@ -537,8 +538,9 @@ public sealed class PdfOcrPipeline
         CancellationToken ct)
     {
         bool vision = _config.IsLlmMode;
+        bool distributeNer = !vision && _cluster!.DistributedNer;
         using CancellationTokenSource llmCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        LlmEntityExtractor.LlmExtractionSession? ner = !vision && _llm is { IsUsable: true }
+        LlmEntityExtractor.LlmExtractionSession? ner = !vision && !distributeNer && _llm is { IsUsable: true }
             ? _llm.Begin(pageCount, llmCts.Token)
             : null;
 
@@ -566,9 +568,10 @@ public sealed class PdfOcrPipeline
         }
 
         string jobId;
+        OcrEntities? distributedEntities = null;
         try
         {
-            jobId = await _cluster!.RunJobAsync(
+            ClusterCoordinator.ClusterRunResult outcome = await _cluster!.RunJobAsync(
                 pdfBytes,
                 pdfByteCount,
                 pageCount,
@@ -587,7 +590,10 @@ public sealed class PdfOcrPipeline
                         token).ConfigureAwait(false);
                 },
                 Accept,
+                distributeNer,
                 ct).ConfigureAwait(false);
+            jobId = outcome.JobId;
+            distributedEntities = outcome.UsedDistributedNer ? outcome.Entities ?? new OcrEntities() : null;
         }
         catch (Exception)
         {
@@ -612,7 +618,9 @@ public sealed class PdfOcrPipeline
         _cluster.PublishLastJobHash(jobId, hash);
         OcrEntities entities = vision
             ? EntitiesFromVisionPages(pages)
-            : await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+            : distributedEntities is not null
+                ? distributedEntities
+                : await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
         List<OcrPageResult> visible = VisiblePages(pages);
         totalSw.Stop();
 

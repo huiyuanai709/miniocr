@@ -48,6 +48,8 @@ public sealed class NacosHostedService : IHostedService
             ["dpi"] = _self.Dpi.ToString(),
             ["capacity"] = _self.Capacity.ToString(),
             ["engineCount"] = _self.EngineCount.ToString(),
+            ["llmConfigured"] = _self.LlmConfigured ? "1" : "0",
+            ["nerConcurrency"] = _self.NerConcurrency.ToString(),
         };
 
         // Copy any user-supplied metadata, but don't overwrite the standard keys.

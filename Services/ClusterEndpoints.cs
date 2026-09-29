@@ -289,6 +289,96 @@ public static partial class ClusterEndpoints
             coordinator.FailBatch(job!, body.NodeId ?? "", body.BatchId, body.Error);
             return Ack(StatusCodes.Status200OK, null);
         });
+
+        app.MapPost("/cluster/jobs/{jobId}/ner/claim", async Task<IResult> (
+            string jobId,
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
+                return missing!;
+            ClusterNerClaimRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterNerClaimRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
+                return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
+            ClusterNerClaimResponse claim = coordinator.ClaimNer(
+                job!,
+                body.NodeId.Trim(),
+                body.LlmConfigured,
+                body.NerConcurrency);
+            return Results.Json(claim, AppJsonContext.Default.ClusterNerClaimResponse);
+        });
+
+        app.MapPost("/cluster/jobs/{jobId}/ner/result", async Task<IResult> (
+            string jobId,
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
+                return missing!;
+            ClusterNerResultRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterNerResultRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.GroupId))
+                return Ack(StatusCodes.Status400BadRequest, "groupId is required.");
+            int accepted = coordinator.AcceptNer(job!, body);
+            return Results.Json(
+                new ClusterAck { Ok = true, Accepted = accepted },
+                AppJsonContext.Default.ClusterAck);
+        });
+
+        app.MapPost("/cluster/jobs/{jobId}/ner/fail", async Task<IResult> (
+            string jobId,
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
+                return missing!;
+            ClusterFailRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterFailRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.BatchId))
+                return Ack(StatusCodes.Status400BadRequest, "batchId is required.");
+            coordinator.FailNer(job!, body.NodeId ?? "", body.BatchId, body.Error);
+            return Ack(StatusCodes.Status200OK, null);
+        });
     }
 
     private static bool Authorize(HttpRequest http, ClusterRuntimeConfig cfg, out IResult? deny)
