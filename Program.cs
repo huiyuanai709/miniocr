@@ -234,6 +234,10 @@ if (clusterConfig.Enabled)
         Model = clusterModel,
         Dpi = runtimeConfig.DefaultDpi,
         AdvertiseUrl = clusterConfig.AdvertiseUrl,
+        LlmConfigured = llmConfig.IsUsable,
+        NerConcurrency = llmConfig.IsUsable && clusterConfig.DistributedNer
+            ? llmConfig.MaxConcurrency
+            : 0,
     };
     builder.Services.AddSingleton(clusterConfig);
     builder.Services.AddSingleton(clusterSelf);
@@ -260,7 +264,8 @@ if (clusterConfig.Enabled)
         $"Cluster: enabled role={clusterConfig.Role} nodeId={clusterConfig.NodeId} " +
         $"capacity={clusterCapacity} model={clusterModel} dpi={runtimeConfig.DefaultDpi} " +
         $"workers={clusterConfig.Workers.Count} advertise={clusterConfig.AdvertiseUrl} " +
-        $"coordinator={clusterConfig.CoordinatorUrl} verboseDispatch={(clusterConfig.VerboseDispatch ? "on" : "off")} token=(set)");
+        $"coordinator={clusterConfig.CoordinatorUrl} verboseDispatch={(clusterConfig.VerboseDispatch ? "on" : "off")} " +
+        $"distributedNer={(clusterConfig.DistributedNer ? "on" : "off")} token=(set)");
 
     // Nacos service discovery: register this node and pull worker list from Nacos.
     if (clusterConfig.UseNacos && clusterConfig.Nacos is not null)
@@ -807,7 +812,7 @@ app.MapGet("/", () => Results.Text(
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
-    "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH\n" +
+    "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH MINIOCR_CLUSTER_DISTRIBUTED_NER\n" +
     "  Each claim, heartbeat, batch completion, and empty poll is Debug unless MINIOCR_CLUSTER_VERBOSE_DISPATCH=1 (or cluster.verboseDispatch). Progress summaries stay Information. Logging__LogLevel__MiniOcr.Services.ClusterCoordinator=Debug (and ClusterWorkerHost) shows the same detail. Per-request framework logs default to Warning; raise Logging__LogLevel__Microsoft.AspNetCore and Logging__LogLevel__System.Net.Http.HttpClient to see them.\n",
     "text/plain; charset=utf-8"));
 

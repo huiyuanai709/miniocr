@@ -41,6 +41,12 @@ public sealed class ClusterFileConfig
     /// <c>Logging:LogLevel</c> for the cluster categories still applies.
     /// </summary>
     public bool VerboseDispatch { get; set; }
+    /// <summary>
+    /// When null, distributed NER is on whenever the cluster is enabled.
+    /// Workers with an LLM key extract names for groups they claim; the coordinator merges them.
+    /// Set false to keep text NER on the coordinator only.
+    /// </summary>
+    public bool? DistributedNer { get; set; }
     public List<ClusterWorkerFileConfig>? Workers { get; set; }
 }
 
@@ -62,6 +68,8 @@ public sealed class ClusterHealthInfo
     public int Dpi { get; set; }
     public int Capacity { get; set; }
     public bool TokenSet { get; set; }
+    /// <summary>Text NER runs on workers that have an LLM key. Default on when the cluster is enabled.</summary>
+    public bool DistributedNer { get; set; }
     public List<ClusterNodeHealth> Nodes { get; set; } = [];
     public ClusterLastJobHealth? LastJob { get; set; }
 }
@@ -78,6 +86,10 @@ public sealed class ClusterNodeHealth
     public string OcrMode { get; set; } = "";
     public string Model { get; set; } = "";
     public int Dpi { get; set; }
+    /// <summary>This node has <c>llm.enabled</c> and an API key, so it can run text NER.</summary>
+    public bool LlmConfigured { get; set; }
+    /// <summary>This node's <c>llm.maxConcurrency</c>. Zero when no key is configured.</summary>
+    public int NerConcurrency { get; set; }
     public string? Warning { get; set; }
 }
 
@@ -87,7 +99,10 @@ public sealed class ClusterLastJobHealth
     public int PageCount { get; set; }
     public double ElapsedMs { get; set; }
     public string PageTextSha256 { get; set; } = "";
+    public int NerGroups { get; set; }
     public List<ClusterNodePages> Nodes { get; set; } = [];
+    /// <summary>NER groups completed by each node. <see cref="ClusterNodePages.Pages"/> is a group count.</summary>
+    public List<ClusterNodePages>? NerByNode { get; set; }
 }
 
 public sealed class ClusterNodePages
@@ -105,6 +120,9 @@ public sealed class ClusterRegisterRequest
     public string Model { get; set; } = "";
     public int Dpi { get; set; }
     public int EngineCount { get; set; }
+    /// <summary>Null when the caller does not know. False means OCR only; the coordinator runs NER for its pages.</summary>
+    public bool? LlmConfigured { get; set; }
+    public int? NerConcurrency { get; set; }
 }
 
 public sealed class ClusterRegisterResponse
@@ -122,6 +140,8 @@ public sealed class ClusterHeartbeatRequest
     public int Capacity { get; set; }
     public int InFlight { get; set; }
     public bool Healthy { get; set; } = true;
+    public bool? LlmConfigured { get; set; }
+    public int? NerConcurrency { get; set; }
 }
 
 public sealed class ClusterInfoResponse
@@ -136,6 +156,8 @@ public sealed class ClusterInfoResponse
     public bool Healthy { get; set; } = true;
     public int ActiveSessions { get; set; }
     public int PagesDone { get; set; }
+    public bool LlmConfigured { get; set; }
+    public int NerConcurrency { get; set; }
 }
 
 public sealed class ClusterNotifyRequest
@@ -208,6 +230,53 @@ public sealed class ClusterAck
     public bool Ok { get; set; }
     public string? Error { get; set; }
     public int Accepted { get; set; }
+}
+
+public sealed class ClusterNerClaimRequest
+{
+    public string NodeId { get; set; } = "";
+    public bool LlmConfigured { get; set; }
+    public int NerConcurrency { get; set; }
+}
+
+public sealed class ClusterNerPageText
+{
+    public int Page { get; set; }
+    public string Text { get; set; } = "";
+}
+
+public sealed class ClusterNerClaimResponse
+{
+    public bool Done { get; set; }
+    public bool Wait { get; set; }
+    public string? GroupId { get; set; }
+    public List<int>? Pages { get; set; }
+    public List<ClusterNerPageText>? PageTexts { get; set; }
+    /// <summary>Group text the model sees, before the next-page head is appended.</summary>
+    public string? PromptText { get; set; }
+    public string? Lookahead { get; set; }
+    public int LookaheadPage { get; set; }
+    public int LeaseMs { get; set; }
+    public int RetryAfterMs { get; set; }
+}
+
+public sealed class ClusterNerEntityHit
+{
+    /// <summary><c>person</c> (B04) or <c>company</c> (B06).</summary>
+    public string Kind { get; set; } = "";
+    public string Name { get; set; } = "";
+    public int Page { get; set; }
+    public int Count { get; set; }
+    public List<string> OriginText { get; set; } = [];
+}
+
+public sealed class ClusterNerResultRequest
+{
+    public string NodeId { get; set; } = "";
+    public string GroupId { get; set; } = "";
+    public List<string>? Companies { get; set; }
+    public List<string>? Persons { get; set; }
+    public List<ClusterNerEntityHit>? Entities { get; set; }
 }
 
 // ---- Nacos Open API DTOs ----

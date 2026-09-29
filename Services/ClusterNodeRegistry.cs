@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using MiniOcr.Models;
 
@@ -14,6 +15,8 @@ public sealed class ClusterSelf
     public required string Model { get; init; }
     public required int Dpi { get; init; }
     public required string AdvertiseUrl { get; init; }
+    public bool LlmConfigured { get; init; }
+    public int NerConcurrency { get; init; }
 }
 
 /// <summary>Coordinator's view of local + remote nodes. Thread-safe.</summary>
@@ -40,6 +43,8 @@ public sealed class ClusterNodeRegistry
             Model = self.Model,
             Dpi = self.Dpi,
             Url = string.IsNullOrWhiteSpace(self.AdvertiseUrl) ? null : self.AdvertiseUrl,
+            LlmConfigured = self.LlmConfigured,
+            NerConcurrency = self.LlmConfigured ? Math.Clamp(self.NerConcurrency, 0, 32) : 0,
         };
     }
 
@@ -117,9 +122,20 @@ public sealed class ClusterNodeRegistry
             else if (req.Capacity > 0 && node.Capacity <= 0)
                 node.Capacity = req.Capacity;
             node.Warning = warning;
+            NoteLlmCore(node, req.LlmConfigured, req.NerConcurrency);
         }
 
         return warning;
+    }
+
+    public int NerCapacity(string nodeId)
+    {
+        lock (_gate)
+        {
+            if (!_nodes.TryGetValue(nodeId, out Node? node))
+                return 0;
+            return node.LlmConfigured && node.NerConcurrency > 0 ? node.NerConcurrency : 0;
+        }
     }
 
     public void Heartbeat(ClusterHeartbeatRequest req)
@@ -137,6 +153,7 @@ public sealed class ClusterNodeRegistry
             node.ReportedInFlight = Math.Max(0, req.InFlight);
             if (!node.CapacityFromConfig && req.Capacity > 0)
                 node.Capacity = req.Capacity;
+            NoteLlmCore(node, req.LlmConfigured, req.NerConcurrency);
         }
     }
 
@@ -165,6 +182,7 @@ public sealed class ClusterNodeRegistry
                         node.EngineCount = info.EngineCount;
                     if (!node.CapacityFromConfig && info.Capacity > 0)
                         node.Capacity = info.Capacity;
+                    NoteLlmCore(node, info.LlmConfigured, info.NerConcurrency);
                     node.Warning = Mismatch(node.OcrMode, node.Model, node.Dpi);
                 }
 
@@ -295,6 +313,8 @@ public sealed class ClusterNodeRegistry
                     OcrMode = node.OcrMode,
                     Model = node.Model,
                     Dpi = node.Dpi,
+                    LlmConfigured = node.LlmConfigured,
+                    NerConcurrency = node.NerConcurrency,
                     Warning = node.Warning,
                 });
             }
@@ -359,6 +379,21 @@ public sealed class ClusterNodeRegistry
         }
     }
 
+    private static void NoteLlmCore(Node node, bool? configured, int? concurrency)
+    {
+        if (configured is not bool on)
+            return;
+        node.LlmConfigured = on;
+        if (!on)
+        {
+            node.NerConcurrency = 0;
+            return;
+        }
+
+        if (concurrency is int n)
+            node.NerConcurrency = n > 0 ? Math.Clamp(n, 1, 32) : 0;
+    }
+
     private static bool UrlEquals(string? a, string? b) =>
         string.Equals(
             (a ?? "").TrimEnd('/'),
@@ -384,6 +419,8 @@ public sealed class ClusterNodeRegistry
         public string OcrMode { get; set; } = "";
         public string Model { get; set; } = "";
         public string? Warning { get; set; }
+        public bool LlmConfigured { get; set; }
+        public int NerConcurrency { get; set; }
         public DateTimeOffset LastHeartbeat { get; set; }
         public DateTimeOffset LastNacosSeen { get; set; }
     }

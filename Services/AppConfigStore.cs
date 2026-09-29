@@ -426,6 +426,7 @@ public static class AppConfigStore
             "joinGraceMs": 500,
             "speculativeTailPages": 4,
             "verboseDispatch": false,
+            "distributedNer": true,
             "workers": []
           }
         }
