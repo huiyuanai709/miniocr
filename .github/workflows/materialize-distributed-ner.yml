@@ -5,7 +5,7 @@ on:
     branches:
       - cursor/distributed-llm-ner-e065
     paths:
-      - .github/ner-bundle.b64
+      - .github/ner-bundle.part3
 
 permissions:
   contents: write
@@ -21,10 +21,11 @@ jobs:
       - name: Apply source bundle onto main and drop this helper
         run: |
           set -euo pipefail
-          base64 -d .github/ner-bundle.b64 | gzip -d > /tmp/ner.patch
+          cat .github/ner-bundle.part1 .github/ner-bundle.part2 .github/ner-bundle.part3 > /tmp/ner.b64
+          base64 -d /tmp/ner.b64 | gzip -d > /tmp/ner.patch
           git checkout 165f28ba4817ecb4f9f21e874ec542e34df5661a -- .
           git apply /tmp/ner.patch
-          rm -f .github/ner-bundle.b64
+          rm -f .github/ner-bundle.part1 .github/ner-bundle.part2 .github/ner-bundle.part3
           rm -f .github/workflows/materialize-distributed-ner.yml
           git add -A
           git config user.name "huiyuanai709"
