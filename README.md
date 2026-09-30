@@ -638,7 +638,7 @@ The current CPU is missing one or more of the required instruction sets.
 | --- | --- |
 | `external/SimdPaddleOCR` @ `6aae0ad` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
 | 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
-| `PDFtoImage` 5.4.0 | PDFium 栅格化（SkiaSharp） |
+| `external/PDFtoImage` @ `d29f9ca` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`，当前与上游 master 一致：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152）。只引用核心 `PDFtoImage` 项目，不含 `PDFtoImage.Parallel`。MIT |
 
 ## API
 
@@ -868,8 +868,10 @@ dotnet run -c Release --project tests/MiniOcr.ClusterLive
 ```
 miniocr/
   MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2（仅 x64）；可选 MiniOcrSingleFile
-  .gitmodules             # external/SimdPaddleOCR tracks fork main (pinned 6aae0ad)
+  .gitmodules             # external/SimdPaddleOCR tracks fork main; external/PDFtoImage tracks fork master
   external/SimdPaddleOCR/ # fork 源码（ProjectReference；CI checkout 带 submodules）
+  external/PDFtoImage/    # fork 源码（核心 PDFtoImage ProjectReference；CI checkout 带 submodules）
+  external/Directory.Build.targets  # 把 PDFtoImage 的多目标收窄到 net11.0，避免 Android/iOS workload
   .github/workflows/publish.yml  # 多平台 AOT + linux/win 单文件矩阵
   Program.cs              # SlimBuilder + /challenge /ocr /health
   AppJsonContext.cs       # AOT JSON

@@ -19,8 +19,8 @@
     <OptimizationPreference>Speed</OptimizationPreference>
     <InvariantGlobalization>false</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
-    <!-- external/ is the SimdPaddleOCR submodule. The Web SDK would otherwise
-         compile and publish every file under it alongside this project. -->
+    <!-- external/ holds the SimdPaddleOCR and PDFtoImage submodules. The Web SDK
+         would otherwise compile and publish every file under them alongside this project. -->
     <DefaultItemExcludes>$(DefaultItemExcludes);tests/**;artifacts/**;dist/**;.github/**;external/**</DefaultItemExcludes>
     <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
   </PropertyGroup>
@@ -45,7 +45,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="PDFtoImage" Version="5.4.0" />
+    <!-- Pinned fork master @ d29f9ca (upstream PDFtoImage 6.0.0-preview: net11.0,
+         PDFium 156, SkiaSharp 4.152). Core project only — not PDFtoImage.Parallel.
+         Native PDFium / SkiaSharp assets flow as runtime assets of this project
+         (runtimes/<rid>/native); .NET copies them on publish the same way a
+         PackageReference to the PDFtoImage nupkg did. -->
+    <ProjectReference Include="external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
     <!-- Pinned fork main @ 6aae0ad (PR #2 merged), not NuGet 1.4.2.
          ChineseV6Tiny models come from the same tree so the bundle types match. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
@@ -56,6 +61,12 @@
     <Error
       Condition="!Exists('$(MSBuildThisFileDirectory)external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj')"
       Text="Missing external/SimdPaddleOCR. From the repo root run: git submodule update --init --recursive" />
+  </Target>
+
+  <Target Name="EnsurePdfToImageSubmodule" BeforeTargets="Restore;Build;Publish">
+    <Error
+      Condition="!Exists('$(MSBuildThisFileDirectory)external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj')"
+      Text="Missing external/PDFtoImage. From the repo root run: git submodule update --init --recursive" />
   </Target>
 
   <ItemGroup>
