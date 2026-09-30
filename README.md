@@ -659,7 +659,7 @@ The current CPU is missing one or more of the required instruction sets.
 | --- | --- |
 | `external/SimdPaddleOCR` @ `6aae0ad` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
 | 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
-| `external/PDFtoImage` @ `a03cd99` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfSession` Gray8 与 `PDFtoImage.Parallel`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
+| `external/PDFtoImage` @ `f65215f` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfSession` Gray8、`PDFtoImage.Parallel`，以及 net11.0 的 `runtime-async`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
 
 ## API
 

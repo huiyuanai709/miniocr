@@ -7,9 +7,10 @@
     This file lives outside the submodule so the fork stays untouched.
     Directory.Build.targets is imported after PDFtoImage.csproj assigns
     TargetFrameworks, so the override is what restore and the outer build see.
-    SimdPaddleOCR ships its own nearer Directory.Build.targets and does not
-    import this file. Inner builds already have TargetFramework set, so they
-    are left alone.
+    PDFtoImage.Parallel already sets a single TargetFramework of net11.0, so
+    it does not need this narrowing. SimdPaddleOCR ships its own nearer
+    Directory.Build.targets and does not import this file. Inner builds
+    already have TargetFramework set, so they are left alone.
   -->
   <PropertyGroup Condition="'$(MSBuildProjectName)' == 'PDFtoImage' and $([System.String]::Copy('$(MSBuildProjectDirectory)').Replace('\','/').EndsWith('external/PDFtoImage/src/PDFtoImage')) and '$(TargetFramework)' == ''">
     <TargetFrameworks>net11.0</TargetFrameworks>
