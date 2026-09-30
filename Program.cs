@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using MiniOcr;
+using PDFtoImage.Parallel;
 using MiniOcr.Models;
 using MiniOcr.Services;
 
@@ -141,6 +142,12 @@ if (runtimeConfig.IsWeChatMode)
             runtimeConfig = runtimeConfig.WithMode("local");
         }
     }
+}
+
+ParallelPdfProcessor? parallelRenderer = null;
+if (runtimeConfig.IsParallelRender)
+{
+    (runtimeConfig, parallelRenderer) = await PdfParallelStartup.ProbeAsync(runtimeConfig, bootstrapLogger);
 }
 
 string apiKeyStatus = string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)";
@@ -317,7 +324,8 @@ builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
         llm: sp.GetService<LlmEntityExtractor>(),
         vision: sp.GetService<LlmVisionOcr>(),
         wechat: sp.GetService<WeChatOcrEngine>(),
-        cluster: sp.GetService<ClusterCoordinator>());
+        cluster: sp.GetService<ClusterCoordinator>(),
+        parallelRenderer: parallelRenderer);
 });
 if (clusterConfig.Enabled)
 {

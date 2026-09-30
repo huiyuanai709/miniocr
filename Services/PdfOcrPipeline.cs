@@ -31,7 +31,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         LlmEntityExtractor? llm = null,
         LlmVisionOcr? vision = null,
         WeChatOcrEngine? wechat = null,
-        ClusterCoordinator? cluster = null)
+        ClusterCoordinator? cluster = null,
+        ParallelPdfProcessor? parallelRenderer = null)
     {
         _config = config;
         _logger = logger;
@@ -42,6 +43,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         _cluster = cluster;
         _defaultDpi = config.DefaultDpi;
         _rasterWorkers = config.RasterWorkerCount;
+        if (config.IsParallelRender)
+            _parallel = parallelRenderer;
 
         if (config.IsLlmMode)
         {

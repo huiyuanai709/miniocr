@@ -17,8 +17,8 @@ public sealed class OcrRuntimeConfig
     public int DetIntraOpThreads { get; init; }
     public bool UseDirectionClassification { get; init; }
     public int RasterWorkerCount { get; init; }
-    /// <summary><c>inprocess</c> (default) or <c>parallel</c>.</summary>
-    public string RenderMode { get; init; } = "inprocess";
+    /// <summary><c>parallel</c> (default) or <c>inprocess</c>.</summary>
+    public string RenderMode { get; init; } = "parallel";
     /// <summary>Worker processes used when <see cref="RenderMode"/> is <c>parallel</c>.</summary>
     public int RenderProcessCount { get; init; } = 1;
     public int RecBatchLines { get; init; }
@@ -244,7 +244,14 @@ public sealed class OcrRuntimeConfig
     /// </summary>
     public OcrRuntimeConfig WithMode(string mode) => With(mode: CanonicalMode(mode));
 
-    public OcrRuntimeConfig With(string? mode = null, int? engineCount = null, int? wechatInstances = null) => new()
+    /// <summary>
+    /// Copy with an explicit render mode. Does not re-read <c>MINIOCR_RENDER_MODE</c>,
+    /// so a startup fallback to in-process stays in-process even when the env var requested parallel.
+    /// </summary>
+    public OcrRuntimeConfig WithRenderMode(string renderMode) =>
+        With(renderMode: CanonicalRenderMode(renderMode));
+
+    public OcrRuntimeConfig With(string? mode = null, int? engineCount = null, int? wechatInstances = null, string? renderMode = null) => new()
     {
         Mode = mode is null ? Mode : CanonicalMode(mode),
         EngineCount = engineCount ?? EngineCount,
@@ -253,7 +260,7 @@ public sealed class OcrRuntimeConfig
         DetIntraOpThreads = DetIntraOpThreads,
         UseDirectionClassification = UseDirectionClassification,
         RasterWorkerCount = RasterWorkerCount,
-        RenderMode = RenderMode,
+        RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),
         RenderProcessCount = RenderProcessCount,
         RecBatchLines = RecBatchLines,
         DetLimitSideLength = DetLimitSideLength,
@@ -289,20 +296,20 @@ public sealed class OcrRuntimeConfig
 
     /// <summary>
     /// Env MINIOCR_RENDER_MODE overrides file. Accepts inprocess|parallel (case-insensitive).
-    /// Unknown values fall back to inprocess.
+    /// Unknown values fall back to parallel.
     /// </summary>
     public static string ResolveRenderMode(string? fileMode)
     {
         string? env = Environment.GetEnvironmentVariable("MINIOCR_RENDER_MODE");
-        string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "inprocess");
+        string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "parallel");
         return CanonicalRenderMode(raw);
     }
 
     public static string CanonicalRenderMode(string? raw)
     {
-        if (string.Equals(raw, "parallel", StringComparison.OrdinalIgnoreCase))
-            return "parallel";
-        return "inprocess";
+        if (string.Equals(raw, "inprocess", StringComparison.OrdinalIgnoreCase))
+            return "inprocess";
+        return "parallel";
     }
 
     /// <summary>
