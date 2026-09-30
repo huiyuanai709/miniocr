@@ -23,6 +23,7 @@
     <Compile Include="..\..\Services\LocalPdfFile.cs" Link="LocalPdfFile.cs" />
     <Compile Include="..\..\Services\RentedBuffer.cs" Link="RentedBuffer.cs" />
     <Compile Include="..\..\Services\OcrRuntimeConfig.cs" Link="OcrRuntimeConfig.cs" />
+    <Compile Include="..\..\Services\ParallelStartupFallback.cs" Link="ParallelStartupFallback.cs" />
     <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
     <Compile Include="..\..\Models\ClusterModels.cs" Link="ClusterModels.cs" />
     <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />

@@ -54,8 +54,8 @@ public sealed class OcrFileConfig
     public int? LineWorkers { get; set; }
     public int? DetThreads { get; set; }
     public int? RasterWorkers { get; set; }
-    /// <summary><c>inprocess</c> (default) or <c>parallel</c> (PDFtoImage.Parallel worker processes).</summary>
-    public string RenderMode { get; set; } = "inprocess";
+    /// <summary><c>parallel</c> (default, PDFtoImage.Parallel worker processes) or <c>inprocess</c>.</summary>
+    public string RenderMode { get; set; } = "parallel";
     /// <summary>Worker processes when <see cref="RenderMode"/> is <c>parallel</c>. Null = auto from cores and engine count.</summary>
     public int? RenderProcesses { get; set; }
     public bool? UseCls { get; set; }

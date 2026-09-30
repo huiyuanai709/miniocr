@@ -401,7 +401,7 @@ public static class AppConfigStore
             "lineWorkers": null,
             "detThreads": null,
             "rasterWorkers": null,
-            "renderMode": "inprocess",
+            "renderMode": "parallel",
             "renderProcesses": null,
             "useCls": false,
             "autoScaleFromCpu": true,

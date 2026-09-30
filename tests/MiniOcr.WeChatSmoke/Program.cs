@@ -258,9 +258,9 @@ try
 
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", null);
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", null);
-    AssertEqual("inprocess", cfg.RenderMode, "default render mode is inprocess");
+    AssertEqual("parallel", cfg.RenderMode, "default render mode is parallel");
     AssertTrue(cfg.RenderProcessCount is >= 1 and <= 4, "auto render processes stay in 1..4");
-    AssertEqual("inprocess", cfg.With().RenderMode, "With copies render mode");
+    AssertEqual("parallel", cfg.With().RenderMode, "With copies render mode");
     AssertEqual(cfg.RenderProcessCount.ToString(), cfg.With().RenderProcessCount.ToString(), "With copies render processes");
     AssertEqual("2", OcrRuntimeConfig.ComputeRenderProcesses(4, 2).ToString(), "4 cores and 2 engines -> 2 render processes");
     AssertEqual("4", OcrRuntimeConfig.ComputeRenderProcesses(16, 8).ToString(), "render process auto cap is 4");
@@ -271,18 +271,46 @@ try
     OcrRuntimeConfig parallelCfg = OcrRuntimeConfig.FromAppConfig(new AppConfigFile());
     AssertEqual("parallel", parallelCfg.RenderMode, "env render mode overrides file");
     AssertEqual("4", parallelCfg.RenderProcessCount.ToString(), "env render processes");
+    AssertEqual("inprocess", parallelCfg.WithRenderMode("inprocess").RenderMode, "WithRenderMode ignores MINIOCR_RENDER_MODE");
+
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", "inprocess");
+    AssertEqual("inprocess", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RenderMode, "env inprocess overrides default");
 
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", "nope");
-    AssertEqual("inprocess", OcrRuntimeConfig.ResolveRenderMode("parallel"), "unknown env render mode is inprocess");
+    AssertEqual("parallel", OcrRuntimeConfig.ResolveRenderMode("inprocess"), "unknown env render mode is parallel");
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", null);
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", null);
-    AssertEqual("parallel", OcrRuntimeConfig.ResolveRenderMode("Parallel"), "file render mode parallel");
+    AssertEqual("inprocess", OcrRuntimeConfig.ResolveRenderMode("InProcess"), "file render mode inprocess");
+    OcrRuntimeConfig fileInProcess = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { RenderMode = "inprocess", AutoScaleFromCpu = false },
+    });
+    AssertEqual("inprocess", fileInProcess.RenderMode, "file can select inprocess");
     OcrRuntimeConfig fileRender = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
     {
         Ocr = new OcrFileConfig { RenderMode = "parallel", RenderProcesses = 3, AutoScaleFromCpu = false },
     });
     AssertEqual("parallel", fileRender.RenderMode, "file render mode");
     AssertEqual("3", fileRender.RenderProcessCount.ToString(), "file render processes");
+    List<string> fallbackLines = [];
+    OcrRuntimeConfig fallen = ParallelStartupFallback.Apply(
+        fileRender,
+        new InvalidOperationException("spawn denied"),
+        fallbackLines.Add);
+    AssertEqual("inprocess", fallen.RenderMode, "spawn failure falls back to inprocess");
+    AssertEqual("parallel", fallen.WithRenderMode("parallel").RenderMode, "fallback copy can return to parallel");
+    AssertTrue(
+        fallbackLines.Count == 1 && fallbackLines[0].Contains("Falling back to in-process rendering", StringComparison.Ordinal),
+        "spawn failure log line");
+    AssertTrue(fallbackLines[0].Contains("spawn denied", StringComparison.Ordinal), "spawn failure log includes the cause");
+    int logs = 0;
+    AssertEqual("parallel", ParallelStartupFallback.Apply(fileRender, null, _ => logs++).RenderMode, "no spawn failure keeps parallel");
+    AssertEqual("0", logs.ToString(), "no spawn failure does not log");
+    AssertEqual(
+        "inprocess",
+        ParallelStartupFallback.Apply(fileInProcess, new InvalidOperationException("ignored"), _ => logs++).RenderMode,
+        "inprocess config is unchanged when spawn is not attempted");
+    AssertEqual("0", logs.ToString(), "inprocess config does not log a fallback");
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", "99");
     AssertEqual("8", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RenderProcessCount.ToString(), "render processes clamp to 8");
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", "0");
