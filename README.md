@@ -253,6 +253,8 @@ cd artifacts/linux-x64-singlefile
     "lineWorkers": null,
     "detThreads": null,
     "rasterWorkers": null,
+    "renderMode": "inprocess",
+    "renderProcesses": null,
     "useCls": false,
     "autoScaleFromCpu": true,
     "wechatOcrPath": "",
@@ -267,7 +269,7 @@ cd artifacts/linux-x64-singlefile
 
 **优先级：**
 
-- OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`。
+- OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`。`MINIOCR_RENDER_MODE` 覆盖 `ocr.renderMode`。
 - LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_PAGES_PER_REQUEST` / `MINIOCR_LLM_OCR_CONCURRENCY` / `MINIOCR_LLM_OCR_JPEG_QUALITY` / `MINIOCR_LLM_THINKING` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
 
 #### OCR 模式：`local` vs `llm`（视觉 OCR）
@@ -371,7 +373,9 @@ cd artifacts/linux-x64-singlefile
 | `MINIOCR_LINE_WORKERS` | `ocr.lineWorkers` | 自动 | 页内 CLS/REC 并行 |
 | `MINIOCR_DET_THREADS` | `ocr.detThreads` | 自动 | 检测图内卷积线程 |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | **false** | 是否启用方向分类 |
-| `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm：`min(8,cores)`） | 并行 PDF 栅格生产者（封顶 8） |
+| `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm：`min(8,cores)`） | 进程内 PDF 栅格生产者（封顶 8）。`renderMode=parallel` 时只在回退路径使用 |
+| `MINIOCR_RENDER_MODE` | `ocr.renderMode` | **inprocess** | `inprocess`（进程内 `ToImages`）或 `parallel`（`PDFtoImage.Parallel` 工作进程）。未知值回退 `inprocess` |
+| `MINIOCR_RENDER_PROCESSES` | `ocr.renderProcesses` | 自动，见下 | `parallel` 的工作进程数。未设置时 `Clamp(min(4, max(1, cores−engines)), 1, 4)`；显式值钳制 **1–8** |
 | `MINIOCR_REC_BATCH` | — | **8** | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | — | **960** | 检测 `LimitSideLength` |
 
@@ -386,8 +390,23 @@ cd artifacts/linux-x64-singlefile
 | `engines` | `Clamp(cores/2, 1, min(16, cores))` |
 | `lineWorkers` / `detThreads` | 使 `engines × (line + det)` 约在 **1.0–1.5× cores**（目标约 1.25×） |
 | `rasterWorkers` | `Clamp(min(engines, cores/2), 1, 8)` |
+| `renderProcesses` | `Clamp(min(4, max(1, cores−engines)), 1, 4)` |
 
-启动时日志打印 `ProcessorCount` 与选定的 engines/line/det/raster；`GET /health` 同样暴露这些字段及绝对 `configPath` / `configFileExisted` / LLM 状态（`llmApiKey` 仅为 `(set)`/`(empty)`）。
+`renderMode` 默认 **`inprocess`**。PDFium 进程内有一把全局锁，多线程 `ToImages` 并不能并行栅格；`parallel` 把同一份临时 PDF 以内存映射交给长期存活的工作进程（灰度页在进程间按 Gray8 传输，宿主展开成 OCR 已直接使用的 BGRA8888）。工作进程崩溃时丢掉进程池，未写入 Channel 的页改回进程内渲染；取消请求不回退。子进程是再次启动本可执行文件。Native AOT 在 `Main` 之前进入 worker。本仓库的普通 `dotnet run` 仍带着 AOT 的 feature switch（动态代码和 startup hook 都是关的），所以入口程序集里还有一个 module initializer，在 `Main` 之前调用同一个 worker 引导，避免子进程把 Web 主机和 OCR 模型再加载一遍。
+
+**默认不改成 `parallel`。** 在 4 核 Linux 上用 `MINIOCR_ENGINES=2`、96 DPI、ChineseV6Tiny，对一份 120 页、约 103MB、每页内嵌 JPEG 的扫描 PDF 做端到端（栅格+OCR）：
+
+| 模式 | 墙钟 | 响应 `rasterizeMs` | OCR 忙时（`sum(ocrMs)/engines`） | 峰值 PSS |
+| --- | ---: | ---: | ---: | ---: |
+| `inprocess` | 23.3s | 6710（各 worker 之和，PDFium 全局锁下接近串行） | 22.6s | 1243MB |
+| `parallel` ×2 | 23.7s | 485（有序产出的等待，不含交给 OCR 时的反压） | 22.9s | 1092MB |
+| `parallel` ×4 | 23.4s | 518 | 22.6s | 1178MB |
+
+三种模式的 OCR 文本 SHA-256 相同（`4de7fa77231623b41ab6572c6ad0b91506b21b4e15f16926ffb68c701d2b09ac`），页序正确，临时 PDF 已删除。OCR 忙时和墙钟几乎重合，引擎没有在等栅格。并行栅格没有缩短端到端时间，内存也没有明显好处，所以默认保持 `inprocess`。栅格成为瓶颈时（更多核、更重的 PDF、更少的 OCR 引擎）再设 `ocr.renderMode` 为 `parallel`。
+
+同一份 5 页样例在 linux-x64 Native AOT 和 linux-x64 单文件上用 `parallel` ×2 跑过：文本哈希与进程内一致，日志里只有一次加载模型和一次监听，工作进程是再启动后的本可执行文件（进程树上父进程 + 2 个子进程），没有另起 Web 主机。win-x64 单文件可以在 Linux 上交叉发布，包内含 `pdfium.dll` / `libSkiaSharp.dll`，并且 `StartupHookProvider.IsSupported=true`；win-x64 Native AOT 不能在 Linux 上交叉编译（`Cross-OS native compilation is not supported`），要在 Windows CI 上编。
+
+启动时日志打印 `ProcessorCount` 与选定的 engines/line/det/raster/renderMode/renderProcesses；`GET /health` 同样暴露这些字段及绝对 `configPath` / `configFileExisted` / LLM 状态（`llmApiKey` 仅为 `(set)`/`(empty)`）。
 
 > 更快可降 `MINIOCR_DPI=45`；更高精度可设 `MINIOCR_DPI=150`、`MINIOCR_USE_CLS=1`。显式设置 env/文件中的 engines 等会关闭对该项的自动推算。
 
@@ -620,7 +639,7 @@ The current CPU is missing one or more of the required instruction sets.
 | 环节 | 策略 |
 | --- | --- |
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
-| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`；`AntiAliasing=None` + `Grayscale`；多生产者写入有界 Channel，**绝不**同时持有全部页位图。llm 默认更多 raster workers（`min(8,cores)`）。 |
+| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale`。默认 `renderMode=inprocess`：每 worker **一次** `ToImages`。`renderMode=parallel` 时用长期存活的 `PDFtoImage.Parallel` 进程池，整本 PDF 只写一次临时文件并内存映射（工作进程不各自拷贝大 PDF）；灰度页走 Gray8 传输后在宿主展开为 BGRA。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
 | OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
 | 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。集群默认把这些组发给有 LLM key 的节点（`cluster.distributedNer`），协调节点合并去重。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
@@ -638,7 +657,7 @@ The current CPU is missing one or more of the required instruction sets.
 | --- | --- |
 | `external/SimdPaddleOCR` @ `6aae0ad` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
 | 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
-| `external/PDFtoImage` @ `d29f9ca` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`，当前与上游 master 一致：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152）。只引用核心 `PDFtoImage` 项目，不含 `PDFtoImage.Parallel`。MIT |
+| `external/PDFtoImage` @ `a03cd99` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfSession` Gray8 与 `PDFtoImage.Parallel`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
 
 ## API
 
@@ -870,7 +889,7 @@ miniocr/
   MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2（仅 x64）；可选 MiniOcrSingleFile
   .gitmodules             # external/SimdPaddleOCR tracks fork main; external/PDFtoImage tracks fork master
   external/SimdPaddleOCR/ # fork 源码（ProjectReference；CI checkout 带 submodules）
-  external/PDFtoImage/    # fork 源码（核心 PDFtoImage ProjectReference；CI checkout 带 submodules）
+  external/PDFtoImage/    # fork 源码（PDFtoImage + PDFtoImage.Parallel ProjectReference；CI checkout 带 submodules）
   external/Directory.Build.targets  # 把 PDFtoImage 的多目标收窄到 net11.0，避免 Android/iOS workload
   .github/workflows/publish.yml  # 多平台 AOT + linux/win 单文件矩阵
   Program.cs              # SlimBuilder + /challenge /ocr /health

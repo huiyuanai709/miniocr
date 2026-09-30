@@ -3,6 +3,18 @@ using MiniOcr;
 using MiniOcr.Models;
 using MiniOcr.Services;
 
+// PDFtoImage.Parallel re-launches this executable as a render worker and sets
+// PDFTOIMAGE_PARALLEL_WORKER_PIPE. Native AOT enters that path from a module
+// initializer (CoreCLR from a startup hook) and exits before Main. If the
+// bootstrap was trimmed away, the variable is still set here — refuse to start
+// the web host or load OCR models in the child.
+if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("PDFTOIMAGE_PARALLEL_WORKER_PIPE")))
+{
+    Console.Error.WriteLine(
+        "PDFtoImage.Parallel worker bootstrap did not run; refusing to start the MiniOcr host.");
+    Environment.Exit(1);
+}
+
 WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(args);
 // CreateSlimBuilder ships without the template's appsettings.json, so every
 // cluster HTTP call is Information: hosting "Request starting/finished" plus
@@ -144,6 +156,7 @@ Console.WriteLine(
     $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"useCls={runtimeConfig.UseDirectionClassification}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
+    $"renderMode={runtimeConfig.RenderMode}, renderProcesses={runtimeConfig.RenderProcessCount}, " +
     $"wechatInstances={runtimeConfig.WeChatInstances}, wechatStatus={wechatStatus}");
 Console.WriteLine(
     $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
@@ -329,6 +342,9 @@ ILogger logger = app.Logger;
 IHostApplicationLifetime lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
 lifetime.ApplicationStopping.Register(() =>
 {
+    PdfOcrPipeline? pipeline = app.Services.GetService<PdfOcrPipeline>();
+    if (pipeline is not null)
+        pipeline.DisposeAsync().AsTask().GetAwaiter().GetResult();
     if (engine is not null)
         engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
     if (wechatEngine is not null)
@@ -353,6 +369,8 @@ app.MapGet("/health", (IServiceProvider sp) =>
             DefaultDpi = cfg.DefaultDpi,
             UseDirectionClassification = cfg.UseDirectionClassification,
             RasterWorkerCount = cfg.RasterWorkerCount,
+            RenderMode = cfg.RenderMode,
+            RenderProcessCount = cfg.RenderProcessCount,
             RecBatchLines = cfg.RecBatchLines,
             DetLimitSideLength = cfg.DetLimitSideLength,
             AutoScaleFromCpu = cfg.AutoScaleFromCpu,
@@ -809,7 +827,7 @@ app.MapGet("/", () => Results.Text(
     $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} " +
     $"ocr.mode={runtimeConfig.Mode} wechat={wechatStatus} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
-    "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
+    "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS MINIOCR_RENDER_MODE MINIOCR_RENDER_PROCESSES\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
     "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH MINIOCR_CLUSTER_DISTRIBUTED_NER\n" +

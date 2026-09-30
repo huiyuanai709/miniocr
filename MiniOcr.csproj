@@ -45,12 +45,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Pinned fork master @ d29f9ca (upstream PDFtoImage 6.0.0-preview: net11.0,
-         PDFium 156, SkiaSharp 4.152). Core project only — not PDFtoImage.Parallel.
-         Native PDFium / SkiaSharp assets flow as runtime assets of this project
-         (runtimes/<rid>/native); .NET copies them on publish the same way a
-         PackageReference to the PDFtoImage nupkg did. -->
+    <!-- Pinned fork master @ a03cd99 (PDFtoImage 6.0.0-preview plus PdfSession Gray8
+         and PDFtoImage.Parallel). Native PDFium / SkiaSharp assets flow as runtime
+         assets of the core project (runtimes/<rid>/native); .NET copies them on
+         publish the same way a PackageReference to the PDFtoImage nupkg did.
+         Parallel re-launches this executable as a worker (CoreCLR startup hook,
+         Native AOT module initializer). -->
     <ProjectReference Include="external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
+    <ProjectReference Include="external/PDFtoImage/src/Parallel/Parallel.csproj" />
     <!-- Pinned fork main @ 6aae0ad (PR #2 merged), not NuGet 1.4.2.
          ChineseV6Tiny models come from the same tree so the bundle types match. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
@@ -65,9 +67,14 @@
 
   <Target Name="EnsurePdfToImageSubmodule" BeforeTargets="Restore;Build;Publish">
     <Error
-      Condition="!Exists('$(MSBuildThisFileDirectory)external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj')"
+      Condition="!Exists('$(MSBuildThisFileDirectory)external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj') or !Exists('$(MSBuildThisFileDirectory)external/PDFtoImage/src/Parallel/Parallel.csproj')"
       Text="Missing external/PDFtoImage. From the repo root run: git submodule update --init --recursive" />
   </Target>
+
+  <!-- PublishTrimmed turns CoreCLR startup hooks off. PDFtoImage.Parallel needs
+       the hook so a single-file worker enters before Main. Native AOT uses the
+       module initializer instead; this import does not change that path. -->
+  <Import Project="external/PDFtoImage/src/Parallel/PDFtoImage.Parallel.targets" />
 
   <ItemGroup>
     <!-- Keep model / Skia / PDFium assemblies from being trimmed away -->
@@ -76,6 +83,7 @@
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.TextLineOrientation" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.ModelProvider" />
     <TrimmerRootAssembly Include="PDFtoImage" />
+    <TrimmerRootAssembly Include="PDFtoImage.Parallel" />
     <TrimmerRootAssembly Include="SkiaSharp" />
   </ItemGroup>
 
