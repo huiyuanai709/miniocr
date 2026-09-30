@@ -17,6 +17,10 @@ public sealed class OcrRuntimeConfig
     public int DetIntraOpThreads { get; init; }
     public bool UseDirectionClassification { get; init; }
     public int RasterWorkerCount { get; init; }
+    /// <summary><c>inprocess</c> (default) or <c>parallel</c>.</summary>
+    public string RenderMode { get; init; } = "inprocess";
+    /// <summary>Worker processes used when <see cref="RenderMode"/> is <c>parallel</c>.</summary>
+    public int RenderProcessCount { get; init; } = 1;
     public int RecBatchLines { get; init; }
     public int DetLimitSideLength { get; init; }
     public bool AutoScaleFromCpu { get; init; }
@@ -103,6 +107,16 @@ public sealed class OcrRuntimeConfig
             rasterDefault);
         raster = Math.Clamp(raster, 1, 8);
 
+        string renderMode = ResolveRenderMode(ocr.RenderMode);
+        int renderAuto = ComputeRenderProcesses(cores, engines);
+        int renderProcesses = ResolveInt(
+            "MINIOCR_RENDER_PROCESSES",
+            ocr.RenderProcesses,
+            renderAuto,
+            autoScale,
+            fixedFallback: renderAuto);
+        renderProcesses = Math.Clamp(renderProcesses, 1, 8);
+
         int recBatch = Math.Clamp(ReadInt("MINIOCR_REC_BATCH", 8), 1, 64);
         int detLimit = Math.Clamp(ReadInt("MINIOCR_DET_LIMIT_SIDE", 960), 64, 4096);
 
@@ -144,6 +158,8 @@ public sealed class OcrRuntimeConfig
             DetIntraOpThreads = det,
             UseDirectionClassification = useCls,
             RasterWorkerCount = raster,
+            RenderMode = renderMode,
+            RenderProcessCount = renderProcesses,
             RecBatchLines = recBatch,
             DetLimitSideLength = detLimit,
             AutoScaleFromCpu = autoScale,
@@ -237,6 +253,8 @@ public sealed class OcrRuntimeConfig
         DetIntraOpThreads = DetIntraOpThreads,
         UseDirectionClassification = UseDirectionClassification,
         RasterWorkerCount = RasterWorkerCount,
+        RenderMode = RenderMode,
+        RenderProcessCount = RenderProcessCount,
         RecBatchLines = RecBatchLines,
         DetLimitSideLength = DetLimitSideLength,
         AutoScaleFromCpu = AutoScaleFromCpu,
@@ -248,6 +266,9 @@ public sealed class OcrRuntimeConfig
         WeChatConnectTimeoutSeconds = WeChatConnectTimeoutSeconds,
         WeChatRequestTimeoutSeconds = WeChatRequestTimeoutSeconds,
     };
+
+    public bool IsParallelRender =>
+        string.Equals(RenderMode, "parallel", StringComparison.OrdinalIgnoreCase);
 
     public bool IsLlmMode =>
         string.Equals(Mode, "llm", StringComparison.OrdinalIgnoreCase);
@@ -264,6 +285,35 @@ public sealed class OcrRuntimeConfig
         string? env = Environment.GetEnvironmentVariable("MINIOCR_OCR_MODE");
         string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "local");
         return CanonicalMode(raw);
+    }
+
+    /// <summary>
+    /// Env MINIOCR_RENDER_MODE overrides file. Accepts inprocess|parallel (case-insensitive).
+    /// Unknown values fall back to inprocess.
+    /// </summary>
+    public static string ResolveRenderMode(string? fileMode)
+    {
+        string? env = Environment.GetEnvironmentVariable("MINIOCR_RENDER_MODE");
+        string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "inprocess");
+        return CanonicalRenderMode(raw);
+    }
+
+    public static string CanonicalRenderMode(string? raw)
+    {
+        if (string.Equals(raw, "parallel", StringComparison.OrdinalIgnoreCase))
+            return "parallel";
+        return "inprocess";
+    }
+
+    /// <summary>
+    /// Auto worker-process count for parallel render. The fork's render benchmark
+    /// knees around 4 processes; leave the remaining cores for OCR engines.
+    /// </summary>
+    public static int ComputeRenderProcesses(int cores, int engines)
+    {
+        cores = Math.Max(1, cores);
+        engines = Math.Clamp(engines, 1, 16);
+        return Math.Clamp(Math.Min(4, Math.Max(1, cores - engines)), 1, 4);
     }
 
     public static string CanonicalMode(string? raw)

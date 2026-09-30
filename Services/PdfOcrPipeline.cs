@@ -2,12 +2,13 @@ using System.Diagnostics;
 using System.Threading.Channels;
 using MiniOcr.Models;
 using PDFtoImage;
+using PDFtoImage.Parallel;
 using Sdcb.SimdPaddleOCR;
 using SkiaSharp;
 
 namespace MiniOcr.Services;
 
-public sealed class PdfOcrPipeline
+public sealed class PdfOcrPipeline : IAsyncDisposable
 {
     private readonly OcrEngine? _engine;
     private readonly WeChatOcrEngine? _wechat;
@@ -19,6 +20,9 @@ public sealed class PdfOcrPipeline
     private readonly int _pageWindow;
     private readonly int _defaultDpi;
     private readonly int _rasterWorkers;
+    private readonly object _parallelGate = new();
+    private ParallelPdfProcessor? _parallel;
+    private int _parallelDisposed;
 
     public PdfOcrPipeline(
         OcrRuntimeConfig config,
@@ -813,78 +817,14 @@ public sealed class PdfOcrPipeline
             throw failure;
     }
 
-    private async Task ProduceIndicesAsync(
+    private Task ProduceIndicesAsync(
         byte[] pdfBytes,
         int pdfLength,
         int[] pageIndices,
         RenderOptions renderOptions,
         ChannelWriter<(int, SKBitmap, double)> writer,
-        CancellationToken ct)
-    {
-        int workers = Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, pageIndices.Length)), 1, 8);
-        try
-        {
-            Task[] tasks = new Task[workers];
-            for (int w = 0; w < workers; w++)
-            {
-                int workerId = w;
-                tasks[w] = Task.Run(async () =>
-                {
-                    using MemoryStream local = new(
-                        pdfBytes, index: 0, count: pdfLength, writable: false, publiclyVisible: true);
-                    List<int> mine = new((pageIndices.Length + workers - 1) / workers);
-                    for (int i = workerId; i < pageIndices.Length; i += workers)
-                        mine.Add(pageIndices[i]);
-                    if (mine.Count == 0)
-                        return;
-
-                    IEnumerator<SKBitmap> enumerator =
-                        Conversion.ToImages(local, mine, leaveOpen: true, options: renderOptions)
-                            .GetEnumerator();
-                    try
-                    {
-                        int idx = 0;
-                        while (idx < mine.Count)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            Stopwatch sw = Stopwatch.StartNew();
-                            if (!enumerator.MoveNext())
-                            {
-                                throw new InvalidOperationException(
-                                    $"PDFtoImage yielded {idx} pages, expected {mine.Count}.");
-                            }
-
-                            SKBitmap bitmap = enumerator.Current;
-                            sw.Stop();
-                            int pageIndex = mine[idx++];
-                            try
-                            {
-                                await writer.WriteAsync((pageIndex, bitmap, sw.Elapsed.TotalMilliseconds), ct)
-                                    .ConfigureAwait(false);
-                            }
-                            catch
-                            {
-                                bitmap.Dispose();
-                                while (enumerator.MoveNext())
-                                    enumerator.Current.Dispose();
-                                throw;
-                            }
-                        }
-                    }
-                    finally
-                    {
-                        enumerator.Dispose();
-                    }
-                }, ct);
-            }
-
-            await Task.WhenAll(tasks).ConfigureAwait(false);
-        }
-        finally
-        {
-            writer.TryComplete();
-        }
-    }
+        CancellationToken ct) =>
+        DispatchRenderAsync(pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct);
 
     private string LogTextHash(OcrPageResult?[] pages)
     {
@@ -923,6 +863,9 @@ public sealed class PdfOcrPipeline
             WithAnnotations: false,
             WithFormFill: false,
             AntiAliasing: PdfAntiAliasing.None,
+            // Grayscale + no tiling makes PDFtoImage.Parallel ship Gray8 and expand
+            // back to BGRA8888 in the host. OCR only accepts BGR/RGB(A); that host
+            // bitmap is already Bgra8888, so EnsureBgra8888 does not convert again.
             Grayscale: true);
 
     private static OcrEntities EntitiesFromVisionPages(OcrPageResult[] pages)
@@ -995,7 +938,7 @@ public sealed class PdfOcrPipeline
         return new OcrEntities();
     }
 
-    private async Task ProduceParallelAsync(
+    private Task ProduceParallelAsync(
         byte[] pdfBytes,
         int pdfLength,
         int pageCount,
@@ -1003,67 +946,331 @@ public sealed class PdfOcrPipeline
         ChannelWriter<(int, SKBitmap, double)> writer,
         CancellationToken ct)
     {
-        int workers = Math.Clamp(_rasterWorkers, 1, Math.Max(1, pageCount));
+        int[] pageIndices = new int[pageCount];
+        for (int i = 0; i < pageCount; i++)
+            pageIndices[i] = i;
+        return DispatchRenderAsync(pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct);
+    }
+
+    /// <summary>
+    /// In-process PDFium calls share one global lock, so extra threads do not
+    /// rasterize in parallel. <c>ocr.renderMode=parallel</c> renders in worker
+    /// processes that share one memory-mapped temp PDF (Gray8 on the wire when
+    /// <see cref="CreateRenderOptions"/> asks for grayscale). A worker crash
+    /// drops the pool and finishes the unwritten pages in-process. Cancellation
+    /// does not fall back.
+    /// </summary>
+    private async Task DispatchRenderAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        int[] pageIndices,
+        RenderOptions renderOptions,
+        ChannelWriter<(int, SKBitmap, double)> writer,
+        CancellationToken ct)
+    {
+        Stopwatch wall = Stopwatch.StartNew();
+        string mode = _config.IsParallelRender ? "parallel" : "inprocess";
+        int workers = _config.IsParallelRender
+            ? _config.RenderProcessCount
+            : Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, pageIndices.Length)), 1, 8);
+        HashSet<int> written = new();
         try
         {
-            Task[] tasks = new Task[workers];
-            for (int w = 0; w < workers; w++)
+            if (_config.IsParallelRender && pageIndices.Length > 0)
             {
-                int workerId = w;
-                tasks[w] = Task.Run(async () =>
+                try
                 {
-                    using MemoryStream local = new(
-                        pdfBytes, index: 0, count: pdfLength, writable: false, publiclyVisible: true);
-
-                    List<int> pageIndices = new((pageCount + workers - 1) / workers);
-                    for (int i = workerId; i < pageCount; i += workers)
-                        pageIndices.Add(i);
-
-                    IEnumerator<SKBitmap> enumerator =
-                        Conversion.ToImages(local, pageIndices, leaveOpen: true, options: renderOptions)
-                            .GetEnumerator();
-                    try
+                    await ProduceWithParallelAsync(
+                        pdfBytes, pdfLength, pageIndices, renderOptions, writer, written, ct)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Parallel PDF render failed after {Written} pages; falling back to in-process for the rest",
+                        written.Count);
+                    AbandonParallel();
+                    mode = "parallel-fallback-inprocess";
+                    int[] remaining = RemainingIndices(pageIndices, written);
+                    workers = Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, remaining.Length)), 1, 8);
+                    if (remaining.Length > 0)
                     {
-                        int idx = 0;
-                        while (idx < pageIndices.Count)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            Stopwatch sw = Stopwatch.StartNew();
-                            if (!enumerator.MoveNext())
-                            {
-                                throw new InvalidOperationException(
-                                    $"PDFtoImage yielded {idx} pages, expected {pageIndices.Count}.");
-                            }
-
-                            SKBitmap bitmap = enumerator.Current;
-                            sw.Stop();
-                            int pageIndex = pageIndices[idx++];
-                            try
-                            {
-                                await writer.WriteAsync((pageIndex, bitmap, sw.Elapsed.TotalMilliseconds), ct)
-                                    .ConfigureAwait(false);
-                            }
-                            catch
-                            {
-                                bitmap.Dispose();
-                                while (enumerator.MoveNext())
-                                    enumerator.Current.Dispose();
-                                throw;
-                            }
-                        }
+                        await ProduceInProcessAsync(
+                            pdfBytes, pdfLength, remaining, renderOptions, writer, ct)
+                            .ConfigureAwait(false);
                     }
-                    finally
-                    {
-                        enumerator.Dispose();
-                    }
-                }, ct);
+                }
             }
-
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            else
+            {
+                await ProduceInProcessAsync(
+                    pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct)
+                    .ConfigureAwait(false);
+            }
         }
         finally
         {
+            wall.Stop();
+            _logger.LogInformation(
+                "Raster produce mode={Mode} workers={Workers} pages={Pages} wallMs={WallMs:F1}",
+                mode,
+                workers,
+                pageIndices.Length,
+                wall.Elapsed.TotalMilliseconds);
             writer.TryComplete();
+        }
+    }
+
+    private async Task ProduceWithParallelAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        int[] pageIndices,
+        RenderOptions renderOptions,
+        ChannelWriter<(int, SKBitmap, double)> writer,
+        HashSet<int> written,
+        CancellationToken ct)
+    {
+        string path = Path.Combine(Path.GetTempPath(), "miniocr-render-" + Guid.NewGuid().ToString("N") + ".pdf");
+        try
+        {
+            await WritePdfTempAsync(path, pdfBytes, pdfLength, ct).ConfigureAwait(false);
+            // Share.Read|Delete lets the processor reopen the same file (no second
+            // copy of a hundreds-of-MB PDF) and lets us unlink it after the request.
+            // Not DeleteOnClose: workers reopen by path and must see the file.
+            await using FileStream stream = new(
+                path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            ParallelPdfProcessor processor = GetOrCreateParallel();
+            Stopwatch sw = Stopwatch.StartNew();
+            int idx = 0;
+            await foreach (SKBitmap bitmap in processor.ToImagesAsync(
+                stream, pageIndices, leaveOpen: true, options: renderOptions, cancellationToken: ct)
+                .ConfigureAwait(false))
+            {
+                sw.Stop();
+                if (idx >= pageIndices.Length)
+                {
+                    bitmap.Dispose();
+                    throw new InvalidOperationException(
+                        $"PDFtoImage.Parallel yielded more than {pageIndices.Length} pages.");
+                }
+
+                int pageIndex = pageIndices[idx++];
+                try
+                {
+                    await writer.WriteAsync((pageIndex, bitmap, sw.Elapsed.TotalMilliseconds), ct)
+                        .ConfigureAwait(false);
+                    written.Add(pageIndex);
+                }
+                catch
+                {
+                    bitmap.Dispose();
+                    throw;
+                }
+
+                sw.Restart();
+            }
+
+            if (idx != pageIndices.Length)
+            {
+                throw new InvalidOperationException(
+                    $"PDFtoImage.Parallel yielded {idx} pages, expected {pageIndices.Length}.");
+            }
+        }
+        finally
+        {
+            TryDeleteTemp(path);
+        }
+    }
+
+    private async Task ProduceInProcessAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        int[] pageIndices,
+        RenderOptions renderOptions,
+        ChannelWriter<(int, SKBitmap, double)> writer,
+        CancellationToken ct)
+    {
+        if (pageIndices.Length == 0)
+            return;
+
+        int workers = Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, pageIndices.Length)), 1, 8);
+        Task[] tasks = new Task[workers];
+        for (int w = 0; w < workers; w++)
+        {
+            int workerId = w;
+            tasks[w] = Task.Run(async () =>
+            {
+                using MemoryStream local = new(
+                    pdfBytes, index: 0, count: pdfLength, writable: false, publiclyVisible: true);
+                List<int> mine = new((pageIndices.Length + workers - 1) / workers);
+                for (int i = workerId; i < pageIndices.Length; i += workers)
+                    mine.Add(pageIndices[i]);
+                if (mine.Count == 0)
+                    return;
+
+                IEnumerator<SKBitmap> enumerator =
+                    Conversion.ToImages(local, mine, leaveOpen: true, options: renderOptions)
+                        .GetEnumerator();
+                try
+                {
+                    int idx = 0;
+                    while (idx < mine.Count)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        Stopwatch sw = Stopwatch.StartNew();
+                        if (!enumerator.MoveNext())
+                        {
+                            throw new InvalidOperationException(
+                                $"PDFtoImage yielded {idx} pages, expected {mine.Count}.");
+                        }
+
+                        SKBitmap bitmap = enumerator.Current;
+                        sw.Stop();
+                        int pageIndex = mine[idx++];
+                        try
+                        {
+                            await writer.WriteAsync((pageIndex, bitmap, sw.Elapsed.TotalMilliseconds), ct)
+                                .ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            bitmap.Dispose();
+                            while (enumerator.MoveNext())
+                                enumerator.Current.Dispose();
+                            throw;
+                        }
+                    }
+                }
+                finally
+                {
+                    enumerator.Dispose();
+                }
+            }, ct);
+        }
+
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+    }
+
+    private ParallelPdfProcessor GetOrCreateParallel()
+    {
+        lock (_parallelGate)
+        {
+            ObjectDisposedException.ThrowIf(_parallelDisposed != 0, this);
+            return _parallel ??= new ParallelPdfProcessor(new ProcessorOptions
+            {
+                WorkerCount = Math.Clamp(_config.RenderProcessCount, 1, 8),
+                TransferMode = ProcessorTransferMode.MemoryMappedFile,
+                ReuseFileStream = true,
+            });
+        }
+    }
+
+    private void AbandonParallel()
+    {
+        ParallelPdfProcessor? processor;
+        lock (_parallelGate)
+        {
+            processor = _parallel;
+            _parallel = null;
+        }
+
+        if (processor is null)
+            return;
+        try
+        {
+            processor.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Disposing failed parallel PDF renderer");
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _parallelDisposed, 1) != 0)
+            return;
+
+        ParallelPdfProcessor? processor;
+        lock (_parallelGate)
+        {
+            processor = _parallel;
+            _parallel = null;
+        }
+
+        if (processor is null)
+            return;
+        try
+        {
+            await processor.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to dispose parallel PDF renderer");
+        }
+    }
+
+    private static int[] RemainingIndices(int[] pageIndices, HashSet<int> written)
+    {
+        if (written.Count == 0)
+            return pageIndices;
+        int[] remaining = new int[pageIndices.Length - written.Count];
+        int n = 0;
+        foreach (int index in pageIndices)
+        {
+            if (!written.Contains(index))
+                remaining[n++] = index;
+        }
+
+        if (n == remaining.Length)
+            return remaining;
+        return remaining[..n];
+    }
+
+    private static async Task WritePdfTempAsync(string path, byte[] pdfBytes, int pdfLength, CancellationToken ct)
+    {
+        var options = new FileStreamOptions
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.Write,
+            Share = FileShare.None,
+            BufferSize = 1024 * 1024,
+            Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+        };
+        if (!OperatingSystem.IsWindows())
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
+        await using FileStream output = new(path, options);
+        await output.WriteAsync(pdfBytes.AsMemory(0, pdfLength), ct).ConfigureAwait(false);
+    }
+
+    private void TryDeleteTemp(string path)
+    {
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                File.Delete(path);
+                return;
+            }
+            catch (FileNotFoundException)
+            {
+                return;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return;
+            }
+            catch (IOException) when (attempt < 4)
+            {
+                Thread.Sleep(20 * (attempt + 1));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to delete temporary PDF {Path}", path);
+                return;
+            }
         }
     }
 

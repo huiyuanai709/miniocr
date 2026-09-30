@@ -13,12 +13,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # MiniOcr.csproj ProjectReferences external/SimdPaddleOCR and external/PDFtoImage.
+          submodules: recursive
 
       - name: Setup .NET 11 RC
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "11.0.x"
           dotnet-quality: preview
+
+      - name: Build (PDFtoImage + SimdPaddleOCR project references)
+        run: dotnet build ./MiniOcr.csproj -c Release
 
       - name: WeChat OCR detection and protobuf
         run: dotnet run -c Release --project tests/MiniOcr.WeChatSmoke

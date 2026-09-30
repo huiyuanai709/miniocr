@@ -2,3 +2,7 @@
 	path = external/SimdPaddleOCR
 	url = https://github.com/huiyuanai709/SimdPaddleOCR.git
 	branch = main
+[submodule "external/PDFtoImage"]
+	path = external/PDFtoImage
+	url = https://github.com/huiyuanai709/PDFtoImage.git
+	branch = master

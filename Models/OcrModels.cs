@@ -107,6 +107,10 @@ public sealed class HealthResponse
     public int DefaultDpi { get; set; }
     public bool UseDirectionClassification { get; set; }
     public int RasterWorkerCount { get; set; }
+    /// <summary><c>inprocess</c> or <c>parallel</c>.</summary>
+    public string RenderMode { get; set; } = "inprocess";
+    /// <summary>PDFtoImage.Parallel worker processes. Unused while <see cref="RenderMode"/> is <c>inprocess</c>.</summary>
+    public int RenderProcessCount { get; set; }
     public int RecBatchLines { get; set; }
     public int DetLimitSideLength { get; set; }
     public bool AutoScaleFromCpu { get; set; }

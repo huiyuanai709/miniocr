@@ -401,6 +401,8 @@ public static class AppConfigStore
             "lineWorkers": null,
             "detThreads": null,
             "rasterWorkers": null,
+            "renderMode": "inprocess",
+            "renderProcesses": null,
             "useCls": false,
             "autoScaleFromCpu": true,
             "wechatOcrPath": "",

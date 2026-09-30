@@ -98,7 +98,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Checks out external/SimdPaddleOCR at the gitlink (fork main, currently 6aae0ad).
+          # Checks out external/SimdPaddleOCR and external/PDFtoImage at their gitlinks.
           submodules: recursive
 
       - name: Setup .NET 11 RC

@@ -227,6 +227,8 @@ Console.WriteLine("=== config mode ===");
 string? prevMode = Environment.GetEnvironmentVariable("MINIOCR_OCR_MODE");
 string? prevPath = Environment.GetEnvironmentVariable("MINIOCR_WECHAT_OCR_PATH");
 string? prevInstances = Environment.GetEnvironmentVariable("MINIOCR_WECHAT_INSTANCES");
+string? prevRenderMode = Environment.GetEnvironmentVariable("MINIOCR_RENDER_MODE");
+string? prevRenderProcesses = Environment.GetEnvironmentVariable("MINIOCR_RENDER_PROCESSES");
 try
 {
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "wechat");
@@ -253,12 +255,46 @@ try
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", null);
     AssertEqual("wechat", OcrRuntimeConfig.ResolveMode("WeChat"), "file mode wechat");
     AssertEqual("local", OcrRuntimeConfig.CanonicalMode("paddle"), "unknown canonical mode is local");
+
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", null);
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", null);
+    AssertEqual("inprocess", cfg.RenderMode, "default render mode is inprocess");
+    AssertTrue(cfg.RenderProcessCount is >= 1 and <= 4, "auto render processes stay in 1..4");
+    AssertEqual("inprocess", cfg.With().RenderMode, "With copies render mode");
+    AssertEqual(cfg.RenderProcessCount.ToString(), cfg.With().RenderProcessCount.ToString(), "With copies render processes");
+    AssertEqual("2", OcrRuntimeConfig.ComputeRenderProcesses(4, 2).ToString(), "4 cores and 2 engines -> 2 render processes");
+    AssertEqual("4", OcrRuntimeConfig.ComputeRenderProcesses(16, 8).ToString(), "render process auto cap is 4");
+    AssertEqual("1", OcrRuntimeConfig.ComputeRenderProcesses(2, 1).ToString(), "small machine uses 1 render process");
+
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", "parallel");
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", "4");
+    OcrRuntimeConfig parallelCfg = OcrRuntimeConfig.FromAppConfig(new AppConfigFile());
+    AssertEqual("parallel", parallelCfg.RenderMode, "env render mode overrides file");
+    AssertEqual("4", parallelCfg.RenderProcessCount.ToString(), "env render processes");
+
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", "nope");
+    AssertEqual("inprocess", OcrRuntimeConfig.ResolveRenderMode("parallel"), "unknown env render mode is inprocess");
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", null);
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", null);
+    AssertEqual("parallel", OcrRuntimeConfig.ResolveRenderMode("Parallel"), "file render mode parallel");
+    OcrRuntimeConfig fileRender = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { RenderMode = "parallel", RenderProcesses = 3, AutoScaleFromCpu = false },
+    });
+    AssertEqual("parallel", fileRender.RenderMode, "file render mode");
+    AssertEqual("3", fileRender.RenderProcessCount.ToString(), "file render processes");
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", "99");
+    AssertEqual("8", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RenderProcessCount.ToString(), "render processes clamp to 8");
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", "0");
+    AssertEqual("1", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RenderProcessCount.ToString(), "render processes clamp to 1");
 }
 finally
 {
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", prevMode);
     Environment.SetEnvironmentVariable("MINIOCR_WECHAT_OCR_PATH", prevPath);
     Environment.SetEnvironmentVariable("MINIOCR_WECHAT_INSTANCES", prevInstances);
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", prevRenderMode);
+    Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", prevRenderProcesses);
 }
 
 Console.WriteLine("=== non-ASCII PDF path ===");
