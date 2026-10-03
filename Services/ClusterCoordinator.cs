@@ -8,119 +8,6 @@ using MiniOcr.Models;
 namespace MiniOcr.Services;
 
 /// <summary>
-/// One in-flight distributed OCR job. Page text is committed here; the pipeline owns NER.
-/// </summary>
-public sealed class ClusterJob
-{
-    private readonly object _acceptGate = new();
-    private readonly TaskCompletionSource _readersDrained =
-        new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private Action<OcrPageResult>? _onAccepted;
-    private int _readers;
-    private int _rejectReads;
-    private int _finished;
-
-    public ClusterJob(
-        string id,
-        ClusterPageScheduler scheduler,
-        byte[] pdf,
-        int pdfLength,
-        int pageCount,
-        int dpi)
-    {
-        Id = id;
-        Scheduler = scheduler;
-        Pdf = pdf;
-        PdfLength = pdfLength;
-        PageCount = pageCount;
-        Dpi = dpi;
-        Started = DateTimeOffset.UtcNow;
-        LastProgressAt = Started;
-    }
-
-    public string Id { get; }
-    public ClusterPageScheduler Scheduler { get; }
-    public byte[] Pdf { get; }
-    public int PdfLength { get; }
-    public int PageCount { get; }
-    public int Dpi { get; }
-    public DateTimeOffset Started { get; }
-    public ConcurrentDictionary<string, byte> Joined { get; } = new(StringComparer.Ordinal);
-    internal int LastProgressDone;
-    internal int LastProgressBucket;
-    internal int LastNerDone;
-    internal int LastNerBucket;
-    internal DateTimeOffset LastProgressAt;
-    /// <summary>Set when this job distributes text NER. Null keeps NER on the coordinator pipeline.</summary>
-    public ClusterNerScheduler? Ner { get; set; }
-    internal bool DeferProgress;
-    internal object ProgressGate { get; } = new();
-    public bool IsFinished => Volatile.Read(ref _finished) == 1;
-
-    public void SetAccepted(Action<OcrPageResult> onAccepted) => _onAccepted = onAccepted;
-
-    public bool TryAccept(string batchId, OcrPageResult page)
-    {
-        lock (_acceptGate)
-        {
-            if (!Scheduler.TryCommit(batchId, page.Page))
-                return false;
-            Ner?.AddPage(page);
-            _onAccepted?.Invoke(page);
-            return true;
-        }
-    }
-
-    /// <summary>Block until any in-flight <see cref="TryAccept"/> has finished mutating page state.</summary>
-    public void DrainAccepts()
-    {
-        lock (_acceptGate)
-        {
-        }
-    }
-
-    public void MarkFinished() => Volatile.Write(ref _finished, 1);
-
-    public IDisposable? TryEnterPdfRead()
-    {
-        if (Volatile.Read(ref _rejectReads) == 1)
-            return null;
-        Interlocked.Increment(ref _readers);
-        if (Volatile.Read(ref _rejectReads) == 1)
-        {
-            ExitRead();
-            return null;
-        }
-
-        return new PdfRead(this);
-    }
-
-    public void StopNewPdfReads() => Volatile.Write(ref _rejectReads, 1);
-
-    public async Task WaitForPdfReadersAsync(TimeSpan timeout)
-    {
-        if (Volatile.Read(ref _readers) <= 0)
-            return;
-        Task finished = _readersDrained.Task;
-        Task delay = Task.Delay(timeout);
-        await Task.WhenAny(finished, delay).ConfigureAwait(false);
-    }
-
-    private void ExitRead()
-    {
-        if (Interlocked.Decrement(ref _readers) <= 0)
-            _readersDrained.TrySetResult();
-    }
-
-    private sealed class PdfRead : IDisposable
-    {
-        private ClusterJob? _job;
-        public PdfRead(ClusterJob job) => _job = job;
-        public void Dispose() => Interlocked.Exchange(ref _job, null)?.ExitRead();
-    }
-}
-
-/// <summary>
 /// Coordinates pull-based OCR. Each worker downloads the PDF once, then claims page
 /// batches sized by its capacity. The coordinator's own engine pool is the local node.
 /// Images are not shipped: raster stays on the machine that OCRs the page.
@@ -259,7 +146,11 @@ public sealed class ClusterCoordinator : IHostedService
         ClusterJobLog.Heartbeat(_logger, _config.VerboseDispatch, req.NodeId, req.InFlight, req.Capacity);
     }
 
-    public ClusterDispatchResponse Dispatch(string nodeId, int capacity, IReadOnlyList<string>? activeJobs)
+    public ClusterDispatchResponse Dispatch(
+        string nodeId,
+        int capacity,
+        IReadOnlyList<string>? activeJobs,
+        int? activeSessions = null)
     {
         if (capacity > 0 && !string.IsNullOrWhiteSpace(nodeId))
         {
@@ -277,6 +168,14 @@ public sealed class ClusterCoordinator : IHostedService
             }
         }
 
+        int sessions = ClusterDispatchRules.SessionCount(activeSessions, busy.Count);
+        if (!string.IsNullOrWhiteSpace(nodeId) && ClusterDispatchRules.AtSessionCap(sessions))
+        {
+            ClusterJobLog.DispatchWait(_logger, _config.VerboseDispatch, nodeId);
+            return new ClusterDispatchResponse { Wait = true, RetryAfterMs = 300 };
+        }
+
+        bool nodeCanNer = !string.IsNullOrWhiteSpace(nodeId) && _registry.NerCapacity(nodeId) > 0;
         foreach (ClusterJob job in _jobs.Values.OrderBy(j => j.Started))
         {
             if (job.IsFinished)
@@ -285,6 +184,10 @@ public sealed class ClusterCoordinator : IHostedService
                 continue;
             if (busy.Contains(job.Id))
                 continue;
+            bool ocrComplete = job.Scheduler.IsComplete;
+            bool nerPending = job.Ner is { IsComplete: false };
+            if (!ClusterDispatchRules.ShouldOfferJob(ocrComplete, nerPending, nodeCanNer))
+                continue;
             return new ClusterDispatchResponse
             {
                 Wait = false,
@@ -292,6 +195,7 @@ public sealed class ClusterCoordinator : IHostedService
                 Dpi = job.Dpi,
                 PageCount = job.PageCount,
                 PdfPath = "/cluster/jobs/" + job.Id + "/pdf",
+                SourceUrl = string.IsNullOrWhiteSpace(job.SourceUrl) ? null : job.SourceUrl,
                 RetryAfterMs = 200,
             };
         }
@@ -300,18 +204,44 @@ public sealed class ClusterCoordinator : IHostedService
         return new ClusterDispatchResponse { Wait = true, RetryAfterMs = 300 };
     }
 
-    public bool Join(ClusterJob job, string nodeId, int capacity)
+    public bool Join(ClusterJob job, string nodeId, int capacity, bool downloading = false)
     {
         if (job.IsFinished || string.IsNullOrWhiteSpace(nodeId))
             return false;
-        job.Joined[nodeId] = 1;
+        bool first = job.Joined.TryAdd(nodeId, 1);
         if (capacity > 0)
             job.Scheduler.SetCapacity(nodeId, capacity);
-        _logger.LogInformation(
-            "Cluster job {JobId} node {NodeId} joined (capacity={Capacity})",
-            job.Id,
-            nodeId,
-            capacity);
+        if (downloading)
+            job.MarkDownloading(nodeId);
+        else
+            job.ClearDownloading(nodeId);
+        if (job.ExpectRemote)
+            job.Scheduler.SetHoldLocalWindow(job.ShouldHoldLocal(DateTimeOffset.UtcNow));
+        if (downloading)
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} node {NodeId} joined, downloading PDF (capacity={Capacity})",
+                job.Id,
+                nodeId,
+                capacity);
+        }
+        else if (first)
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} node {NodeId} joined (capacity={Capacity})",
+                job.Id,
+                nodeId,
+                capacity);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} node {NodeId} PDF ready (capacity={Capacity})",
+                job.Id,
+                nodeId,
+                capacity);
+        }
+
         return true;
     }
 
@@ -324,6 +254,8 @@ public sealed class ClusterCoordinator : IHostedService
             maxPages = 1;
         if (!string.IsNullOrWhiteSpace(nodeId))
             job.Scheduler.SetCapacity(nodeId, Math.Max(1, maxPages));
+        if (job.Ner is not null)
+            job.Scheduler.SetNerBlocker(job.Ner.EarliestMissingPage());
 
         ClusterClaim claim = job.Scheduler.Claim(nodeId, maxPages, DateTimeOffset.UtcNow);
         LogExpiries(job);
@@ -404,6 +336,7 @@ public sealed class ClusterCoordinator : IHostedService
         int pdfLength,
         int pageCount,
         int dpi,
+        string? sourceUrl,
         Func<int[], string, ClusterJob, CancellationToken, Task> recognizeLocal,
         Action<OcrPageResult> onAccepted,
         bool distributeNer,
@@ -431,7 +364,10 @@ public sealed class ClusterCoordinator : IHostedService
         bool expectRemote = remotes.Count > 0;
         scheduler.SetHoldLocalWindow(expectRemote && _config.JoinGraceMs > 0);
 
-        var job = new ClusterJob(id, scheduler, pdf, pdfLength, pageCount, dpi);
+        var job = new ClusterJob(id, scheduler, pdf, pdfLength, pageCount, dpi, sourceUrl)
+        {
+            ExpectRemote = expectRemote,
+        };
         ClusterNerScheduler? ner = null;
         int localNerCap = 0;
         if (distributeNer && _config.DistributedNer)
@@ -472,13 +408,14 @@ public sealed class ClusterCoordinator : IHostedService
 
         WarnModelMismatch(remotes, dpi);
         _logger.LogInformation(
-            "Cluster job {JobId} start: pages={Pages}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges",
+            "Cluster job {JobId} start: pages={Pages}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}",
             id,
             pageCount,
             pdfLength,
             dpi,
             remotes.Count,
-            localCap);
+            localCap,
+            string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator");
 
         using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task notify = NotifyWorkersAsync(job, remotes, linked.Token);
@@ -496,6 +433,8 @@ public sealed class ClusterCoordinator : IHostedService
                 if (scheduler.IsComplete)
                     break;
 
+                if (ner is not null)
+                    scheduler.SetNerBlocker(ner.EarliestMissingPage());
                 ClusterClaim claim = scheduler.Claim(_config.NodeId, localCap, DateTimeOffset.UtcNow);
                 LogExpiries(job);
                 if (claim.Kind == ClusterClaimKind.Done)
@@ -595,7 +534,7 @@ public sealed class ClusterCoordinator : IHostedService
             if (localNer is not null)
                 await Quiet(localNer).ConfigureAwait(false);
             job.StopNewPdfReads();
-            await job.WaitForPdfReadersAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            await job.WaitForPdfReadersAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
 
             ClusterScheduleSnapshot snap = scheduler.Snapshot();
             var breakdown = new List<ClusterNodePages>();
@@ -928,9 +867,13 @@ public sealed class ClusterCoordinator : IHostedService
             return;
         }
 
-        job.Scheduler.SetHoldLocalWindow(false);
+        job.MarkGraceElapsed();
+        bool stillDownloading = job.ShouldHoldLocal(DateTimeOffset.UtcNow);
+        job.Scheduler.SetHoldLocalWindow(stillDownloading);
         _logger.LogInformation(
-            "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; local node may take remaining pages",
+            stillDownloading
+                ? "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; holding the local window while a node downloads the PDF"
+                : "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; local node may take remaining pages",
             job.Id,
             _config.JoinGraceMs);
     }
@@ -951,6 +894,8 @@ public sealed class ClusterCoordinator : IHostedService
             job.Id,
             _config.JobDeadlineMs);
         DateTimeOffset now = DateTimeOffset.UtcNow;
+        job.ForceReleaseDownloadHold();
+        job.Scheduler.SetHoldLocalWindow(false);
         job.Scheduler.TakeOverLocal(now);
         if (job.Ner is null)
             return;
@@ -995,6 +940,7 @@ public sealed class ClusterCoordinator : IHostedService
             CoordinatorUrl = _config.AdvertiseUrl,
             Dpi = job.Dpi,
             PageCount = job.PageCount,
+            SourceUrl = string.IsNullOrWhiteSpace(job.SourceUrl) ? null : job.SourceUrl,
         };
 
         await Task.WhenAll(remotes.Select(remote => NotifyOneAsync(http, job, remote, body, ct)))
@@ -1048,6 +994,8 @@ public sealed class ClusterCoordinator : IHostedService
                 DateTimeOffset now = DateTimeOffset.UtcNow;
                 foreach (ClusterJob job in _jobs.Values)
                 {
+                    if (job.ExpectRemote)
+                        job.Scheduler.SetHoldLocalWindow(job.ShouldHoldLocal(now));
                     job.Scheduler.Reap(now);
                     job.Ner?.Reap(now);
                     LogExpiries(job);

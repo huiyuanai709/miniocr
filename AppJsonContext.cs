@@ -23,6 +23,7 @@ namespace MiniOcr;
 [JsonSerializable(typeof(LlmFileConfig))]
 [JsonSerializable(typeof(OcrFileConfig))]
 [JsonSerializable(typeof(ChatCompletionRequest))]
+[JsonSerializable(typeof(ChatResponseFormat))]
 [JsonSerializable(typeof(ChatCompletionResponse))]
 [JsonSerializable(typeof(ChatChoice))]
 [JsonSerializable(typeof(ChatMessage))]
@@ -87,4 +88,4 @@ namespace MiniOcr;
 [JsonSerializable(typeof(Dictionary<string, string>))]
 [JsonSerializable(typeof(NacosFileConfig))]
 [JsonSerializable(typeof(List<int>))]
-internal partial class AppJsonContext : JsonSerializerContext;
+public partial class AppJsonContext : JsonSerializerContext;

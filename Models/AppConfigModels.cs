@@ -43,6 +43,13 @@ public sealed class LlmFileConfig
 
     /// <summary>When LLM is not usable: use EntityExtractor heuristics. Ignored after an LLM NER attempt (never silent heuristic fallback). Default false.</summary>
     public bool FallbackToHeuristics { get; set; } = false;
+
+    /// <summary>
+    /// Send <c>response_format: {"type":"json_object"}</c>. Null (default) turns it on for
+    /// OpenAI-compatible and DeepSeek chat completions. Set false for a provider that rejects it.
+    /// A 400 that mentions the field also disables it for the rest of the process.
+    /// </summary>
+    public bool? JsonObject { get; set; }
 }
 
 public sealed class OcrFileConfig
@@ -92,6 +99,8 @@ public sealed class LlmRuntimeConfig
     /// <summary>When true, send thinking.type=enabled; when false (default), send disabled.</summary>
     public bool Thinking { get; init; } = false;
     public bool FallbackToHeuristics { get; init; } = false;
+    /// <summary>When true (default), ask for a JSON object. Turned off at runtime if the provider rejects it.</summary>
+    public bool JsonObject { get; init; } = true;
 
     /// <summary>Payload for DeepSeek/OpenAI-compatible thinking field.</summary>
     public ThinkingOption ToThinkingOption() =>
@@ -112,6 +121,14 @@ public sealed class ChatCompletionRequest
     public double Temperature { get; set; }
     /// <summary>DeepSeek thinking control: {"type":"enabled"|"disabled"}.</summary>
     public ThinkingOption? Thinking { get; set; }
+    /// <summary>OpenAI/DeepSeek <c>response_format</c>. Null omits the field.</summary>
+    [JsonPropertyName("response_format")]
+    public ChatResponseFormat? ResponseFormat { get; set; }
+}
+
+public sealed class ChatResponseFormat
+{
+    public string Type { get; set; } = "json_object";
 }
 
 public sealed class ChatMessage
@@ -128,6 +145,9 @@ public sealed class VisionChatCompletionRequest
     public double Temperature { get; set; }
     /// <summary>DeepSeek thinking control: {"type":"enabled"|"disabled"}.</summary>
     public ThinkingOption? Thinking { get; set; }
+    /// <summary>OpenAI/DeepSeek <c>response_format</c>. Null omits the field.</summary>
+    [JsonPropertyName("response_format")]
+    public ChatResponseFormat? ResponseFormat { get; set; }
 }
 
 /// <summary>OpenAI/DeepSeek thinking object serialized as camelCase <c>thinking: { type }</c>.</summary>

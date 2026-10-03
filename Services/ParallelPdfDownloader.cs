@@ -23,7 +23,13 @@ public sealed class ParallelPdfDownloader
 
     public sealed record DownloadResult(RentedBuffer Buffer, string Mode, double ElapsedMs);
 
-    public async Task<DownloadResult> DownloadAsync(string url, CancellationToken ct)
+    public Task<DownloadResult> DownloadAsync(string url, CancellationToken ct) =>
+        DownloadAsync(url, ct, prepare: null);
+
+    public async Task<DownloadResult> DownloadAsync(
+        string url,
+        CancellationToken ct,
+        Action<HttpRequestMessage>? prepare)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) ||
             (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
@@ -39,6 +45,7 @@ public sealed class ParallelPdfDownloader
         try
         {
             using HttpRequestMessage head = new(HttpMethod.Head, uri);
+            prepare?.Invoke(head);
             using HttpResponseMessage headResp = await _http.SendAsync(
                 head, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             if (headResp.IsSuccessStatusCode)
@@ -60,21 +67,21 @@ public sealed class ParallelPdfDownloader
         {
             try
             {
-                RentedBuffer buffer = await DownloadRangedAsync(uri, contentLength.Value, ct).ConfigureAwait(false);
+                RentedBuffer buffer = await DownloadRangedAsync(uri, contentLength.Value, prepare, ct).ConfigureAwait(false);
                 sw.Stop();
                 result = new DownloadResult(buffer, "parallel-ranges", sw.Elapsed.TotalMilliseconds);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Ranged download failed; falling back to single stream for {Uri}", uri);
-                RentedBuffer buffer = await DownloadSingleAsync(uri, contentLength, ct).ConfigureAwait(false);
+                RentedBuffer buffer = await DownloadSingleAsync(uri, contentLength, prepare, ct).ConfigureAwait(false);
                 sw.Stop();
                 result = new DownloadResult(buffer, "single-presized-fallback", sw.Elapsed.TotalMilliseconds);
             }
         }
         else
         {
-            RentedBuffer buffer = await DownloadSingleAsync(uri, contentLength, ct).ConfigureAwait(false);
+            RentedBuffer buffer = await DownloadSingleAsync(uri, contentLength, prepare, ct).ConfigureAwait(false);
             sw.Stop();
             string mode = contentLength is > 0 ? "single-presized" : "single-grow";
             result = new DownloadResult(buffer, mode, sw.Elapsed.TotalMilliseconds);
@@ -92,7 +99,11 @@ public sealed class ParallelPdfDownloader
         return resp.Headers.AcceptRanges.Count > 0;
     }
 
-    private async Task<RentedBuffer> DownloadRangedAsync(Uri uri, long length, CancellationToken ct)
+    private async Task<RentedBuffer> DownloadRangedAsync(
+        Uri uri,
+        long length,
+        Action<HttpRequestMessage>? prepare,
+        CancellationToken ct)
     {
         int size = checked((int)length);
         byte[] rented = _pool.Rent(size);
@@ -118,10 +129,16 @@ public sealed class ParallelPdfDownloader
                     try
                     {
                         using HttpRequestMessage req = new(HttpMethod.Get, uri);
+                        prepare?.Invoke(req);
                         req.Headers.Range = new RangeHeaderValue(start, end);
                         using HttpResponseMessage resp = await _http.SendAsync(
                             req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
                         resp.EnsureSuccessStatusCode();
+                        if (resp.StatusCode != System.Net.HttpStatusCode.PartialContent)
+                        {
+                            throw new InvalidOperationException(
+                                $"Expected 206 for range {start}-{end}, got {(int)resp.StatusCode}.");
+                        }
 
                         int offset = (int)start;
                         int remaining = (int)(end - start + 1);
@@ -157,9 +174,14 @@ public sealed class ParallelPdfDownloader
         }
     }
 
-    private async Task<RentedBuffer> DownloadSingleAsync(Uri uri, long? knownLength, CancellationToken ct)
+    private async Task<RentedBuffer> DownloadSingleAsync(
+        Uri uri,
+        long? knownLength,
+        Action<HttpRequestMessage>? prepare,
+        CancellationToken ct)
     {
         using HttpRequestMessage req = new(HttpMethod.Get, uri);
+        prepare?.Invoke(req);
         using HttpResponseMessage resp = await _http.SendAsync(
             req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();

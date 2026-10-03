@@ -35,5 +35,14 @@ jobs:
       - name: Entity eval (recorded responses, no API key)
         run: dotnet run -c Release --project tests/MiniOcr.EntityEval -- --recorded
 
+      - name: Cluster scheduler
+        run: dotnet run -c Release --project tests/MiniOcr.ClusterSmoke
+
+      - name: LLM JSON mode
+        run: dotnet run -c Release --project tests/MiniOcr.LlmJsonSmoke
+
+      - name: Cluster join benchmark
+        run: dotnet run -c Release --project tests/MiniOcr.ClusterBench
+
       - name: Config path
         run: dotnet run -c Release --project tests/MiniOcr.ConfigPathSmoke

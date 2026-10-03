@@ -154,7 +154,7 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
                 using (download.Buffer)
                 {
                     OcrResponse ocr = await _pipeline
-                        .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct)
+                        .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, sourceUrl: url)
                         .ConfigureAwait(false);
                     ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(fileId, ocr);
                     results.Add(mapped);

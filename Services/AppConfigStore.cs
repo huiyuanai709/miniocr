@@ -192,6 +192,17 @@ public static class AppConfigStore
         if (!string.IsNullOrWhiteSpace(envThinking))
             thinking = ThinkingConfigJsonConverter.ParseThinkingString(envThinking);
 
+        bool jsonObject = llm.JsonObject ?? true;
+        string? envJson = Environment.GetEnvironmentVariable("MINIOCR_LLM_JSON_OBJECT");
+        if (!string.IsNullOrWhiteSpace(envJson))
+        {
+            string s = envJson.Trim();
+            if (s is "0" or "false" or "False" or "FALSE" or "no" or "NO" or "off" or "OFF")
+                jsonObject = false;
+            else if (s is "1" or "true" or "True" or "TRUE" or "yes" or "YES" or "on" or "ON")
+                jsonObject = true;
+        }
+
         return new LlmRuntimeConfig
         {
             Enabled = llm.Enabled,
@@ -208,6 +219,7 @@ public static class AppConfigStore
             OcrJpegQuality = Math.Clamp(ocrJpegQuality, 40, 95),
             Thinking = thinking,
             FallbackToHeuristics = llm.FallbackToHeuristics,
+            JsonObject = jsonObject,
         };
     }
 
@@ -392,7 +404,8 @@ public static class AppConfigStore
             "ocrMaxCharsHint": 8000,
             "ocrJpegQuality": 70,
             "thinking": false,
-            "fallbackToHeuristics": false
+            "fallbackToHeuristics": false,
+            "jsonObject": true
           },
           "ocr": {
             "mode": "local",

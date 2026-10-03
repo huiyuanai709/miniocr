@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Microsoft.Net.Http.Headers;
 using MiniOcr.Models;
 
 namespace MiniOcr.Services;
@@ -114,7 +115,11 @@ public static partial class ClusterEndpoints
             }
 
             body ??= new ClusterDispatchRequest();
-            ClusterDispatchResponse response = coordinator.Dispatch(body.NodeId ?? "", body.Capacity, body.ActiveJobs);
+            ClusterDispatchResponse response = coordinator.Dispatch(
+                body.NodeId ?? "",
+                body.Capacity,
+                body.ActiveJobs,
+                body.ActiveSessions);
             return Results.Json(response, AppJsonContext.Default.ClusterDispatchResponse);
         });
 
@@ -150,29 +155,40 @@ public static partial class ClusterEndpoints
             return Ack(StatusCodes.Status200OK, null);
         });
 
-        app.MapGet("/cluster/jobs/{jobId}/pdf", (string jobId, HttpRequest http, ClusterRuntimeConfig cfg, ClusterCoordinator coordinator) =>
+        app.MapMethods("/cluster/jobs/{jobId}/pdf", [HttpMethods.Get, HttpMethods.Head], (
+            string jobId,
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator) =>
         {
             if (!Authorize(http, cfg, out IResult? deny))
                 return deny!;
             if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
                 return missing!;
-            IDisposable? lease = job!.TryEnterPdfRead();
-            if (lease is null)
-                return Ack(StatusCodes.Status409Conflict, "Job is closing.");
 
-            byte[] pdf = job.Pdf;
-            int length = job.PdfLength;
-            return Results.Stream(async body =>
+            int length = job!.PdfLength;
+            bool head = HttpMethods.IsHead(http.Method);
+            long start = 0;
+            long end = length - 1;
+            bool partial = false;
+            RangeHeaderValue? range = http.GetTypedHeaders().Range;
+            if (range is { Ranges.Count: 1 })
             {
-                try
-                {
-                    await body.WriteAsync(pdf.AsMemory(0, length)).ConfigureAwait(false);
-                }
-                finally
-                {
-                    lease.Dispose();
-                }
-            }, "application/pdf");
+                RangeItemHeaderValue item = range.Ranges.First();
+                if (!ClusterPdfRange.TrySlice(length, item.From, item.To, out start, out end))
+                    return Results.StatusCode(StatusCodes.Status416RangeNotSatisfiable);
+                partial = true;
+            }
+
+            ClusterJob.PdfReadLease? lease = null;
+            if (!head)
+            {
+                lease = job.TryEnterPdfRead();
+                if (lease is null)
+                    return Ack(StatusCodes.Status409Conflict, "Job is closing.");
+            }
+
+            return new PdfBytesResult(job.Pdf, length, start, end, partial, head, lease);
         });
 
         app.MapPost("/cluster/jobs/{jobId}/join", async Task<IResult> (
@@ -199,7 +215,7 @@ public static partial class ClusterEndpoints
 
             if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
                 return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
-            if (!coordinator.Join(job!, body.NodeId.Trim(), body.Capacity))
+            if (!coordinator.Join(job!, body.NodeId.Trim(), body.Capacity, body.Downloading))
                 return Ack(StatusCodes.Status409Conflict, "Job is finished.");
             return Ack(StatusCodes.Status200OK, null);
         });
@@ -434,4 +450,68 @@ public static partial class ClusterEndpoints
             new ClusterAck { Ok = status is >= 200 and < 300, Error = error },
             AppJsonContext.Default.ClusterAck,
             statusCode: status);
+
+    /// <summary>
+    /// Serves the job PDF with Content-Length and Accept-Ranges. A single byte range is 206.
+    /// The read lease's token is cancelled when the job finishes so the body does not hold completion.
+    /// </summary>
+    private sealed class PdfBytesResult : IResult
+    {
+        private readonly byte[] _pdf;
+        private readonly int _length;
+        private readonly long _start;
+        private readonly long _end;
+        private readonly bool _partial;
+        private readonly bool _head;
+        private readonly ClusterJob.PdfReadLease? _lease;
+
+        public PdfBytesResult(
+            byte[] pdf,
+            int length,
+            long start,
+            long end,
+            bool partial,
+            bool head,
+            ClusterJob.PdfReadLease? lease)
+        {
+            _pdf = pdf;
+            _length = length;
+            _start = start;
+            _end = end;
+            _partial = partial;
+            _head = head;
+            _lease = lease;
+        }
+
+        public async Task ExecuteAsync(HttpContext httpContext)
+        {
+            HttpResponse response = httpContext.Response;
+            int count = checked((int)(_end - _start + 1));
+            response.StatusCode = _partial
+                ? StatusCodes.Status206PartialContent
+                : StatusCodes.Status200OK;
+            response.ContentType = "application/pdf";
+            response.ContentLength = count;
+            response.Headers.AcceptRanges = "bytes";
+            if (_partial)
+                response.Headers.ContentRange = $"bytes {_start}-{_end}/{_length}";
+            if (_head)
+                return;
+
+            ClusterJob.PdfReadLease? lease = _lease;
+            try
+            {
+                await response.Body.WriteAsync(
+                    _pdf.AsMemory((int)_start, count),
+                    lease?.Token ?? CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                lease?.Dispose();
+            }
+        }
+    }
 }

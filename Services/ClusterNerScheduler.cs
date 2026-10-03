@@ -152,6 +152,26 @@ public sealed class ClusterNerScheduler
         }
     }
 
+    /// <summary>
+    /// Lowest 1-based page that has not been accepted yet. Ordered NER groups cannot form
+    /// past this hole. Null once OCR is sealed or every page is in.
+    /// </summary>
+    public int? EarliestMissingPage()
+    {
+        lock (_gate)
+        {
+            if (_sealed)
+                return null;
+            for (int i = 0; i < _pageCount; i++)
+            {
+                if (_accepted[i] is null)
+                    return i + 1;
+            }
+
+            return null;
+        }
+    }
+
     public void SetNerCapacity(string nodeId, int concurrency)
     {
         if (string.IsNullOrWhiteSpace(nodeId))
