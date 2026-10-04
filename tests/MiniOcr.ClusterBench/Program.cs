@@ -128,8 +128,10 @@ static async Task<int> CoordinatorAsync(string[] args)
     sched.SetCapacity("coord", 8);
     sched.SetCapacity("fast", 8);
     sched.SetCapacity("slow", 16);
-    if (adaptive)
-        sched.SetHoldLocalWindow(true);
+    // Legacy joins only after the full download. Hold the local window until that
+    // join so a fast machine cannot finish every page and cancel /pdf first.
+    // The new path holds only while a joined node is still downloading.
+    sched.SetHoldLocalWindow(true);
 
     var job = new JobState(sched, pages, adaptive, sourceUrl);
     using var listener = new HttpListener();
@@ -623,6 +625,8 @@ sealed class JobState
 
         if (Adaptive)
             Sched.SetHoldLocalWindow(hold);
+        else if (!downloading)
+            Sched.SetHoldLocalWindow(false);
     }
 
     public void NoteBatch(string node, int count)
