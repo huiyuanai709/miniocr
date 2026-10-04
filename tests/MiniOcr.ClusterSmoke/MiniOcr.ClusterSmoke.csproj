@@ -13,6 +13,9 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\..\Services\ClusterPageScheduler.cs" Link="ClusterPageScheduler.cs" />
+    <Compile Include="..\..\Services\ClusterJob.cs" Link="ClusterJob.cs" />
+    <Compile Include="..\..\Services\ClusterDispatchRules.cs" Link="ClusterDispatchRules.cs" />
+    <Compile Include="..\..\Services\ClusterPdfRange.cs" Link="ClusterPdfRange.cs" />
     <Compile Include="..\..\Services\ClusterJobLog.cs" Link="ClusterJobLog.cs" />
     <Compile Include="..\..\Services\ClusterNodeRegistry.cs" Link="ClusterNodeRegistry.cs" />
     <Compile Include="..\..\Services\ClusterRuntimeConfig.cs" Link="ClusterRuntimeConfig.cs" />

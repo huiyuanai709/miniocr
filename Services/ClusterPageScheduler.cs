@@ -79,6 +79,7 @@ public sealed class ClusterPageScheduler
     private readonly Dictionary<string, Lease> _leases = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _caps = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _committed = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Pace> _pace = new(StringComparer.Ordinal);
     private readonly List<TaskCompletionSource<bool>> _waiters = [];
     private readonly List<ClusterLeaseExpiry> _expiries = [];
     private int _expectedNodes;
@@ -86,6 +87,8 @@ public sealed class ClusterPageScheduler
     private int _batchSeq;
     private long _version;
     private bool _holdLocalWindow;
+    /// <summary>0-based page that blocks the next NER group. -1 when NER is not waiting on a hole.</summary>
+    private int _nerBlocker = -1;
 
     public ClusterPageScheduler(ClusterScheduleOptions options)
     {
@@ -155,6 +158,22 @@ public sealed class ClusterPageScheduler
         }
     }
 
+    /// <summary>
+    /// The earliest OCR page the NER grouper is still waiting on. An idle node may copy it
+    /// once the owner's lease has run much longer than that node's measured page time.
+    /// </summary>
+    public void SetNerBlocker(int? oneBasedPage)
+    {
+        lock (_gate)
+        {
+            int next = oneBasedPage is int page && page >= 1 && page <= _pageCount ? page - 1 : -1;
+            if (_nerBlocker == next)
+                return;
+            _nerBlocker = next;
+            SignalCore();
+        }
+    }
+
     public ClusterClaim Claim(string nodeId, int maxPages, DateTimeOffset now)
     {
         if (string.IsNullOrWhiteSpace(nodeId))
@@ -180,7 +199,11 @@ public sealed class ClusterPageScheduler
             if (room <= 0)
                 return WaitClaim();
 
-            int want = Math.Min(room, BatchTarget(cap));
+            int blocked = TrySpeculativeBlocker(nodeId, now);
+            if (blocked >= 0)
+                return LeasePages(nodeId, [blocked], speculative: true, now);
+
+            int want = Math.Min(room, AdaptiveBatch(nodeId, cap));
             if (maxPages > 0)
                 want = Math.Min(want, maxPages);
             want = Shrink(want);
@@ -210,7 +233,11 @@ public sealed class ClusterPageScheduler
     }
 
     /// <summary>First successful commit of a page wins. Duplicates (speculative or retry) return false.</summary>
-    public bool TryCommit(string batchId, int pageNumber)
+    public bool TryCommit(string batchId, int pageNumber) =>
+        TryCommit(batchId, pageNumber, DateTimeOffset.UtcNow);
+
+    /// <summary>First successful commit of a page wins. Duplicates (speculative or retry) return false.</summary>
+    public bool TryCommit(string batchId, int pageNumber, DateTimeOffset now)
     {
         lock (_gate)
         {
@@ -222,6 +249,7 @@ public sealed class ClusterPageScheduler
             if (_pages[index].Done)
                 return false;
 
+            NotePace(lease, now);
             _pages[index].Done = true;
             _done++;
             _committed[lease.NodeId] = CommittedCore(lease.NodeId) + 1;
@@ -389,6 +417,8 @@ public sealed class ClusterPageScheduler
     private int[] Dequeue(int want)
     {
         List<int> taken = new(want);
+        if (want > 0 && TryUnqueueBlocker(out int blocker))
+            taken.Add(blocker);
         int guard = _pending.Count;
         while (taken.Count < want && _pending.Count > 0 && guard-- >= 0)
         {
@@ -400,6 +430,105 @@ public sealed class ClusterPageScheduler
         }
 
         return taken.ToArray();
+    }
+
+    private bool TryUnqueueBlocker(out int index)
+    {
+        index = _nerBlocker;
+        if (index < 0 || _pages[index].Done || !_pages[index].Queued || IsLeased(index))
+            return false;
+        int n = _pending.Count;
+        int[] buf = new int[n];
+        for (int i = 0; i < n; i++)
+            buf[i] = _pending.Dequeue();
+        bool found = false;
+        for (int i = 0; i < n; i++)
+        {
+            if (!found && buf[i] == index)
+            {
+                found = true;
+                continue;
+            }
+
+            _pending.Enqueue(buf[i]);
+        }
+
+        if (!found)
+            return false;
+        _pages[index].Queued = false;
+        return true;
+    }
+
+    /// <summary>
+    /// Copy of the NER-blocking page when it is already leased and has been outstanding
+    /// much longer than the owner's measured time for one page. At most one extra copy.
+    /// </summary>
+    private int TrySpeculativeBlocker(string nodeId, DateTimeOffset now)
+    {
+        int index = _nerBlocker;
+        if (index < 0 || _pages[index].Done)
+            return -1;
+        if (NodeHasPage(nodeId, index) || LeaseCount(index) == 0 || LeaseCount(index) >= 2)
+            return -1;
+        Lease? owner = null;
+        foreach (Lease lease in _leases.Values)
+        {
+            if (!lease.Speculative && lease.Pages.Contains(index))
+            {
+                owner = lease;
+                break;
+            }
+        }
+
+        if (owner is null || owner.NodeId == nodeId)
+            return -1;
+        double ageMs = (now - owner.Created).TotalMilliseconds;
+        double threshold = Math.Max(2_500, ExpectedPageMs(owner.NodeId) * 2.0);
+        return ageMs >= threshold ? index : -1;
+    }
+
+    private double ExpectedPageMs(string nodeId)
+    {
+        if (!_pace.TryGetValue(nodeId, out Pace? pace) || pace.Pages < 1 || pace.Seconds <= 0)
+            return 4_000;
+        double pps = pace.Pages / pace.Seconds;
+        if (pps <= 0.01)
+            return 60_000;
+        return 1000.0 / pps;
+    }
+
+    private void NotePace(Lease lease, DateTimeOffset now)
+    {
+        if (!_pace.TryGetValue(lease.NodeId, out Pace? pace))
+        {
+            pace = new Pace();
+            _pace[lease.NodeId] = pace;
+        }
+
+        pace.Pages++;
+        if (!string.Equals(pace.OpenBatch, lease.BatchId, StringComparison.Ordinal))
+        {
+            pace.OpenBatch = lease.BatchId;
+            pace.Seconds += Math.Max(0.05, (now - lease.Created).TotalSeconds);
+        }
+    }
+
+    /// <summary>
+    /// Auto batches track measured pages/sec and start small. An explicit
+    /// <see cref="ClusterScheduleOptions.PagesPerBatch"/> stays fixed.
+    /// </summary>
+    private int AdaptiveBatch(string nodeId, int capacity)
+    {
+        int max = BatchTarget(capacity);
+        if (_pagesPerBatch > 0)
+            return max;
+        if (!_pace.TryGetValue(nodeId, out Pace? pace) || pace.Pages <= 0 || pace.Seconds <= 0)
+            return Math.Min(max, 2);
+        double pps = pace.Pages / pace.Seconds;
+        int sized = (int)Math.Round(pps * 8.0);
+        if (sized < 1)
+            sized = 1;
+        return Math.Min(max, sized);
     }
 
     private int[] PickSpeculative(string nodeId, int want)
@@ -659,5 +788,12 @@ public sealed class ClusterPageScheduler
         public DateTimeOffset Deadline { get; init; }
         public bool Speculative { get; init; }
         public DateTimeOffset Created { get; init; }
+    }
+
+    private sealed class Pace
+    {
+        public int Pages;
+        public double Seconds;
+        public string? OpenBatch;
     }
 }

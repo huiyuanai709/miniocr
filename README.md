@@ -348,12 +348,13 @@ cd artifacts/linux-x64-singlefile
 7. **视觉 OCR 并发**：`llm.ocrConcurrency`（默认 **32**，1–256）；`MINIOCR_LLM_OCR_CONCURRENCY` 可覆盖。调高可缩短墙钟时间，但请留意 **费率与限流**。
 8. **视觉 JPEG 质量**：`llm.ocrJpegQuality`（默认 **70**，40–95）；`MINIOCR_LLM_OCR_JPEG_QUALITY` 可覆盖。
 9. **`maxCharsPerRequest`（安全上限）**：默认 **300000**（钳制 1000–2_000_000）。分组以 `pagesPerRequest` 为准；若下一页会让当前组超过该字符数，则提前拆组。单页超限时截断后单独发送。
-10. **`thinking`（DeepSeek 思考模式）**：DeepSeek Flash / v4 等模型 **默认开启思考**，会拖慢 NER/OCR。本项目默认 **`thinking: false`（关闭）**，请求体会显式发送：
+10. **`jsonObject`（结构化输出）**：默认 **开**。文本 NER 和视觉 OCR 的请求带 `response_format: {"type":"json_object"}`（OpenAI / DeepSeek 兼容）。提示词里写了 `json`，满足 DeepSeek 的要求。提供商若用 HTTP 400 拒绝该字段，本次进程会关掉它并立刻不带该字段重试。`llm.jsonObject: false` 或 `MINIOCR_LLM_JSON_OBJECT=0` 从一开始就不发。模型若仍返回带尾逗号、注释或 markdown 围栏的 JSON，解析端用 AOT source-gen 上下文打开 `AllowTrailingCommas` 和 `ReadCommentHandling.Skip`，并在解析失败时**同一组再请求一次**，然后才记失败。
+11. **`thinking`（DeepSeek 思考模式）**：DeepSeek Flash / v4 等模型 **默认开启思考**，会拖慢 NER/OCR。本项目默认 **`thinking: false`（关闭）**，请求体会显式发送：
    ```json
    "thinking": { "type": "disabled" }
    ```
    需要开启时设 `"thinking": true` 或 `"enabled"`（亦可 `MINIOCR_LLM_THINKING=1|true|enabled`），将发送 `{ "type": "enabled" }`。配置接受布尔或字符串：`false` / `"disabled"` → disabled；`true` / `"enabled"` → enabled。文本 NER 与视觉 OCR 均会带上该字段。
-11. `local` 模式下 LLM **未启用 / 无 key** 时：仅当 `fallbackToHeuristics: true` 才用启发式 NER（默认 **false** → `entities` 为空）。**一旦调用了 LLM NER**（成功为空或失败），**绝不**再静默回退启发式——记错误日志并返回空实体。`ocr.mode=llm` 视觉路径同样只用结构化视觉输出，不用启发式 invent 实体。
+12. `local` 模式下 LLM **未启用 / 无 key** 时：仅当 `fallbackToHeuristics: true` 才用启发式 NER（默认 **false** → `entities` 为空）。**一旦调用了 LLM NER**（成功为空或失败），**绝不**再静默回退启发式——记错误日志并返回空实体。`ocr.mode=llm` 视觉路径同样只用结构化视觉输出，不用启发式 invent 实体。
 
 ### 吞吐旋钮（文件 + 环境变量 / 请求）
 
@@ -368,6 +369,7 @@ cd artifacts/linux-x64-singlefile
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | **32**（1–256） | `ocr.mode=llm` 时页级视觉并发 |
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | **70**（40–95） | `ocr.mode=llm` 时页图 JPEG 质量（更低=更快编码/更小上传） |
 | `MINIOCR_LLM_THINKING` | `llm.thinking` | **false**（disabled） | DeepSeek 思考模式；`0/1/false/true/disabled/enabled`；默认关闭并显式发送 `thinking.type=disabled` |
+| `MINIOCR_LLM_JSON_OBJECT` | `llm.jsonObject` | **true** | 发送 `response_format.type=json_object`；`0` 关闭。提供商拒绝时进程内自动关掉 |
 | `MINIOCR_ENGINES` | `ocr.engines` | **4**（`Clamp(cores/2, 1, min(16,cores))`） | 页级并行 `PaddleOcrAll` 实例数（仅 local） |
 | `MINIOCR_DPI` | `ocr.dpi` | **96**（local）/ **72**（llm，未显式设置时） | 栅格化 DPI（也可在 JSON/`?dpi=` 覆盖） |
 | `MINIOCR_LINE_WORKERS` | `ocr.lineWorkers` | 自动 | 页内 CLS/REC 并行 |
@@ -701,14 +703,18 @@ The current CPU is missing one or more of the required instruction sets.
 
 拉模式，不是按页数切死：
 
-1. 协调节点创建任务，自己的引擎池是节点之一，立刻开始领页。
-2. 工人 `POST /cluster/dispatch` 轮询（或被 `POST /cluster/notify` 叫醒）后 `GET` PDF 一次，再 `POST /claim` 领下一批。
-3. 批次大小约等于该节点 `capacity`（默认本机引擎数；`llm` 模式用视觉并发），封顶 16，临近结尾缩到 1–2 页，避免尾巴粘在一台慢机器上。
-4. 一台机器同时在途的页数不超过它的 capacity，所以更快的机器更早来领下一批，自然多干。
-5. 短文档上协调节点会在 `joinGraceMs`（默认 500）内先把自己限制在一个窗口，给工人留出下载时间；大文档上这点时间可以忽略。过了宽限，本地节点继续把剩下的页吃完。
-6. 租约到期、`/fail`、或健康检查连续失败：这些页回到队列，别的节点（含本地）重做。投机执行：待处理队列空了且未完成页数 ≤ `speculativeTailPages`（默认 4）时，空闲节点会再跑一遍尾巴，谁先写回谁算数。
-7. 到达 `jobDeadlineSeconds`（默认 300）仍有远程租约：协调节点丢弃远程租约，剩下的页只在本地做完。死掉的工人不会让任务挂死或直接失败。
-8. 页按完成顺序写入，但 LLM NER 仍用原来的有序缓冲：凑满**连续的** 10 个非空页就发出一组，空白页不占名额、也不进协议输出。最终每页文本与单机相同（同一模型、同一 DPI）。
+1. 协调节点创建任务，自己的引擎池是节点之一，立刻开始领页。任务若来自 http(s) 链接，调度响应和 `notify` 里带上原始 `sourceUrl`。
+2. 工人 `POST /cluster/dispatch` 轮询（或被 `POST /cluster/notify` 叫醒）后**先 `POST /join`（`downloading: true`）**，再下 PDF，下完再 `POST /join` 表示可以领页。协调节点从这一刻起就知道该工人在场，日志是 `joined, downloading PDF`，并在下载结束前（最多 30 秒）继续按住本地窗口，避免大文件下载期间协调节点独自做完前半本。
+3. PDF 优先用原始链接的 `ParallelPdfDownloader`（HEAD + 最多 8 路 Range，按 `Content-Length` 一次分配）。原始链接失败或不支持 Range 时，再向协调节点拉；协调节点的 `GET/HEAD /cluster/jobs/{id}/pdf` 同样返回 `Accept-Ranges: bytes` 和准确的 `Content-Length`。同一任务的字节缓存在工人进程里，再次加入不会重下。
+4. 未设置 `pagesPerBatch` 时，批次按该节点实测 pages/s 调整，大约覆盖 8 秒的活，并且**新节点的第一批最多 2 页**。显式 `pagesPerBatch` 仍然固定。在途页数不超过 capacity。更快的机器更早回来领下一批，自然多干。
+5. 短文档上协调节点会在 `joinGraceMs`（默认 500）内先把自己限制在一个窗口。有工人仍在下载时，这个窗口会保持到下载结束或 30 秒，而不是宽限一到就把剩下的页吃完。
+6. 租约到期、`/fail`、或健康检查连续失败：这些页回到队列，别的节点（含本地）重做。两处投机执行，谁先写回谁算数，后写的提交被丢掉，页文本不会重复：
+   - 待处理队列空了且未完成页数 ≤ `speculativeTailPages`（默认 4）时，空闲节点再跑一遍尾巴。
+   - 某一页已经租出去、又是下一组 NER 还缺的最早一页，并且租约已经明显超过该节点实测的单页时间（至少 2.5 秒、约 2 倍单页）：空闲节点只复制这一页，让组能先成形。同一页同时最多两份在途。
+7. 工人同时最多 2 个任务。`dispatch` 和 `notify` 都执行这个上限。工人离开任务后的 45 秒内会把该任务放进 `ActiveJobs`，协调节点不会立刻再派给它。OCR 已经完成、而这个节点不能做 NER（或 NER 已经没有待领组）时，也不会再派，避免为了空转再下一遍 PDF。
+8. 领页、加入、NER 领取遇到超时或连接错误会退避重试，不结束整个会话。只有任务令牌真正取消才当作取消；HttpClient 超时走 `/fail` 或 `/ner/fail`，其他节点可以马上重做。任务结束时协调节点取消还没写完的 `/pdf` 流，不再干等最多 60 秒。
+9. 到达 `jobDeadlineSeconds`（默认 300）仍有远程租约：协调节点丢弃远程租约，剩下的页只在本地做完。死掉的工人不会让任务挂死或直接失败。
+10. 页按完成顺序写入，但 LLM NER 仍用原来的有序缓冲：凑满**连续的** 10 个非空页就发出一组，空白页不占名额、也不进协议输出。最终每页文本与单机相同（同一模型、同一 DPI）。
 
 `GET /health` 在集群开启时多一个 `cluster` 对象：节点、容量、健康、在途页、累计完成页。任务进行中大约每 3 秒或每 10% 有一行进度（`done/total`、pages/s、各节点页数），结束时另有一行 `byNode=coord=.., worker-a=..`，以及 `OCR_TEXT_SHA256=`（全页文本哈希，含空白页，便于和单机对照）。这些都不进竞赛 JSON。调度日志见下面「日志」。
 
@@ -727,6 +733,19 @@ The current CPU is missing one or more of the required instruction sets.
 另一次把 `joinGraceMs` 改成默认 500：20 页 4647 ms，提交页 coord 9 / worker-a 5 / worker-b 6，哈希仍是上面的 20 页值（那次单机 20 页是 5333 ms）。
 
 20 页、每批 1 页时，领页 HTTP 和每台打开 PDF 的固定开销还压得过 OCR，所以 3 个单核节点大约 1.15×（默认宽限）到 1.31×（协调节点让出），不是 3×。页数到几百、两千时，OCR 会盖过这些开销。`tests/MiniOcr.ClusterLive` 用 20 秒宽限，是为了让 5 页样例也能摊到工人上；默认 500 ms 适合大文档。
+
+### 加入时机和慢节点（`tests/MiniOcr.ClusterBench`）
+
+这不是 463 页扫描件的复跑。基准在本机起三个进程：一个 2 MB、2 MB/s 的限速 PDF，一个协调节点，两个工人。快工人每页 20 ms，慢工人每页 500 ms，一共 40 页。`legacy` 模拟旧路径：单流下完整本 PDF 才 `join`，固定一次领 16 页。`new` 走现在的路径：先 `join`，用 `ParallelPdfDownloader` 对源做 Range 下载，批次用真实的 `ClusterPageScheduler`（新节点先领 2 页，并复制卡住 NER 的那一页）。
+
+一次本机结果：
+
+| 模式 | 墙钟 | 快/慢加入 | PDF 就绪 | 页数 coord/fast/slow | 慢节点首批 | 第 20 组 |
+| --- | --- | --- | --- | --- | --- | --- |
+| legacy | 9141 ms | 1130 / 1130 ms | 1130 ms | 16 / 8 / 16 | 16 | 9138 ms |
+| new | 1616 ms | 39 / 39 ms | 575 ms | 18 / 20 / 2 | 2 | 1581 ms |
+
+墙钟少 7525 ms，快工人加入提前 1091 ms，第 20 组提前 7557 ms。慢节点从一次抱走 16 页变成首批 2 页，所以有序 NER 不再被它按住。数字会随机器浮动；CI 只检查新路径比旧路径更早加入、墙钟更短、慢节点首批不超过 2 页。
 
 ### 配置
 

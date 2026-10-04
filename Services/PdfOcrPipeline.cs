@@ -72,12 +72,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         double downloadMs,
         string downloadMode,
         CancellationToken ct,
-        int? dpiOverride = null)
+        int? dpiOverride = null,
+        string? sourceUrl = null)
     {
         Stopwatch totalSw = Stopwatch.StartNew();
         byte[] array = pdf.DangerousGetArray();
         int length = pdf.Length;
-        return ProcessCoreAsync(array, length, downloadMs, downloadMode, totalSw, dpiOverride, ct);
+        return ProcessCoreAsync(array, length, downloadMs, downloadMode, totalSw, dpiOverride, sourceUrl, ct);
     }
 
     private async Task<OcrResponse> ProcessCoreAsync(
@@ -87,6 +88,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         string downloadMode,
         Stopwatch totalSw,
         int? dpiOverride,
+        string? sourceUrl,
         CancellationToken ct)
     {
         int pageCount;
@@ -107,7 +109,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 "OCR pipeline (cluster): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, mode={Mode}",
                 pageCount, pdfByteCount, dpi, _config.Mode);
             return await ProcessDistributedAsync(
-                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct)
+                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, sourceUrl, totalSw, ct)
                 .ConfigureAwait(false);
         }
 
@@ -541,6 +543,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int dpi,
         double downloadMs,
         string downloadMode,
+        string? sourceUrl,
         Stopwatch totalSw,
         CancellationToken ct)
     {
@@ -583,6 +586,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 pdfByteCount,
                 pageCount,
                 dpi,
+                sourceUrl,
                 async (oneBased, batchId, job, token) =>
                 {
                     int[] zeroBased = new int[oneBased.Length];

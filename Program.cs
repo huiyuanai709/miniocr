@@ -647,7 +647,7 @@ app.MapPost("/ocr", async Task<IResult> (
             using (download.Buffer)
             {
                 OcrResponse ocr = await pipeline
-                    .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi)
+                    .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi, url)
                     .ConfigureAwait(false);
                 if (files.Count == 1)
                     single = ocr;

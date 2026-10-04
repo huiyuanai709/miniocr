@@ -16,7 +16,7 @@ public sealed class LlmVisionOcr
 {
     private const string SystemPrompt =
         "You are a document OCR and entity extraction engine for Chinese and English PDFs. " +
-        "Given one page image, return ONLY strict JSON (no markdown fences, no commentary) with shape:\n" +
+        "Given one page image, return ONLY a strict json object (no markdown fences, no commentary) with shape:\n" +
         "{\"text\":\"full page plain text\",\"ruleList\":[" +
         "{\"ruleCode\":\"B04\",\"ruleName\":\"人员名称\",\"ruleItemList\":[" +
         "{\"personName\":\"...\",\"count\":1,\"originText\":[\"10-100 char snippet containing the name\"]}]}," +
@@ -40,6 +40,7 @@ public sealed class LlmVisionOcr
     private readonly HttpClient _http;
     private readonly LlmRuntimeConfig _config;
     private readonly ILogger<LlmVisionOcr> _logger;
+    private int _jsonObjectEnabled = 1;
 
     public LlmVisionOcr(
         HttpClient http,
@@ -108,16 +109,40 @@ public sealed class LlmVisionOcr
         string imageDataUrl,
         CancellationToken ct)
     {
+        Exception? parseError = null;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                return await CompleteVisionOnceAsync(pageNumber, imageDataUrl, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (attempt == 0 && LlmJson.IsParseFailure(ex) && !ct.IsCancellationRequested)
+            {
+                parseError = ex;
+                _logger.LogWarning(ex, "LLM vision JSON parse failed for page {Page}; retrying once", pageNumber);
+            }
+        }
+
+        throw parseError ?? new InvalidOperationException("LLM vision JSON parse failed.");
+    }
+
+    private async Task<LlmVisionOcrPayload> CompleteVisionOnceAsync(
+        int pageNumber,
+        string imageDataUrl,
+        CancellationToken ct)
+    {
         string url = _config.BaseUrl.TrimEnd('/') + "/v1/chat/completions";
         string userText =
             $"OCR this PDF page (page {pageNumber}). " +
             $"Return full page text (aim ≤{_config.OcrMaxCharsHint} chars) and B04/B06 ruleList JSON as specified.";
 
+        bool jsonMode = _config.JsonObject && Volatile.Read(ref _jsonObjectEnabled) == 1;
         VisionChatCompletionRequest body = new()
         {
             Model = _config.Model,
             Temperature = 0,
             Thinking = _config.ToThinkingOption(),
+            ResponseFormat = jsonMode ? LlmJson.JsonObject : null,
             Messages =
             [
                 new VisionChatMessage
@@ -142,24 +167,14 @@ public sealed class LlmVisionOcr
         };
 
         _logger.LogInformation(
-            "LLM vision OCR request: page={Page}, model={Model}, thinking={Thinking}, url={Url}",
+            "LLM vision OCR request: page={Page}, model={Model}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}",
             pageNumber,
             _config.Model,
             body.Thinking?.Type ?? "(null)",
+            jsonMode,
             url);
 
-        using HttpResponseMessage response = await _http
-            .PostAsJsonAsync(url, body, AppJsonContext.Default.VisionChatCompletionRequest, ct)
-            .ConfigureAwait(false);
-
-        string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-        {
-            string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
-            throw new HttpRequestException(
-                $"LLM vision OCR failed HTTP {(int)response.StatusCode}: {snippet}");
-        }
-
+        string raw = await PostVisionAsync(url, body, jsonMode, ct).ConfigureAwait(false);
         ChatCompletionResponse? parsed =
             JsonSerializer.Deserialize(raw, AppJsonContext.Default.ChatCompletionResponse);
         string? content = parsed?.Choices?.FirstOrDefault()?.Message?.Content;
@@ -167,9 +182,50 @@ public sealed class LlmVisionOcr
             throw new InvalidOperationException("LLM vision OCR returned empty message content.");
 
         string json = NerPrompt.ExtractJsonObject(content);
-        LlmVisionOcrPayload? payload =
-            JsonSerializer.Deserialize(json, AppJsonContext.Default.LlmVisionOcrPayload);
+        LlmVisionOcrPayload? payload = LlmJson.Deserialize<LlmVisionOcrPayload>(json);
         return payload ?? new LlmVisionOcrPayload();
+    }
+
+    private async Task<string> PostVisionAsync(
+        string url,
+        VisionChatCompletionRequest body,
+        bool jsonMode,
+        CancellationToken ct)
+    {
+        using HttpResponseMessage response = await _http
+            .PostAsJsonAsync(url, body, AppJsonContext.Default.VisionChatCompletionRequest, ct)
+            .ConfigureAwait(false);
+        string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode
+            && jsonMode
+            && LlmJson.IsFormatRejected((int)response.StatusCode, raw))
+        {
+            Volatile.Write(ref _jsonObjectEnabled, 0);
+            _logger.LogWarning(
+                "LLM vision rejected response_format=json_object; disabling it and retrying without the field");
+            body.ResponseFormat = null;
+            using HttpResponseMessage retry = await _http
+                .PostAsJsonAsync(url, body, AppJsonContext.Default.VisionChatCompletionRequest, ct)
+                .ConfigureAwait(false);
+            raw = await retry.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!retry.IsSuccessStatusCode)
+            {
+                string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
+                throw new HttpRequestException(
+                    $"LLM vision OCR failed HTTP {(int)retry.StatusCode}: {snippet}");
+            }
+
+            return raw;
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
+            throw new HttpRequestException(
+                $"LLM vision OCR failed HTTP {(int)response.StatusCode}: {snippet}");
+        }
+
+        return raw;
     }
 
     /// <summary>

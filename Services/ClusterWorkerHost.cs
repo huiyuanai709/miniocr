@@ -19,8 +19,13 @@ public sealed class ClusterWorkerHost : IHostedService
     private readonly PdfOcrPipeline _pipeline;
     private readonly LlmEntityExtractor _llm;
     private readonly IHttpClientFactory _httpFactory;
+    private readonly ParallelPdfDownloader _downloader;
     private readonly ILogger<ClusterWorkerHost> _logger;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _sessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte[]> _pdfCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _recentlyLeft = new(StringComparer.Ordinal);
+    private readonly object _pdfCacheOrder = new();
+    private readonly List<string> _pdfCacheKeys = [];
     private readonly CancellationTokenSource _cts = new();
     private Task? _loop;
     private int _pagesDone;
@@ -32,6 +37,7 @@ public sealed class ClusterWorkerHost : IHostedService
         PdfOcrPipeline pipeline,
         LlmEntityExtractor llm,
         IHttpClientFactory httpFactory,
+        ParallelPdfDownloader downloader,
         ILogger<ClusterWorkerHost> logger)
     {
         _config = config;
@@ -39,8 +45,12 @@ public sealed class ClusterWorkerHost : IHostedService
         _pipeline = pipeline;
         _llm = llm;
         _httpFactory = httpFactory;
+        _downloader = downloader;
         _logger = logger;
     }
+
+    private const int MaxCachedPdfs = 2;
+    private static readonly TimeSpan RecentLeaveCooldown = TimeSpan.FromSeconds(45);
 
     private bool RunsDistributedNer => _config.DistributedNer && _llm.IsUsable;
 
@@ -144,13 +154,18 @@ public sealed class ClusterWorkerHost : IHostedService
             return false;
         }
 
-        if (_sessions.Count >= 2 && !_sessions.ContainsKey(req.JobId))
+        if (_sessions.Count >= ClusterDispatchRules.MaxWorkerSessions && !_sessions.ContainsKey(req.JobId))
         {
             error = "Worker is at session capacity.";
             return false;
         }
 
-        StartSession(req.JobId.Trim(), req.CoordinatorUrl.Trim().TrimEnd('/'), req.Dpi, req.PageCount);
+        StartSession(
+            req.JobId.Trim(),
+            req.CoordinatorUrl.Trim().TrimEnd('/'),
+            req.Dpi,
+            req.PageCount,
+            req.SourceUrl);
         return true;
     }
 
@@ -179,7 +194,14 @@ public sealed class ClusterWorkerHost : IHostedService
                 {
                     ClusterDispatchResponse? dispatch = await DispatchAsync(ct).ConfigureAwait(false);
                     if (dispatch is { Wait: false, JobId.Length: > 0, PdfPath.Length: > 0 })
-                        StartSession(dispatch.JobId, _config.CoordinatorUrl, dispatch.Dpi, dispatch.PageCount);
+                    {
+                        StartSession(
+                            dispatch.JobId,
+                            _config.CoordinatorUrl,
+                            dispatch.Dpi,
+                            dispatch.PageCount,
+                            dispatch.SourceUrl);
+                    }
                     else
                         ClusterJobLog.DispatchWait(_logger, _config.VerboseDispatch, _self.NodeId);
                 }
@@ -208,8 +230,17 @@ public sealed class ClusterWorkerHost : IHostedService
         }
     }
 
-    private void StartSession(string jobId, string coordinatorUrl, int dpi, int pageCount)
+    private void StartSession(string jobId, string coordinatorUrl, int dpi, int pageCount, string? sourceUrl)
     {
+        if (_sessions.Count >= ClusterDispatchRules.MaxWorkerSessions && !_sessions.ContainsKey(jobId))
+        {
+            _logger.LogDebug(
+                "Cluster worker {NodeId} ignored job {JobId}: at session capacity",
+                _self.NodeId,
+                jobId);
+            return;
+        }
+
         var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
         if (!_sessions.TryAdd(jobId, sessionCts))
         {
@@ -217,10 +248,19 @@ public sealed class ClusterWorkerHost : IHostedService
             return;
         }
 
-        _ = Task.Run(() => SessionAsync(jobId, coordinatorUrl, dpi, pageCount, sessionCts), CancellationToken.None);
+        _recentlyLeft.TryRemove(jobId, out _);
+        _ = Task.Run(
+            () => SessionAsync(jobId, coordinatorUrl, dpi, pageCount, sourceUrl, sessionCts),
+            CancellationToken.None);
     }
 
-    private async Task SessionAsync(string jobId, string coordinatorUrl, int dpi, int pageCount, CancellationTokenSource sessionCts)
+    private async Task SessionAsync(
+        string jobId,
+        string coordinatorUrl,
+        int dpi,
+        int pageCount,
+        string? sourceUrl,
+        CancellationTokenSource sessionCts)
     {
         CancellationToken ct = sessionCts.Token;
         int localDone = 0;
@@ -231,29 +271,62 @@ public sealed class ClusterWorkerHost : IHostedService
         try
         {
             _logger.LogInformation(
-                "Cluster worker {NodeId} joining job {JobId} via {Coordinator} dpi={Dpi} pages={Pages}",
+                "Cluster worker {NodeId} joining job {JobId} via {Coordinator} dpi={Dpi} pages={Pages} pdf={Source}",
                 _self.NodeId,
                 jobId,
                 coordinatorUrl,
                 dpi,
-                pageCount);
-            Stopwatch download = Stopwatch.StartNew();
-            byte[] pdf = await DownloadPdfAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
-            download.Stop();
-            _logger.LogInformation(
-                "Cluster worker {NodeId} job {JobId} PDF downloaded bytes={Bytes} ms={Ms:F0}",
-                _self.NodeId,
-                jobId,
-                pdf.Length,
-                download.Elapsed.TotalMilliseconds);
-            await JoinAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+                pageCount,
+                DescribePdfSource(sourceUrl));
+            bool cached = TryGetCachedPdf(jobId, out byte[]? pdf);
+            if (!await JoinWithRetryAsync(coordinatorUrl, jobId, downloading: !cached, ct).ConfigureAwait(false))
+                return;
             nerTask = RunsDistributedNer
                 ? RunNerConsumersAsync(coordinatorUrl, jobId, () => Interlocked.Increment(ref nerGroups), ct)
                 : null;
+            if (!cached)
+            {
+                Stopwatch download = Stopwatch.StartNew();
+                pdf = await DownloadPdfWithRetryAsync(coordinatorUrl, jobId, sourceUrl, ct).ConfigureAwait(false);
+                download.Stop();
+                RememberPdf(jobId, pdf);
+                _logger.LogInformation(
+                    "Cluster worker {NodeId} job {JobId} PDF downloaded bytes={Bytes} ms={Ms:F0} via={Source}",
+                    _self.NodeId,
+                    jobId,
+                    pdf.Length,
+                    download.Elapsed.TotalMilliseconds,
+                    DescribePdfSource(sourceUrl));
+                if (!await JoinWithRetryAsync(coordinatorUrl, jobId, downloading: false, ct).ConfigureAwait(false))
+                    return;
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Cluster worker {NodeId} job {JobId} PDF cache hit bytes={Bytes}",
+                    _self.NodeId,
+                    jobId,
+                    pdf!.Length);
+            }
 
+            byte[] pdfBytes = pdf ?? throw new InvalidOperationException("PDF was not downloaded.");
             while (!ct.IsCancellationRequested)
             {
-                ClusterClaimResponse? claim = await ClaimAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+                ClusterClaimResponse? claim;
+                try
+                {
+                    claim = await ClaimWithRetryAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Cluster worker {NodeId} claim on {JobId} failed; retrying", _self.NodeId, jobId);
+                    await Task.Delay(500, ct).ConfigureAwait(false);
+                    continue;
+                }
                 if (claim is null)
                     break;
                 if (claim.Done)
@@ -274,8 +347,8 @@ public sealed class ClusterWorkerHost : IHostedService
                 {
                     List<OcrPageResult> results = [];
                     await _pipeline.RecognizeIndicesAsync(
-                        pdf,
-                        pdf.Length,
+                        pdfBytes,
+                        pdfBytes.Length,
                         zeroBased,
                         dpi,
                         results.Add,
@@ -319,7 +392,7 @@ public sealed class ClusterWorkerHost : IHostedService
                         progressAt = now;
                     }
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
                     throw;
                 }
@@ -360,6 +433,7 @@ public sealed class ClusterWorkerHost : IHostedService
             if (nerTask is not null)
                 await Quiet(nerTask).ConfigureAwait(false);
             _sessions.TryRemove(jobId, out _);
+            _recentlyLeft[jobId] = DateTimeOffset.UtcNow.UtcTicks;
             sessionCts.Dispose();
             _logger.LogInformation(
                 "Cluster worker {NodeId} left job {JobId} localPages={Pages}",
@@ -482,7 +556,8 @@ public sealed class ClusterWorkerHost : IHostedService
         {
             NodeId = _self.NodeId,
             Capacity = _self.Capacity,
-            ActiveJobs = _sessions.Keys.ToList(),
+            ActiveSessions = _sessions.Count,
+            ActiveJobs = ActiveJobIds(),
         };
         using HttpRequestMessage req = new(HttpMethod.Post, _config.CoordinatorUrl + "/cluster/dispatch");
         AddAuth(req);
@@ -496,40 +571,186 @@ public sealed class ClusterWorkerHost : IHostedService
             .ConfigureAwait(false);
     }
 
-    private async Task<byte[]> DownloadPdfAsync(string coordinatorUrl, string jobId, CancellationToken ct)
+    private async Task<byte[]> DownloadPdfWithRetryAsync(
+        string coordinatorUrl,
+        string jobId,
+        string? sourceUrl,
+        CancellationToken ct)
     {
-        using HttpRequestMessage req = new(HttpMethod.Get, coordinatorUrl + "/cluster/jobs/" + jobId + "/pdf");
-        AddAuth(req);
-        using HttpResponseMessage resp = await Client().SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
-            .ConfigureAwait(false);
-        resp.EnsureSuccessStatusCode();
-        long? length = resp.Content.Headers.ContentLength;
-        if (length is > ClusterCoordinator.MaxPdfBytes)
-            throw new InvalidOperationException("PDF exceeds 300 MB.");
-        await using Stream stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        using var ms = new MemoryStream(length is > 0 and < int.MaxValue ? (int)length : 64 * 1024);
-        byte[] buffer = new byte[128 * 1024];
-        while (true)
+        Exception? last = null;
+        if (!string.IsNullOrWhiteSpace(sourceUrl))
         {
-            int n = await stream.ReadAsync(buffer, ct).ConfigureAwait(false);
-            if (n == 0)
-                break;
-            if (ms.Length + n > ClusterCoordinator.MaxPdfBytes)
-                throw new InvalidOperationException("PDF exceeds 300 MB.");
-            ms.Write(buffer, 0, n);
+            for (int attempt = 0; attempt < 3 && !ct.IsCancellationRequested; attempt++)
+            {
+                try
+                {
+                    return await DownloadExactAsync(sourceUrl, prepare: null, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (IsTransient(ex))
+                {
+                    last = ex;
+                    _logger.LogWarning(
+                        ex,
+                        "Cluster worker {NodeId} source PDF download failed (attempt {Attempt}); retrying",
+                        _self.NodeId,
+                        attempt + 1);
+                    await Task.Delay(Backoff(attempt), ct).ConfigureAwait(false);
+                }
+            }
+
+            _logger.LogWarning(
+                last,
+                "Cluster worker {NodeId} job {JobId} source PDF unavailable; falling back to the coordinator",
+                _self.NodeId,
+                jobId);
         }
 
-        return ms.ToArray();
+        string coordinatorPdf = coordinatorUrl + "/cluster/jobs/" + jobId + "/pdf";
+        for (int attempt = 0; attempt < 4 && !ct.IsCancellationRequested; attempt++)
+        {
+            try
+            {
+                return await DownloadExactAsync(coordinatorPdf, AddAuth, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                last = ex;
+                _logger.LogWarning(
+                    ex,
+                    "Cluster worker {NodeId} coordinator PDF download failed (attempt {Attempt}); retrying",
+                    _self.NodeId,
+                    attempt + 1);
+                await Task.Delay(Backoff(attempt), ct).ConfigureAwait(false);
+            }
+        }
+
+        throw last ?? new HttpRequestException("PDF download failed");
     }
 
-    private async Task JoinAsync(string coordinatorUrl, string jobId, CancellationToken ct)
+    private async Task<byte[]> DownloadExactAsync(
+        string url,
+        Action<HttpRequestMessage>? prepare,
+        CancellationToken ct)
     {
-        var body = new ClusterJoinRequest { NodeId = _self.NodeId, Capacity = _self.Capacity };
+        ParallelPdfDownloader.DownloadResult download =
+            await _downloader.DownloadAsync(url, ct, prepare).ConfigureAwait(false);
+        using RentedBuffer buffer = download.Buffer;
+        if (buffer.Length <= 0 || buffer.Length > ClusterCoordinator.MaxPdfBytes)
+            throw new InvalidOperationException("PDF exceeds 300 MB.");
+        byte[] exact = new byte[buffer.Length];
+        buffer.Span.CopyTo(exact);
+        _logger.LogDebug(
+            "PDF fetch mode={Mode} bytes={Bytes} ms={Ms:F0}",
+            download.Mode,
+            exact.Length,
+            download.ElapsedMs);
+        return exact;
+    }
+
+    private async Task<bool> JoinWithRetryAsync(
+        string coordinatorUrl,
+        string jobId,
+        bool downloading,
+        CancellationToken ct)
+    {
+        Exception? last = null;
+        for (int attempt = 0; !ct.IsCancellationRequested; attempt++)
+        {
+            try
+            {
+                await JoinAsync(coordinatorUrl, jobId, downloading, ct).ConfigureAwait(false);
+                return true;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode is System.Net.HttpStatusCode.NotFound
+                or System.Net.HttpStatusCode.Conflict)
+            {
+                _logger.LogInformation(
+                    "Cluster worker {NodeId} job {JobId} join closed ({Status})",
+                    _self.NodeId,
+                    jobId,
+                    (int?)ex.StatusCode);
+                return false;
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                last = ex;
+                int delay = Backoff(Math.Min(attempt, 6));
+                _logger.LogWarning(
+                    ex,
+                    "Cluster worker {NodeId} join {JobId} failed; retrying in {Delay}ms",
+                    _self.NodeId,
+                    jobId,
+                    delay);
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+        }
+
+        if (last is not null)
+            _logger.LogWarning(last, "Cluster worker {NodeId} stopped joining {JobId}", _self.NodeId, jobId);
+        return false;
+    }
+
+    private async Task JoinAsync(string coordinatorUrl, string jobId, bool downloading, CancellationToken ct)
+    {
+        var body = new ClusterJoinRequest
+        {
+            NodeId = _self.NodeId,
+            Capacity = _self.Capacity,
+            Downloading = downloading,
+        };
         using HttpRequestMessage req = new(HttpMethod.Post, coordinatorUrl + "/cluster/jobs/" + jobId + "/join");
         AddAuth(req);
         req.Content = JsonContent.Create(body, AppJsonContext.Default.ClusterJoinRequest);
         using HttpResponseMessage resp = await Client().SendAsync(req, ct).ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();
+    }
+
+    private async Task<ClusterClaimResponse?> ClaimWithRetryAsync(
+        string coordinatorUrl,
+        string jobId,
+        CancellationToken ct)
+    {
+        for (int attempt = 0; !ct.IsCancellationRequested; attempt++)
+        {
+            try
+            {
+                return await ClaimAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode is System.Net.HttpStatusCode.NotFound
+                or System.Net.HttpStatusCode.Conflict)
+            {
+                return null;
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                int delay = Backoff(Math.Min(attempt, 6));
+                _logger.LogWarning(
+                    ex,
+                    "Cluster worker {NodeId} claim {JobId} failed; retrying in {Delay}ms",
+                    _self.NodeId,
+                    jobId,
+                    delay);
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+        }
+
+        throw new OperationCanceledException(ct);
     }
 
     private async Task<ClusterClaimResponse?> ClaimAsync(string coordinatorUrl, string jobId, CancellationToken ct)
@@ -631,7 +852,29 @@ public sealed class ClusterWorkerHost : IHostedService
     {
         while (!ct.IsCancellationRequested)
         {
-            ClusterNerClaimResponse? claim = await ClaimNerAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+            ClusterNerClaimResponse? claim;
+            try
+            {
+                claim = await ClaimNerWithRetryAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Cluster worker {NodeId} NER claim on {JobId} failed; retrying", _self.NodeId, jobId);
+                try
+                {
+                    await Task.Delay(500, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                continue;
+            }
             if (claim is null || claim.Done)
                 return;
             if (claim.Wait)
@@ -690,7 +933,7 @@ public sealed class ClusterWorkerHost : IHostedService
                         result.Entities?.Count ?? 0);
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 throw;
             }
@@ -700,6 +943,42 @@ public sealed class ClusterWorkerHost : IHostedService
                 await PostNerFailAsync(coordinatorUrl, jobId, claim.GroupId, ex.Message, ct).ConfigureAwait(false);
             }
         }
+    }
+
+    private async Task<ClusterNerClaimResponse?> ClaimNerWithRetryAsync(
+        string coordinatorUrl,
+        string jobId,
+        CancellationToken ct)
+    {
+        for (int attempt = 0; !ct.IsCancellationRequested; attempt++)
+        {
+            try
+            {
+                return await ClaimNerAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode is System.Net.HttpStatusCode.NotFound
+                or System.Net.HttpStatusCode.Conflict)
+            {
+                return null;
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                int delay = Backoff(Math.Min(attempt, 6));
+                _logger.LogWarning(
+                    ex,
+                    "Cluster worker {NodeId} NER claim {JobId} failed; retrying in {Delay}ms",
+                    _self.NodeId,
+                    jobId,
+                    delay);
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+        }
+
+        throw new OperationCanceledException(ct);
     }
 
     private async Task<ClusterNerClaimResponse?> ClaimNerAsync(string coordinatorUrl, string jobId, CancellationToken ct)
@@ -787,6 +1066,69 @@ public sealed class ClusterWorkerHost : IHostedService
 
     private void AddAuth(HttpRequestMessage req) =>
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _config.Token);
+
+    private List<string> ActiveJobIds()
+    {
+        long cutoff = DateTimeOffset.UtcNow.Subtract(RecentLeaveCooldown).UtcTicks;
+        var ids = new List<string>(_sessions.Keys);
+        foreach ((string jobId, long left) in _recentlyLeft)
+        {
+            if (left < cutoff)
+            {
+                _recentlyLeft.TryRemove(jobId, out _);
+                continue;
+            }
+
+            if (!ids.Contains(jobId))
+                ids.Add(jobId);
+        }
+
+        return ids;
+    }
+
+    private bool TryGetCachedPdf(string jobId, out byte[]? pdf) =>
+        _pdfCache.TryGetValue(jobId, out pdf);
+
+    private void RememberPdf(string jobId, byte[] pdf)
+    {
+        _pdfCache[jobId] = pdf;
+        lock (_pdfCacheOrder)
+        {
+            _pdfCacheKeys.Remove(jobId);
+            _pdfCacheKeys.Add(jobId);
+            while (_pdfCacheKeys.Count > MaxCachedPdfs)
+            {
+                string oldest = _pdfCacheKeys[0];
+                _pdfCacheKeys.RemoveAt(0);
+                if (!string.Equals(oldest, jobId, StringComparison.Ordinal))
+                    _pdfCache.TryRemove(oldest, out _);
+            }
+        }
+    }
+
+    private static string DescribePdfSource(string? sourceUrl)
+    {
+        if (string.IsNullOrWhiteSpace(sourceUrl))
+            return "coordinator";
+        return Uri.TryCreate(sourceUrl, UriKind.Absolute, out Uri? uri)
+            ? "source:" + uri.Host
+            : "source";
+    }
+
+    private static int Backoff(int attempt)
+    {
+        int shift = Math.Clamp(attempt, 0, 4);
+        return Math.Min(2_000, 200 << shift);
+    }
+
+    private static bool IsTransient(Exception ex)
+    {
+        if (ex is HttpRequestException or IOException or TaskCanceledException or TimeoutException)
+            return true;
+        if (ex is OperationCanceledException)
+            return true;
+        return ex.InnerException is not null && IsTransient(ex.InnerException);
+    }
 
     private static bool SameUrl(string a, string b) =>
         string.Equals(a.TrimEnd('/'), b.TrimEnd('/'), StringComparison.OrdinalIgnoreCase);

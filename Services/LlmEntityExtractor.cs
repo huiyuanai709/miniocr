@@ -17,6 +17,7 @@ public sealed class LlmEntityExtractor
     private readonly HttpClient _http;
     private readonly LlmRuntimeConfig _config;
     private readonly ILogger<LlmEntityExtractor> _logger;
+    private int _jsonObjectEnabled = 1;
 
     public LlmEntityExtractor(
         HttpClient http,
@@ -264,13 +265,39 @@ public sealed class LlmEntityExtractor
         LlmPageGrouper.PageBatch batch,
         CancellationToken ct)
     {
+        Exception? parseError = null;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                return await CompleteBatchOnceAsync(batch, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (attempt == 0 && LlmJson.IsParseFailure(ex) && !ct.IsCancellationRequested)
+            {
+                parseError = ex;
+                _logger.LogWarning(
+                    ex,
+                    "LLM NER JSON parse failed for pages {Pages}; retrying the group once",
+                    string.Join(',', batch.PageNumbers));
+            }
+        }
+
+        throw parseError ?? new InvalidOperationException("LLM NER JSON parse failed.");
+    }
+
+    private async Task<LlmEntityPayload> CompleteBatchOnceAsync(
+        LlmPageGrouper.PageBatch batch,
+        CancellationToken ct)
+    {
         string userText = batch.Text;
         string url = _config.BaseUrl.TrimEnd('/') + "/v1/chat/completions";
+        bool jsonMode = _config.JsonObject && Volatile.Read(ref _jsonObjectEnabled) == 1;
         ChatCompletionRequest body = new()
         {
             Model = _config.Model,
             Temperature = 0,
             Thinking = _config.ToThinkingOption(),
+            ResponseFormat = jsonMode ? LlmJson.JsonObject : null,
             Messages =
             [
                 new ChatMessage { Role = "system", Content = SystemPrompt },
@@ -279,25 +306,15 @@ public sealed class LlmEntityExtractor
         };
 
         _logger.LogInformation(
-            "LLM NER request: model={Model}, chars={Chars}, pages={Pages}, thinking={Thinking}, url={Url}",
+            "LLM NER request: model={Model}, chars={Chars}, pages={Pages}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}",
             _config.Model,
             userText.Length,
             string.Join(',', batch.PageNumbers),
             body.Thinking?.Type ?? "(null)",
+            jsonMode,
             url);
 
-        using HttpResponseMessage response = await _http
-            .PostAsJsonAsync(url, body, AppJsonContext.Default.ChatCompletionRequest, ct)
-            .ConfigureAwait(false);
-
-        string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-        {
-            string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
-            throw new HttpRequestException(
-                $"LLM chat completions failed HTTP {(int)response.StatusCode}: {snippet}");
-        }
-
+        string raw = await PostChatAsync(url, body, jsonMode, ct).ConfigureAwait(false);
         ChatCompletionResponse? parsed =
             JsonSerializer.Deserialize(raw, AppJsonContext.Default.ChatCompletionResponse);
         string? content = parsed?.Choices?.FirstOrDefault()?.Message?.Content;
@@ -305,9 +322,50 @@ public sealed class LlmEntityExtractor
             throw new InvalidOperationException("LLM returned empty message content.");
 
         string json = NerPrompt.ExtractJsonObject(content);
-        LlmEntityPayload? payload =
-            JsonSerializer.Deserialize(json, AppJsonContext.Default.LlmEntityPayload);
+        LlmEntityPayload? payload = LlmJson.Deserialize<LlmEntityPayload>(json);
         return payload ?? new LlmEntityPayload();
+    }
+
+    private async Task<string> PostChatAsync(
+        string url,
+        ChatCompletionRequest body,
+        bool jsonMode,
+        CancellationToken ct)
+    {
+        using HttpResponseMessage response = await _http
+            .PostAsJsonAsync(url, body, AppJsonContext.Default.ChatCompletionRequest, ct)
+            .ConfigureAwait(false);
+        string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode
+            && jsonMode
+            && LlmJson.IsFormatRejected((int)response.StatusCode, raw))
+        {
+            Volatile.Write(ref _jsonObjectEnabled, 0);
+            _logger.LogWarning(
+                "LLM rejected response_format=json_object; disabling it and retrying without the field");
+            body.ResponseFormat = null;
+            using HttpResponseMessage retry = await _http
+                .PostAsJsonAsync(url, body, AppJsonContext.Default.ChatCompletionRequest, ct)
+                .ConfigureAwait(false);
+            raw = await retry.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!retry.IsSuccessStatusCode)
+            {
+                string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
+                throw new HttpRequestException(
+                    $"LLM chat completions failed HTTP {(int)retry.StatusCode}: {snippet}");
+            }
+
+            return raw;
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
+            throw new HttpRequestException(
+                $"LLM chat completions failed HTTP {(int)response.StatusCode}: {snippet}");
+        }
+
+        return raw;
     }
 
     internal static OcrEntities MergeToEntities(

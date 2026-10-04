@@ -166,14 +166,24 @@ public sealed class ClusterNotifyRequest
     public string CoordinatorUrl { get; set; } = "";
     public int Dpi { get; set; }
     public int PageCount { get; set; }
+    /// <summary>Original PDF URL. Workers prefer this over the coordinator copy when it is set.</summary>
+    public string? SourceUrl { get; set; }
 }
 
 public sealed class ClusterDispatchRequest
 {
     public string NodeId { get; set; } = "";
     public int Capacity { get; set; }
-    /// <summary>Jobs this worker is already downloading or OCR-ing. The coordinator will offer a different open job.</summary>
+    /// <summary>
+    /// Jobs this worker is already in, plus ones it recently left. The coordinator will not offer those ids.
+    /// Recently-left ids stop a just-finished session from being handed straight back.
+    /// </summary>
     public List<string>? ActiveJobs { get; set; }
+    /// <summary>
+    /// Live session count, not including recently-left jobs. Null means the caller is an older worker
+    /// and <see cref="ActiveJobs"/> is the session list.
+    /// </summary>
+    public int? ActiveSessions { get; set; }
 }
 
 public sealed class ClusterDispatchResponse
@@ -185,12 +195,16 @@ public sealed class ClusterDispatchResponse
     public int PageCount { get; set; }
     /// <summary>Absolute path on the coordinator, e.g. <c>/cluster/jobs/{id}/pdf</c>.</summary>
     public string? PdfPath { get; set; }
+    /// <summary>Original PDF URL when the coordinator still has it. Empty when the job was a local file.</summary>
+    public string? SourceUrl { get; set; }
 }
 
 public sealed class ClusterJoinRequest
 {
     public string NodeId { get; set; } = "";
     public int Capacity { get; set; }
+    /// <summary>True while this node is still fetching the PDF. A later join with false means it can claim pages.</summary>
+    public bool Downloading { get; set; }
 }
 
 public sealed class ClusterClaimRequest

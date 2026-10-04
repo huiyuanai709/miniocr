@@ -921,6 +921,90 @@ async Task PumpNer(
     }
 }
 
+Console.WriteLine("=== adaptive batch and NER blocker ===");
+{
+    DateTimeOffset t0 = new(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+    ClusterPageScheduler sched = NewScheduler(40, expectedNodes: 3, leaseFloorMs: 60_000, pageTimeoutMs: 60_000);
+    sched.SetCapacity("slow", 16);
+    sched.SetCapacity("idle", 8);
+    sched.SetNerBlocker(1);
+    ClusterClaim first = sched.Claim("slow", 16, t0);
+    AssertTrue(first.Kind == ClusterClaimKind.Batch && first.Pages.Length == 2, "new node starts with a small batch");
+    AssertTrue(first.Pages[0] == 1, "blocker page is leased first");
+    foreach (int page in first.Pages)
+        AssertTrue(sched.TryCommit(first.BatchId, page, t0.AddSeconds(20)), "commit slow first batch");
+    ClusterClaim second = sched.Claim("slow", 16, t0.AddSeconds(20));
+    AssertTrue(second.Kind == ClusterClaimKind.Batch && second.Pages.Length <= 2, $"measured slow node stays small ({second.Pages.Length})");
+    sched.SetNerBlocker(second.Pages.Min());
+    ClusterClaim tooSoon = sched.Claim("idle", 8, t0.AddSeconds(21));
+    AssertTrue(tooSoon.Kind == ClusterClaimKind.Batch && !tooSoon.Speculative, "fresh lease is not copied yet");
+    int blocker = second.Pages.Min();
+    ClusterClaim copy = sched.Claim("idle", 8, t0.AddSeconds(20).AddMilliseconds(20_000));
+    AssertTrue(copy.Kind == ClusterClaimKind.Batch && copy.Speculative, "stale NER blocker is copied");
+    AssertTrue(copy.Pages.Length == 1 && copy.Pages[0] == blocker, "copy is only the blocking page");
+    AssertTrue(sched.TryCommit(copy.BatchId, blocker, t0.AddSeconds(41)), "first commit of the copy wins");
+    AssertTrue(!sched.TryCommit(second.BatchId, blocker, t0.AddSeconds(50)), "original lease cannot overwrite the copy");
+}
+
+Console.WriteLine("=== fast node grows after a quick batch ===");
+{
+    DateTimeOffset t0 = new(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+    ClusterPageScheduler sched = NewScheduler(30, expectedNodes: 2);
+    sched.SetCapacity("fast", 8);
+    ClusterClaim first = sched.Claim("fast", 8, t0);
+    AssertTrue(first.Pages.Length == 2, "fast node also starts small");
+    foreach (int page in first.Pages)
+        sched.TryCommit(first.BatchId, page, t0.AddMilliseconds(200));
+    ClusterClaim second = sched.Claim("fast", 8, t0.AddMilliseconds(200));
+    AssertTrue(second.Pages.Length == 8, $"fast node opens up to capacity ({second.Pages.Length})");
+}
+
+Console.WriteLine("=== dispatch rules ===");
+{
+    AssertTrue(ClusterDispatchRules.AtSessionCap(2) && !ClusterDispatchRules.AtSessionCap(1), "two live sessions is the cap");
+    AssertTrue(ClusterDispatchRules.SessionCount(0, 3) == 0, "reported session count wins over the skip list");
+    AssertTrue(ClusterDispatchRules.SessionCount(null, 2) == 2, "older workers fall back to listed jobs");
+    AssertTrue(ClusterDispatchRules.ShouldOfferJob(false, false, false), "ocr still open is always offered");
+    AssertTrue(!ClusterDispatchRules.ShouldOfferJob(true, true, false), "ocr done and no NER capacity is not offered");
+    AssertTrue(!ClusterDispatchRules.ShouldOfferJob(true, false, true), "ocr done and NER idle is not offered");
+    AssertTrue(ClusterDispatchRules.ShouldOfferJob(true, true, true), "ocr done with NER left goes to an LLM node");
+}
+
+Console.WriteLine("=== pdf range and read cancel ===");
+{
+    AssertTrue(ClusterPdfRange.TrySlice(1000, 0, 99, out long s, out long e) && s == 0 && e == 99, "closed range");
+    AssertTrue(ClusterPdfRange.TrySlice(1000, 900, null, out s, out e) && s == 900 && e == 999, "open end is clamped");
+    AssertTrue(ClusterPdfRange.TrySlice(1000, null, 10, out s, out e) && s == 990 && e == 999, "suffix range");
+    AssertTrue(!ClusterPdfRange.TrySlice(1000, 1000, 1001, out _, out _), "start past end is rejected");
+
+    ClusterPageScheduler sched = NewScheduler(2);
+    var job = new ClusterJob("job-cancel-1", sched, new byte[8], 8, 2, 96, "http://files.example/a.pdf");
+    ClusterJob.PdfReadLease? lease = job.TryEnterPdfRead();
+    AssertTrue(lease is not null, "read lease acquired");
+    Task reader = Task.Run(async () =>
+    {
+        try
+        {
+            await Task.Delay(Timeout.Infinite, lease!.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            lease!.Dispose();
+        }
+    });
+    var waitSw = Stopwatch.StartNew();
+    job.StopNewPdfReads();
+    await job.WaitForPdfReadersAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+    waitSw.Stop();
+    await reader.ConfigureAwait(false);
+    AssertTrue(waitSw.Elapsed < TimeSpan.FromSeconds(2), $"cancelling the PDF stream released the reader ({waitSw.ElapsedMilliseconds} ms)");
+    AssertTrue(job.TryEnterPdfRead() is null, "finished job rejects new readers");
+    AssertTrue(job.SourceUrl == "http://files.example/a.pdf", "source url is kept on the job");
+}
+
 if (failed > 0)
 {
     Console.WriteLine($"FAILED {failed}");

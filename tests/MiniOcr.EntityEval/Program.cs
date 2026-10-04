@@ -153,6 +153,17 @@ static void RunUnitChecks(Action<bool, string> assert)
     assert(cross.Companies.Count == 1 && cross.Companies[0].Pages.Contains(8), "cross-page company kept on the starting page");
     assert(cross.Persons.Count == 1 && cross.Persons[0].Pages.Contains(9), "person stays on the second page");
 
+    string fenced = NerPrompt.ExtractJsonObject("```json\n{\"companies\":[\"甲\"],\"persons\":[]}\n```");
+    (List<string> fenceCompanies, _) = ParsePayload(fenced);
+    assert(fenceCompanies.Count == 1 && fenceCompanies[0] == "甲", "markdown fence still extracts the object");
+    (List<string> trailingCompanies, List<string> trailingPersons) =
+        ParsePayload("""{"companies":["甲公司",],"persons":["张伟",]}""");
+    assert(trailingCompanies.Count == 1 && trailingCompanies[0] == "甲公司", "trailing comma in companies");
+    assert(trailingPersons.Count == 1 && trailingPersons[0] == "张伟", "trailing comma in persons");
+    (_, List<string> commented) = ParsePayload("""{ /*keep*/ "companies": [ ], "persons": ["李娜"] }""");
+    assert(commented.Count == 1 && commented[0] == "李娜", "json comments are skipped");
+    assert(NerPrompt.Text.Contains("json", StringComparison.OrdinalIgnoreCase), "NER prompt mentions json");
+
     OcrEntities expanded = EntityPostProcessor.Merge(
         [new OcrPageResult { Page = 1, Text = "乙 方：上 海 浦 东 发 展 银 行 股 份 有 限 公 司" }],
         ["上海浦东发展银行"],
@@ -459,7 +470,11 @@ static async Task<List<RawResponse>> CallLiveAsync(
 static (List<string> Companies, List<string> Persons) ParsePayload(string content)
 {
     string json = NerPrompt.ExtractJsonObject(content);
-    using JsonDocument doc = JsonDocument.Parse(json);
+    using JsonDocument doc = JsonDocument.Parse(json, new JsonDocumentOptions
+    {
+        AllowTrailingCommas = true,
+        CommentHandling = JsonCommentHandling.Skip,
+    });
     return (ReadArray(doc.RootElement, "companies"), ReadArray(doc.RootElement, "persons"));
 }
 

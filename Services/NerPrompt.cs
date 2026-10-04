@@ -10,7 +10,7 @@ public static class NerPrompt
         """
         你是竞赛文档的实体抽取器。输入是中文合同、裁判文书或商业文件的 OCR 文本（Paddle ChineseV6Tiny 或微信 OCR，约 96 DPI）。文本噪声很大：汉字之间会插入空格或换行，全角和半角混用，一个公司名可能被拆到两行甚至两页。用户消息里每一页以「--- page N ---」开头，N 是 PDF 原页码。每一页都要读。
 
-        只输出严格 JSON，不要 markdown，不要解释，不要多余字段：
+        只输出严格 JSON（json object），不要 markdown，不要解释，不要多余字段：
         {"companies":["..."],"persons":["..."]}
         没有实体时返回 {"companies":[],"persons":[]}。每个名字只输出一次。
 
