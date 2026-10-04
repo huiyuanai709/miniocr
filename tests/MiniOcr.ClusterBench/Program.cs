@@ -10,6 +10,8 @@ using MiniOcr.Services;
 // workers. One worker sleeps longer per page. "legacy" joins only after a single-stream
 // download and leases fixed 16-page batches. "new" joins first, fetches the source with
 // ranged ParallelPdfDownloader, and uses the real adaptive scheduler plus NER-blocker copy.
+if (args.Contains("--replay"))
+    return ClusterReplay.Run();
 if (Arg(args, "--role") == "worker")
     return await WorkerAsync(args);
 if (Arg(args, "--role") == "coordinator")

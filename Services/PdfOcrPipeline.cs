@@ -628,7 +628,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 distributeNer,
                 textLayerPages: null,
                 ct: ct,
-                alongside: classify).ConfigureAwait(false);
+                alongside: classify,
+                recognizeFeed: (pages, job, token) => RecognizeFeedAsync(
+                    pdfBytes,
+                    pdfByteCount,
+                    pages,
+                    dpi,
+                    (page, batchId, _) =>
+                    {
+                        job.TryAccept(batchId, page);
+                        return ValueTask.CompletedTask;
+                    },
+                    token)).ConfigureAwait(false);
             jobId = outcome.JobId;
             distributedEntities = outcome.UsedDistributedNer ? outcome.Entities ?? new OcrEntities() : null;
         }
@@ -785,6 +796,232 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
         if (failure is not null)
             throw failure;
+    }
+
+    /// <summary>
+    /// Raster and OCR pages as they are claimed. <paramref name="pages"/> yields
+    /// 1-based page numbers. The reader stays open across claims so the next batch
+    /// renders while engines are still on the previous one. One render at a time.
+    /// </summary>
+    public async Task RecognizeFeedAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        ChannelReader<(string BatchId, int Page)> pages,
+        int dpi,
+        Func<OcrPageResult, string, CancellationToken, ValueTask> onPage,
+        CancellationToken ct)
+    {
+        dpi = Math.Clamp(dpi, 36, 300);
+        if (_config.IsLlmMode)
+        {
+            await RecognizeFeedVisionAsync(pdfBytes, pdfLength, pages, dpi, onPage, ct).ConfigureAwait(false);
+            return;
+        }
+
+        int workers;
+        Func<SKBitmap, CancellationToken, Task<string>> recognize;
+        if (_config.IsWeChatMode)
+        {
+            if (_wechat is null || !_wechat.IsReady)
+                throw new InvalidOperationException("ocr.mode=wechat requires a connected WeChat OCR engine.");
+            workers = Math.Max(1, _wechat.InstanceCount);
+            recognize = (bitmap, token) => _wechat.RecognizeBitmapAsync(bitmap, token);
+        }
+        else
+        {
+            if (_engine is null)
+                throw new InvalidOperationException("ocr.mode=local requires OcrEngine.");
+            workers = Math.Max(1, _engine.EngineCount);
+            recognize = RecognizeLocalAsync;
+        }
+
+        RenderOptions renderOptions = CreateRenderOptions(dpi);
+        Channel<(int Index, string BatchId, SKBitmap Bitmap, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, string, SKBitmap, double)>(new BoundedChannelOptions(Math.Max(4, workers * 2))
+            {
+                SingleWriter = true,
+                SingleReader = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+
+        Task producer = ProduceFeedAsync(pdfBytes, pdfLength, pages, renderOptions, rasterized.Writer, ct);
+
+        async Task ConsumerAsync()
+        {
+            await foreach (var (index, batchId, bitmap, rasterMs) in rasterized.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                using (bitmap)
+                {
+                    try
+                    {
+                        Stopwatch ocrSw = Stopwatch.StartNew();
+                        int width = bitmap.Width;
+                        int height = bitmap.Height;
+                        string pageText = await recognize(bitmap, ct).ConfigureAwait(false);
+                        ocrSw.Stop();
+                        pageText = pageText.Replace("\r", "").Trim();
+                        await onPage(
+                            new OcrPageResult
+                            {
+                                Page = index + 1,
+                                Width = width,
+                                Height = height,
+                                Text = pageText,
+                                Source = PdfTextLayer.SourceOcr,
+                                RasterizeMs = Math.Round(rasterMs, 1),
+                                OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
+                            },
+                            batchId,
+                            ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "OCR feed failed on page {Page} batch {Batch}", index + 1, batchId);
+                    }
+                }
+            }
+        }
+
+        Task[] tasks = new Task[workers];
+        for (int i = 0; i < workers; i++)
+            tasks[i] = ConsumerAsync();
+
+        Exception? failure = null;
+        try
+        {
+            await producer.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+        }
+
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure ??= ex;
+        }
+
+        if (failure is not null)
+            throw failure;
+    }
+
+    private async Task ProduceFeedAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        ChannelReader<(string BatchId, int Page)> pages,
+        RenderOptions renderOptions,
+        ChannelWriter<(int Index, string BatchId, SKBitmap Bitmap, double RasterMs)> writer,
+        CancellationToken ct)
+    {
+        try
+        {
+            var batchOf = new Dictionary<int, string>();
+            List<int> indices = new(8);
+            await foreach (var (batchId, page) in pages.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                indices.Clear();
+                batchOf.Clear();
+                void Take(string id, int oneBased)
+                {
+                    int index = oneBased - 1;
+                    if (index < 0 || batchOf.ContainsKey(index))
+                        return;
+                    batchOf[index] = id;
+                    indices.Add(index);
+                }
+
+                Take(batchId, page);
+                while (indices.Count < 8 && pages.TryRead(out var more))
+                    Take(more.BatchId, more.Page);
+                if (indices.Count == 0)
+                    continue;
+
+                Channel<(int, SKBitmap, double)> chunk =
+                    Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(Math.Max(4, indices.Count))
+                    {
+                        SingleWriter = false,
+                        SingleReader = true,
+                        FullMode = BoundedChannelFullMode.Wait,
+                    });
+                Task rendering = DispatchRenderAsync(
+                    pdfBytes, pdfLength, indices.ToArray(), renderOptions, chunk.Writer, ct, completeWriter: true);
+                await foreach (var (index, bitmap, rasterMs) in chunk.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+                {
+                    string id = batchOf.TryGetValue(index, out string? found) ? found : "";
+                    try
+                    {
+                        await writer.WriteAsync((index, id, bitmap, rasterMs), ct).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        bitmap.Dispose();
+                        throw;
+                    }
+                }
+
+                await rendering.ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            writer.TryComplete();
+        }
+    }
+
+    private async Task RecognizeFeedVisionAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        ChannelReader<(string BatchId, int Page)> pages,
+        int dpi,
+        Func<OcrPageResult, string, CancellationToken, ValueTask> onPage,
+        CancellationToken ct)
+    {
+        List<(string BatchId, int Index)> chunk = new(8);
+        await foreach (var (batchId, page) in pages.ReadAllAsync(ct).ConfigureAwait(false))
+        {
+            chunk.Clear();
+            void Take(string id, int oneBased)
+            {
+                int index = oneBased - 1;
+                if (index < 0)
+                    return;
+                chunk.Add((id, index));
+            }
+
+            Take(batchId, page);
+            while (chunk.Count < 8 && pages.TryRead(out var more))
+                Take(more.BatchId, more.Page);
+            if (chunk.Count == 0)
+                continue;
+
+            var batchOf = new Dictionary<int, string>(chunk.Count);
+            int[] indices = new int[chunk.Count];
+            for (int i = 0; i < chunk.Count; i++)
+            {
+                indices[i] = chunk[i].Index;
+                batchOf[chunk[i].Index] = chunk[i].BatchId;
+            }
+
+            await RecognizeIndicesVisionAsync(
+                pdfBytes,
+                pdfLength,
+                indices,
+                dpi,
+                page =>
+                {
+                    string id = batchOf.TryGetValue(page.Page - 1, out string? found) ? found : "";
+                    onPage(page, id, ct).AsTask().GetAwaiter().GetResult();
+                },
+                ct).ConfigureAwait(false);
+        }
     }
 
     private async Task RecognizeIndicesVisionAsync(
@@ -1285,7 +1522,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int[] pageIndices,
         RenderOptions renderOptions,
         ChannelWriter<(int, SKBitmap, double)> writer,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool completeWriter = true)
     {
         Stopwatch wall = Stopwatch.StartNew();
         string mode = _config.IsParallelRender ? "parallel" : "inprocess";
@@ -1337,7 +1575,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 workers,
                 pageIndices.Length,
                 wall.Elapsed.TotalMilliseconds);
-            writer.TryComplete();
+            if (completeWriter)
+                writer.TryComplete();
         }
     }
 

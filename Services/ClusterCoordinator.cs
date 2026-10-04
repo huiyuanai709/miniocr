@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Threading.Channels;
 using MiniOcr;
 using MiniOcr.Models;
 
@@ -402,7 +403,8 @@ public sealed class ClusterCoordinator : IHostedService
         bool distributeNer,
         IReadOnlyList<OcrPageResult>? textLayerPages,
         CancellationToken ct,
-        Func<ClusterJob, CancellationToken, Task>? alongside = null)
+        Func<ClusterJob, CancellationToken, Task>? alongside = null,
+        Func<ChannelReader<(string BatchId, int Page)>, ClusterJob, CancellationToken, Task>? recognizeFeed = null)
     {
         string id = Guid.NewGuid().ToString("N");
         List<ClusterRemote> remotes = _registry.Remotes();
@@ -417,6 +419,8 @@ public sealed class ClusterCoordinator : IHostedService
             PageTimeoutMs = _config.PageTimeoutMs,
             LeaseCapMs = Math.Max(_config.LeaseFloorMs, 180_000),
             SpeculativeTailPages = _config.SpeculativeTailPages,
+            RenderAheadPages = _config.RenderAheadPages,
+            SpeculativeStaleLeases = _config.SpeculativeStaleLeases,
             ExpectedNodes = Math.Max(1, 1 + remotes.Count),
             PrecompletedPages = precompleted,
             DeferAdmission = streamClassify,
@@ -542,66 +546,164 @@ public sealed class ClusterCoordinator : IHostedService
                     scheduler.AdmitPage(i);
             }
 
-            while (!ct.IsCancellationRequested)
+            if (_config.PipelineOcr && recognizeFeed is not null)
+                await RunPipelinedLocalAsync().ConfigureAwait(false);
+            else
+                await RunSerialLocalAsync().ConfigureAwait(false);
+
+            async Task RunSerialLocalAsync()
             {
-                if (classify is { IsCompleted: true } || (scheduler.IsComplete && classify is not null))
+                while (!ct.IsCancellationRequested)
                 {
-                    // IsComplete can flip on the last text page before AcceptPrepared returns.
-                    await ObserveClassifyAsync().ConfigureAwait(false);
-                    continue;
+                    if (classify is { IsCompleted: true } || (scheduler.IsComplete && classify is not null))
+                    {
+                        // IsComplete can flip on the last text page before AcceptPrepared returns.
+                        await ObserveClassifyAsync().ConfigureAwait(false);
+                        continue;
+                    }
+
+                    if (scheduler.IsComplete)
+                        break;
+
+                    if (ner is not null)
+                        scheduler.SetNerBlocker(ner.EarliestMissingPage());
+                    ClusterClaim claim = scheduler.Claim(_config.NodeId, localCap, DateTimeOffset.UtcNow);
+                    LogExpiries(job);
+                    if (claim.Kind == ClusterClaimKind.Done)
+                        break;
+                    if (claim.Kind == ClusterClaimKind.Wait)
+                    {
+                        await scheduler.WaitForChangeAsync(claim.Version, TimeSpan.FromSeconds(1), ct)
+                            .ConfigureAwait(false);
+                        continue;
+                    }
+
+                    LogClaim(id, _config.NodeId, claim);
+
+                    try
+                    {
+                        await recognizeLocal(claim.Pages, claim.BatchId, job, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        scheduler.ReleaseBatch(claim.BatchId);
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        int[] released = scheduler.ReleaseBatch(claim.BatchId);
+                        localFailures++;
+                        _logger.LogWarning(
+                            ex,
+                            "Cluster job {JobId} local batch {Batch} failed ({Failures}); requeued [{Pages}]",
+                            id,
+                            claim.BatchId,
+                            localFailures,
+                            string.Join(",", released));
+                        if (localFailures >= 3)
+                            throw;
+                        continue;
+                    }
+
+                    int[] leftover = scheduler.ReleaseBatch(claim.BatchId);
+                    if (leftover.Length > 0)
+                    {
+                        _logger.LogWarning(
+                            "Cluster job {JobId} local batch {Batch} incomplete; requeued [{Pages}]",
+                            id,
+                            claim.BatchId,
+                            string.Join(",", leftover));
+                    }
+                }
+            }
+
+            async Task RunPipelinedLocalAsync()
+            {
+                int depth = Math.Max(4, localCap + Math.Max(0, _config.RenderAheadPages));
+                Channel<(string BatchId, int Page)> feed = Channel.CreateBounded<(string, int)>(
+                    new BoundedChannelOptions(depth)
+                    {
+                        SingleReader = true,
+                        SingleWriter = true,
+                        FullMode = BoundedChannelFullMode.Wait,
+                    });
+                List<string> batches = [];
+                using CancellationTokenSource pipeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+                async Task ClaimLoopAsync()
+                {
+                    try
+                    {
+                        while (!pipeCts.IsCancellationRequested)
+                        {
+                            if (classify is { IsCompleted: true } || (scheduler.IsComplete && classify is not null))
+                            {
+                                await ObserveClassifyAsync().ConfigureAwait(false);
+                                continue;
+                            }
+
+                            if (scheduler.IsComplete)
+                                break;
+
+                            if (ner is not null)
+                                scheduler.SetNerBlocker(ner.EarliestMissingPage());
+                            ClusterClaim claim = scheduler.Claim(_config.NodeId, localCap, DateTimeOffset.UtcNow);
+                            LogExpiries(job);
+                            if (claim.Kind == ClusterClaimKind.Done)
+                                break;
+                            if (claim.Kind == ClusterClaimKind.Wait)
+                            {
+                                await scheduler.WaitForChangeAsync(claim.Version, TimeSpan.FromSeconds(1), pipeCts.Token)
+                                    .ConfigureAwait(false);
+                                continue;
+                            }
+
+                            LogClaim(id, _config.NodeId, claim);
+                            batches.Add(claim.BatchId);
+                            foreach (int page in claim.Pages)
+                                await feed.Writer.WriteAsync((claim.BatchId, page), pipeCts.Token).ConfigureAwait(false);
+                        }
+                    }
+                    catch (OperationCanceledException) when (pipeCts.IsCancellationRequested && !ct.IsCancellationRequested)
+                    {
+                    }
+                    finally
+                    {
+                        feed.Writer.TryComplete();
+                    }
                 }
 
-                if (scheduler.IsComplete)
-                    break;
-
-                if (ner is not null)
-                    scheduler.SetNerBlocker(ner.EarliestMissingPage());
-                ClusterClaim claim = scheduler.Claim(_config.NodeId, localCap, DateTimeOffset.UtcNow);
-                LogExpiries(job);
-                if (claim.Kind == ClusterClaimKind.Done)
-                    break;
-                if (claim.Kind == ClusterClaimKind.Wait)
+                Task claiming = ClaimLoopAsync();
+                Task recognizing = recognizeFeed!(feed.Reader, job, pipeCts.Token);
+                Task finished = await Task.WhenAny(claiming, recognizing).ConfigureAwait(false);
+                if (ReferenceEquals(finished, recognizing) && recognizing.IsFaulted && !claiming.IsCompleted)
+                    await pipeCts.CancelAsync().ConfigureAwait(false);
+                try
                 {
-                    await scheduler.WaitForChangeAsync(claim.Version, TimeSpan.FromSeconds(1), ct)
-                        .ConfigureAwait(false);
-                    continue;
+                    await claiming.ConfigureAwait(false);
                 }
-
-                LogClaim(id, _config.NodeId, claim);
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                }
 
                 try
                 {
-                    await recognizeLocal(claim.Pages, claim.BatchId, job, ct).ConfigureAwait(false);
+                    await recognizing.ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
+                finally
                 {
-                    scheduler.ReleaseBatch(claim.BatchId);
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    int[] released = scheduler.ReleaseBatch(claim.BatchId);
-                    localFailures++;
-                    _logger.LogWarning(
-                        ex,
-                        "Cluster job {JobId} local batch {Batch} failed ({Failures}); requeued [{Pages}]",
-                        id,
-                        claim.BatchId,
-                        localFailures,
-                        string.Join(",", released));
-                    if (localFailures >= 3)
-                        throw;
-                    continue;
-                }
-
-                int[] leftover = scheduler.ReleaseBatch(claim.BatchId);
-                if (leftover.Length > 0)
-                {
-                    _logger.LogWarning(
-                        "Cluster job {JobId} local batch {Batch} incomplete; requeued [{Pages}]",
-                        id,
-                        claim.BatchId,
-                        string.Join(",", leftover));
+                    foreach (string batch in batches)
+                    {
+                        int[] leftover = scheduler.ReleaseBatch(batch);
+                        if (leftover.Length > 0)
+                        {
+                            _logger.LogWarning(
+                                "Cluster job {JobId} local batch {Batch} incomplete; requeued [{Pages}]",
+                                id,
+                                batch,
+                                string.Join(",", leftover));
+                        }
+                    }
                 }
             }
 

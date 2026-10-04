@@ -36,6 +36,22 @@ public sealed class ClusterFileConfig
     /// <summary>When this many pages are still leased and nothing is pending, idle nodes may copy the tail.</summary>
     public int SpeculativeTailPages { get; set; } = 4;
     /// <summary>
+    /// Pages a node may lease beyond its OCR capacity so the next batch renders while engines are busy.
+    /// 0 disables. Default 4.
+    /// </summary>
+    public int RenderAheadPages { get; set; } = 4;
+    /// <summary>
+    /// When null, a stale primary lease can be copied once the pending queue is empty,
+    /// even if more than <see cref="SpeculativeTailPages"/> pages are still out.
+    /// Set false to keep only the small-tail copy.
+    /// </summary>
+    public bool? SpeculativeStaleLeases { get; set; }
+    /// <summary>
+    /// When null, a node claims the next pages while OCR is still running and posts each page as it finishes.
+    /// Set false to claim a batch, finish it, post it, then claim again.
+    /// </summary>
+    public bool? PipelineOcr { get; set; }
+    /// <summary>
     /// When true, per-claim / heartbeat / batch-done / empty-poll lines are Information.
     /// Default false: those lines are Debug. Progress summaries stay Information either way.
     /// <c>Logging:LogLevel</c> for the cluster categories still applies.
