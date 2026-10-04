@@ -716,10 +716,11 @@ The current CPU is missing one or more of the required instruction sets.
 1. 协调节点一拿到 http(s) 链接就 `POST /cluster/notify`（`prefetch: true`，只有 `sourceUrl`，没有页数、不占会话名额）。工人立刻把这份 URL 下进进程内缓存，和协调节点自己的下载重叠。真正的任务通知仍在协调节点拿到字节和页数之后发出，带上 `pageCount`；`textLayer` 不为 `off` 时分类在这条通知之后继续流式进行，不再挡住通知。
 2. 工人 `POST /cluster/dispatch` 轮询（或被任务 `notify` 叫醒）后**先 `POST /join`（`downloading: true`）**，再下 PDF，下完再 `POST /join` 表示可以领页。预取已经完成时，第一次 `join` 就是 `downloading: false`。协调节点从这一刻起就知道该工人在场，日志是 `joined, downloading PDF`。页数少于 48 时，下载结束前（最多 30 秒）继续按住本地窗口，避免短文档在大文件下载期间被协调节点独自做完。
 3. PDF 优先用原始链接的 `ParallelPdfDownloader`（HEAD + 最多 8 路 Range，按 `Content-Length` 一次分配）。预取和稍后的任务会话共用同一次下载。原始链接失败或不支持 Range 时，再向协调节点拉；协调节点的 `GET/HEAD /cluster/jobs/{id}/pdf` 同样返回 `Accept-Ranges: bytes` 和准确的 `Content-Length`。同一任务的字节缓存在工人进程里，再次加入不会重下。
-4. 未设置 `pagesPerBatch` 时，批次按该节点实测 pages/s 调整，大约覆盖 8 秒的活，并且**新节点的第一批最多 2 页**。显式 `pagesPerBatch` 仍然固定。在途页数不超过 capacity。更快的机器更早回来领下一批，自然多干。
+4. 未设置 `pagesPerBatch` 时，批次按该节点实测 pages/s 调整，大约覆盖 8 秒的活，并且**新节点的第一批最多 2 页**。显式 `pagesPerBatch` 仍然固定。一次领取仍然不超过该节点的 capacity。节点已经有 capacity 页在途时，还可以再领 `renderAheadPages`（默认 4）页，让下一波先渲染。`pipelineOcr`（默认开）在 OCR 还在跑的时候继续领，每页识别完就回传，引擎不等 HTTP。`MINIOCR_CLUSTER_PIPELINE_OCR=0` 回到「领一整批、做完、再回传」。
 5. 协调节点会在 `joinGraceMs`（默认 500）内先把自己限制在一个窗口。宽限过后：页数 **少于 48** 且仍有工人在下载时，窗口保持到下载结束或 30 秒；页数 **达到 48** 时窗口随宽限结束打开，不再为了等下载把协调节点闲置。一本几百页的扫描件在那 30 秒里做不完，按住窗口只是空等。
 6. 租约到期、`/fail`、或健康检查连续失败：这些页回到队列，别的节点（含本地）重做。两处投机执行，谁先写回谁算数，后写的提交被丢掉，页文本不会重复：
    - 待处理队列空了且未完成页数 ≤ `speculativeTailPages`（默认 4）时，空闲节点再跑一遍尾巴。
+   - 待处理队列空了、未完成页还多于这个尾巴，但某一份主租约已经跑得比「剩余波次 × 该节点单页时间」的 60% 更久（至少 2.5 秒）：空闲节点复制这份过期租约。健康节点一轮 OCR 通常不到 2.5 秒，所以不会互相抄；卡住的节点才会被抄。`speculativeStaleLeases: false` 或 `MINIOCR_CLUSTER_SPECULATIVE_STALE=0` 关掉。
    - 某一页已经租出去、又是下一组 NER 还缺的最早一页，并且租约已经明显超过该节点实测的单页时间（至少 2.5 秒、约 2 倍单页）：空闲节点只复制这一页，让组能先成形。同一页同时最多两份在途。
 7. 工人同时最多 2 个任务。`dispatch` 和任务 `notify` 都执行这个上限；`prefetch: true` 只下载、不开会话，不占这 2 个名额。工人离开任务后的 45 秒内会把该任务放进 `ActiveJobs`，协调节点不会立刻再派给它。OCR 已经完成、而这个节点不能做 NER（或 NER 已经没有待领组）时，也不会再派，避免为了空转再下一遍 PDF。
 8. 领页、加入、NER 领取遇到超时或连接错误会退避重试，不结束整个会话。只有任务令牌真正取消才当作取消；HttpClient 超时走 `/fail` 或 `/ner/fail`，其他节点可以马上重做。任务结束时协调节点取消还没写完的 `/pdf` 流，不再干等最多 60 秒。
@@ -773,6 +774,33 @@ The current CPU is missing one or more of the required instruction sets.
 
 预取把第二次下载从关键路径上拿掉：协调节点一开始下自己的那份时，工人已经在下同一个 `sourceUrl`。分类改成流式之后，任务通知也不再等全书文本层扫完；扫描件（整本都要 OCR）页会一边分析一边进队列。页数 ≥ 48 时，`joinGraceMs` 一过协调节点就领页，不再为了工人还在下载而空等最多 30 秒。短文档仍保持这 30 秒，避免协调节点把小文件做完。
 
+### 领页和 OCR 重叠（`tests/MiniOcr.ClusterBench --replay`）
+
+这仍不是那份 265 MB / 463 页扫描件的复跑（仓库里没有这个文件）。回放用真实的 `ClusterPageScheduler`，三台 12 线程机器（每台 6 个引擎、4 个渲染进程），虚拟时钟。下载不在这张表里：预取已经把它和 OCR 重叠。265 MB 在 20 MB/s 的局域网上大约 13.3 秒，限速基准的 2 MB/s 则是 132.5 秒。
+
+「旧」是领一整批、整批 OCR 完再一次回传、然后再领。「逐页回传」是每页提交后立刻领，但在途页数仍卡在 capacity。「再超前 4 页」让已经打满的节点再租 4 页给渲染。单页时间是参数：扫描一档按 4 核实测的量级放大到 130 DPI（渲染 45 ms、每引擎 OCR 650 ms）；文本样例一档是本机实测（见下）。
+
+| 回放 | 旧墙钟 | 逐页回传 | 再超前 4 页 | 引擎利用率 旧 → 新 |
+| --- | ---: | ---: | ---: | ---: |
+| 463 页，三台一样快，扫描档 | 20909 ms | 19057 ms（−1852） | 17039 ms（−3870，−18.5%） | 80% → 98% |
+| 同上，一台 OCR 慢 1.5 倍 | 23195 ms | — | 19582 ms（−3613） | 82% → 97% |
+| 同上，一台 OCR 慢 8 倍（一轮超过 2.5 秒） | 31802 ms | — | 26871 ms；过期租约再抄一遍后 24214 ms（再 −2657） | 72% → 95%，抄完后墙钟更短 |
+| 463 页，文本样例档（渲染 20 ms、OCR 90 ms） | 4464 ms | 3847 ms（−617） | 2429 ms（−2035，−45.6%） | 52% → 95% |
+
+健康节点上，过期租约复制和「只超前 4 页」的墙钟相同（投机页数也相同）：一轮 OCR 短于 2.5 秒，复制不会触发。慢 8 倍的那台才会被抄，扫描档再少 2657 ms。`tail` 列不是「最后几页多出来的时间」——队列更早被领空时，这列会变长，墙钟仍然更短。
+
+本机 4 核、1 个引擎、`samples/sample-multipage.pdf`（5 页文本，不是扫描件）、cls 关、热身后：
+
+| 设置 | 96 DPI 每页 OCR | 130 DPI 每页 OCR | 文本是否和 det 960 相同 |
+| --- | ---: | ---: | --- |
+| det 边长 960、rec 批 8（默认） | 89.0 ms | 87.6 ms | 基准。两种 DPI 的文本哈希不一样 |
+| det 边长 640 | 76.7 ms | 70.6 ms | 变了，不改默认 |
+| det 边长 1280 | 99.8 ms | 119.6 ms | 更慢，文本也变了 |
+
+进程内渲染大约 19–20 ms/页（96 DPI 793×1122，130 DPI 1074×1520），OCR 仍是大头。没有把默认 DPI 从用户的 130 降下来，也没有改 det 边长或 rec 批大小。cls 本来就是关的。空白页跳过没有做：这份 463 页扫描里空白占多少不知道，跳错一页会丢名字；`textLayer: auto` 已经跳过真有文本层的页。
+
+12 线程、130 DPI、Paddle、并行渲染、`textLayer: auto` 的建议是保持这些默认：`capacity: 0`（6 个引擎）、`renderProcesses` 自动是 4、`renderAheadPages: 4`、`pipelineOcr: true`、`speculativeStaleLeases: true`、`speculativeTailPages: 4`、det 边长 960、rec 批 8、cls 关、DPI 仍用 130。不要把批次改成比引擎数更大的固定值，超前的 4 页已经把渲染盖住了。
+
 `ocr.renderProcesses` 自动上限仍是 4。本机 4 核、130 DPI、12 页 JPEG 扫描、文件只写一次：1 个渲染进程中位 413 ms，2 个 212 ms，4 个 135 ms。4 比 2 更快，所以没有把上限降到 2。这是只栅格、没有 OCR 引擎抢核；8 核上「4 个渲染进程 + 4 个 OCR 引擎」是否互相踩，这次没测。4 核机器的自动值本来就是 `cores − engines = 2`。
 
 ### 配置
@@ -797,6 +825,9 @@ The current CPU is missing one or more of the required instruction sets.
     "healthIntervalSeconds": 5,
     "jobDeadlineSeconds": 300,
     "speculativeTailPages": 4,
+    "renderAheadPages": 4,
+    "speculativeStaleLeases": true,
+    "pipelineOcr": true,
     "verboseDispatch": false,
     "distributedNer": true,
     "workers": [
@@ -874,6 +905,9 @@ MiniOcr.exe --urls http://0.0.0.0:5080
 | `MINIOCR_CLUSTER_JOB_DEADLINE_SECONDS` | 到点后本地接管剩余页 |
 | `MINIOCR_CLUSTER_JOIN_GRACE_MS` | 开局留给工人下载 PDF 的本地窗口 |
 | `MINIOCR_CLUSTER_SPECULATIVE_TAIL` | 尾巴投机复制的页数上限 |
+| `MINIOCR_CLUSTER_RENDER_AHEAD` | 打满 capacity 之后还能多领多少页给渲染。默认 4，`0` 关掉 |
+| `MINIOCR_CLUSTER_SPECULATIVE_STALE` | 过期主租约的复制。默认开，`0` / `off` 关掉 |
+| `MINIOCR_CLUSTER_PIPELINE_OCR` | OCR 进行中继续领页、逐页回传。默认开，`0` 回到整批做完再回传 |
 | `MINIOCR_CLUSTER_VERBOSE_DISPATCH` | `1` / `true` 时把领页、心跳、批次完成、空轮询打到 Information。默认关闭（这些行在 Debug） |
 | `MINIOCR_CLUSTER_DISTRIBUTED_NER` | `cluster.distributedNer`。默认 **开**（集群启用时）。`0` / `off` 时文本 NER 仍全部在协调节点上 |
 

@@ -29,6 +29,17 @@ public sealed class ClusterScheduleOptions
     public int PageTimeoutMs { get; init; } = 20_000;
     public int LeaseCapMs { get; init; } = 180_000;
     public int SpeculativeTailPages { get; init; } = 4;
+    /// <summary>
+    /// Extra pages a node may lease after it is already at OCR capacity, so the next
+    /// pages can render while every engine is busy. 0 keeps the old cap.
+    /// </summary>
+    public int RenderAheadPages { get; init; }
+    /// <summary>
+    /// When the pending queue is empty and the tail is still larger than
+    /// <see cref="SpeculativeTailPages"/>, copy pages from a primary lease that has
+    /// already run past the time that lease should need. Off leaves only the small-tail copy.
+    /// </summary>
+    public bool SpeculativeStaleLeases { get; init; }
     public int ExpectedNodes { get; init; } = 1;
     /// <summary>0-based pages already finished (text layer). They are not queued for OCR.</summary>
     public int[] PrecompletedPages { get; init; } = [];
@@ -81,6 +92,8 @@ public sealed class ClusterPageScheduler
     private readonly int _pageTimeoutMs;
     private readonly int _leaseCapMs;
     private readonly int _speculativeTail;
+    private readonly int _renderAhead;
+    private readonly bool _speculativeStale;
     private readonly PageState[] _pages;
     private readonly Queue<int> _pending;
     private readonly Dictionary<string, Lease> _leases = new(StringComparer.Ordinal);
@@ -108,6 +121,8 @@ public sealed class ClusterPageScheduler
         _pageTimeoutMs = Math.Max(1, options.PageTimeoutMs);
         _leaseCapMs = Math.Max(_leaseFloorMs, options.LeaseCapMs);
         _speculativeTail = Math.Max(1, options.SpeculativeTailPages);
+        _renderAhead = Math.Clamp(options.RenderAheadPages, 0, 16);
+        _speculativeStale = options.SpeculativeStaleLeases;
         _expectedNodes = Math.Max(1, options.ExpectedNodes);
         _pages = new PageState[_pageCount];
         _pending = new Queue<int>(_pageCount);
@@ -255,7 +270,13 @@ public sealed class ClusterPageScheduler
 
             int cap = CapacityOf(nodeId);
             int inFlight = InFlightCore(nodeId);
-            int room = cap - inFlight;
+            int room = Math.Max(0, cap - inFlight);
+            // One claim is still capped by AdaptiveBatch(cap). This only lets a node that
+            // is already full lease a few extra pages so render can run ahead of OCR.
+            int aheadRoom = 0;
+            if (room == 0 && inFlight > 0 && _renderAhead > 0)
+                aheadRoom = Math.Max(0, cap + _renderAhead - inFlight);
+            int claimRoom = room > 0 ? room : aheadRoom;
             bool local = nodeId == _localNodeId;
             if (local && _holdLocalWindow && _pending.Count > 0)
             {
@@ -265,14 +286,14 @@ public sealed class ClusterPageScheduler
                     return WaitClaim();
             }
 
-            if (room <= 0)
+            if (claimRoom <= 0)
                 return WaitClaim();
 
             int blocked = TrySpeculativeBlocker(nodeId, now);
             if (blocked >= 0)
                 return LeasePages(nodeId, [blocked], speculative: true, now);
 
-            int want = Math.Min(room, AdaptiveBatch(nodeId, cap));
+            int want = Math.Min(claimRoom, AdaptiveBatch(nodeId, cap));
             if (maxPages > 0)
                 want = Math.Min(want, maxPages);
             want = Shrink(want);
@@ -290,11 +311,15 @@ public sealed class ClusterPageScheduler
                 return DoneClaim();
 
             int undone = _pageCount - _done;
-            if (undone > 0 && undone <= _speculativeTail && room > 0)
+            if (undone > 0 && claimRoom > 0 && _pending.Count == 0)
             {
-                int[] copies = PickSpeculative(nodeId, Math.Min(room, want));
-                if (copies.Length > 0)
-                    return LeasePages(nodeId, copies, speculative: true, now);
+                bool tail = undone <= _speculativeTail;
+                if (tail || _speculativeStale)
+                {
+                    int[] copies = PickSpeculative(nodeId, Math.Min(claimRoom, want), now, staleOnly: !tail);
+                    if (copies.Length > 0)
+                        return LeasePages(nodeId, copies, speculative: true, now);
+                }
             }
 
             return _done == _pageCount ? DoneClaim() : WaitClaim();
@@ -600,7 +625,30 @@ public sealed class ClusterPageScheduler
         return Math.Min(max, sized);
     }
 
-    private int[] PickSpeculative(string nodeId, int want)
+    /// <summary>
+    /// A primary lease is stale when it has already run longer than the remaining
+    /// waves should take. Waves use the owner's capacity so parallel OCR is not
+    /// treated as one page after another. Floor is 2.5s, same as the NER-blocker copy.
+    /// </summary>
+    private bool LeaseIsStale(Lease lease, DateTimeOffset now)
+    {
+        int remaining = 0;
+        foreach (int index in lease.Pages)
+        {
+            if (!_pages[index].Done)
+                remaining++;
+        }
+
+        if (remaining <= 0)
+            return false;
+        int cap = Math.Max(1, CapacityOf(lease.NodeId));
+        int waves = (remaining + cap - 1) / cap;
+        double expectedMs = ExpectedPageMs(lease.NodeId) * waves;
+        double threshold = Math.Max(2_500, expectedMs * 0.6);
+        return (now - lease.Created).TotalMilliseconds >= threshold;
+    }
+
+    private int[] PickSpeculative(string nodeId, int want, DateTimeOffset now, bool staleOnly)
     {
         // Oldest primary lease first, pages this node is not already running, at most one extra copy.
         List<Lease> ordered = _leases.Values
@@ -611,6 +659,8 @@ public sealed class ClusterPageScheduler
         foreach (Lease lease in ordered)
         {
             if (lease.NodeId == nodeId)
+                continue;
+            if (staleOnly && !LeaseIsStale(lease, now))
                 continue;
             foreach (int index in lease.Pages.OrderBy(i => i))
             {

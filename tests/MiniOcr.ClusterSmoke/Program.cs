@@ -446,6 +446,18 @@ Console.WriteLine("=== distributed NER config ===");
         new AppConfigFile { Cluster = new ClusterFileConfig { Enabled = true, Token = "t" } },
         _ => null);
     AssertTrue(defaults.DistributedNer, "distributed NER defaults on when unset");
+    AssertTrue(defaults.RenderAheadPages == 4, "render-ahead defaults to 4");
+    AssertTrue(defaults.SpeculativeStaleLeases, "stale lease copy defaults on");
+    AssertTrue(defaults.PipelineOcr, "pipelined OCR defaults on");
+    ClusterRuntimeConfig aheadOff = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile { Cluster = new ClusterFileConfig { Enabled = true, Token = "t", RenderAheadPages = 4, PipelineOcr = true } },
+        name => name == "MINIOCR_CLUSTER_RENDER_AHEAD" ? "0"
+            : name == "MINIOCR_CLUSTER_PIPELINE_OCR" ? "0"
+            : name == "MINIOCR_CLUSTER_SPECULATIVE_STALE" ? "off"
+            : null);
+    AssertTrue(aheadOff.RenderAheadPages == 0, "MINIOCR_CLUSTER_RENDER_AHEAD=0 disables render-ahead");
+    AssertTrue(!aheadOff.PipelineOcr, "MINIOCR_CLUSTER_PIPELINE_OCR=0 restores the serial claim loop");
+    AssertTrue(!aheadOff.SpeculativeStaleLeases, "MINIOCR_CLUSTER_SPECULATIVE_STALE=off");
     ClusterRuntimeConfig fileOff = ClusterRuntimeConfig.Resolve(
         new AppConfigFile { Cluster = new ClusterFileConfig { Enabled = true, Token = "t", DistributedNer = false } },
         _ => null);
@@ -1093,6 +1105,98 @@ Console.WriteLine("=== fast node grows after a quick batch ===");
         sched.TryCommit(first.BatchId, page, t0.AddMilliseconds(200));
     ClusterClaim second = sched.Claim("fast", 8, t0.AddMilliseconds(200));
     AssertTrue(second.Pages.Length == 8, $"fast node opens up to capacity ({second.Pages.Length})");
+}
+
+Console.WriteLine("=== render-ahead leases past capacity while OCR is in flight ===");
+{
+    DateTimeOffset t0 = new(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+    ClusterPageScheduler ahead = new(new ClusterScheduleOptions
+    {
+        PageCount = 40,
+        LocalNodeId = "local",
+        LeaseFloorMs = 60_000,
+        PageTimeoutMs = 60_000,
+        LeaseCapMs = 180_000,
+        SpeculativeTailPages = 4,
+        ExpectedNodes = 2,
+        RenderAheadPages = 4,
+    });
+    ahead.SetCapacity("fast", 8);
+    int leased = 0;
+    ClusterClaim? last = null;
+    for (int i = 0; i < 6; i++)
+    {
+        last = ahead.Claim("fast", 8, t0);
+        AssertTrue(last.Kind == ClusterClaimKind.Batch && !last.Speculative, $"render-ahead claim {i + 1} is real work");
+        leased += last.Pages.Length;
+    }
+
+    AssertTrue(leased == 12, $"in-flight stops at capacity+ahead ({leased})");
+    ClusterClaim blocked = ahead.Claim("fast", 8, t0);
+    AssertTrue(blocked.Kind == ClusterClaimKind.Wait, "no second full batch past the render-ahead cap");
+
+    ClusterPageScheduler capped = NewScheduler(40, expectedNodes: 2, leaseFloorMs: 60_000, pageTimeoutMs: 60_000);
+    capped.SetCapacity("fast", 8);
+    int filled = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        ClusterClaim claim = capped.Claim("fast", 8, t0);
+        if (claim.Kind != ClusterClaimKind.Batch)
+            break;
+        filled += claim.Pages.Length;
+    }
+
+    AssertTrue(filled == 8, $"without render-ahead the node stops at capacity ({filled})");
+}
+
+Console.WriteLine("=== stale lease is copied only after it overruns ===");
+{
+    DateTimeOffset t0 = new(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+    ClusterPageScheduler sched = new(new ClusterScheduleOptions
+    {
+        PageCount = 10,
+        LocalNodeId = "local",
+        LeaseFloorMs = 60_000,
+        PageTimeoutMs = 60_000,
+        LeaseCapMs = 180_000,
+        SpeculativeTailPages = 4,
+        ExpectedNodes = 2,
+        SpeculativeStaleLeases = true,
+    });
+    sched.SetCapacity("owner", 8);
+    sched.SetCapacity("idle", 8);
+    ClusterClaim warm = sched.Claim("owner", 8, t0);
+    foreach (int page in warm.Pages)
+        sched.TryCommit(warm.BatchId, page, t0.AddMilliseconds(200));
+    ClusterClaim held = sched.Claim("owner", 8, t0.AddMilliseconds(200));
+    AssertTrue(held.Pages.Length == 8, $"owner holds the rest ({held.Pages.Length})");
+    ClusterClaim fresh = sched.Claim("idle", 8, t0.AddMilliseconds(201));
+    AssertTrue(fresh.Kind == ClusterClaimKind.Wait, "a fresh lease is not copied just because the queue is empty");
+    ClusterClaim early = sched.Claim("idle", 8, t0.AddMilliseconds(200 + 2499));
+    AssertTrue(early.Kind == ClusterClaimKind.Wait, "stale copy waits out the 2.5s floor");
+    ClusterClaim copy = sched.Claim("idle", 8, t0.AddMilliseconds(200 + 2500));
+    AssertTrue(copy.Kind == ClusterClaimKind.Batch && copy.Speculative, "overdue lease is copied");
+    AssertTrue(copy.Pages.Length == 2, $"idle node copies a starter batch ({copy.Pages.Length})");
+    AssertTrue(held.Pages.Contains(copy.Pages[0]), "copy comes from the owner's open lease");
+
+    ClusterPageScheduler staleOff = new(new ClusterScheduleOptions
+    {
+        PageCount = 10,
+        LocalNodeId = "local",
+        LeaseFloorMs = 60_000,
+        PageTimeoutMs = 60_000,
+        LeaseCapMs = 180_000,
+        SpeculativeTailPages = 4,
+        ExpectedNodes = 2,
+    });
+    staleOff.SetCapacity("owner", 8);
+    staleOff.SetCapacity("idle", 8);
+    ClusterClaim warmOff = staleOff.Claim("owner", 8, t0);
+    foreach (int page in warmOff.Pages)
+        staleOff.TryCommit(warmOff.BatchId, page, t0.AddMilliseconds(200));
+    staleOff.Claim("owner", 8, t0.AddMilliseconds(200));
+    ClusterClaim noCopy = staleOff.Claim("idle", 8, t0.AddSeconds(30));
+    AssertTrue(noCopy.Kind == ClusterClaimKind.Wait, "stale copy stays off unless the scheduler flag is set");
 }
 
 Console.WriteLine("=== dispatch rules ===");

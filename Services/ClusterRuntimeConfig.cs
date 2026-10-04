@@ -25,6 +25,19 @@ public sealed class ClusterRuntimeConfig
     public int JobDeadlineMs { get; init; } = 300_000;
     public int JoinGraceMs { get; init; } = 500;
     public int SpeculativeTailPages { get; init; } = 4;
+    /// <summary>Pages leased beyond OCR capacity so render stays ahead. 0 disables. Default 4.</summary>
+    public int RenderAheadPages { get; init; } = 4;
+    /// <summary>
+    /// Copy a primary lease that has run past its expected remaining time once nothing
+    /// is pending. Default on. <c>MINIOCR_CLUSTER_SPECULATIVE_STALE=0</c> disables it.
+    /// </summary>
+    public bool SpeculativeStaleLeases { get; init; } = true;
+    /// <summary>
+    /// Claim and render the next pages while OCR is still running, and post each page
+    /// as it finishes. Default on. <c>MINIOCR_CLUSTER_PIPELINE_OCR=0</c> restores the
+    /// claim-then-finish loop.
+    /// </summary>
+    public bool PipelineOcr { get; init; } = true;
     /// <summary>Promote routine dispatch logs (claim, heartbeat, batch done, empty poll) to Information.</summary>
     public bool VerboseDispatch { get; init; }
     /// <summary>
@@ -113,6 +126,17 @@ public sealed class ClusterRuntimeConfig
         int tail = Math.Clamp(
             ReadInt(env, "MINIOCR_CLUSTER_SPECULATIVE_TAIL", section.SpeculativeTailPages <= 0 ? 4 : section.SpeculativeTailPages),
             1, 64);
+        int renderAhead = Math.Clamp(
+            ReadInt(env, "MINIOCR_CLUSTER_RENDER_AHEAD", section.RenderAheadPages),
+            0, 16);
+        bool staleLeases = section.SpeculativeStaleLeases ?? true;
+        string? envStale = env("MINIOCR_CLUSTER_SPECULATIVE_STALE");
+        if (!string.IsNullOrWhiteSpace(envStale))
+            staleLeases = ParseBool(envStale, staleLeases);
+        bool pipelineOcr = section.PipelineOcr ?? true;
+        string? envPipeline = env("MINIOCR_CLUSTER_PIPELINE_OCR");
+        if (!string.IsNullOrWhiteSpace(envPipeline))
+            pipelineOcr = ParseBool(envPipeline, pipelineOcr);
 
         bool verboseDispatch = section.VerboseDispatch;
         string? envVerbose = env("MINIOCR_CLUSTER_VERBOSE_DISPATCH");
@@ -172,6 +196,9 @@ public sealed class ClusterRuntimeConfig
             JobDeadlineMs = deadlineSeconds * 1000,
             JoinGraceMs = joinGrace,
             SpeculativeTailPages = tail,
+            RenderAheadPages = renderAhead,
+            SpeculativeStaleLeases = staleLeases,
+            PipelineOcr = pipelineOcr,
             VerboseDispatch = verboseDispatch,
             DistributedNer = distributedNer,
             Workers = workers,

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Threading.Channels;
 using MiniOcr;
 using MiniOcr.Models;
 
@@ -362,6 +363,12 @@ public sealed class ClusterWorkerHost : IHostedService
 
             byte[] pdfBytes = pdf ?? throw new InvalidOperationException("PDF was not downloaded.");
             renderPdf = pdfBytes;
+            if (_config.PipelineOcr)
+            {
+                localDone += await RunPipelinedOcrAsync(
+                    coordinatorUrl, jobId, dpi, pageCount, pdfBytes, started, progressAt, ct).ConfigureAwait(false);
+            }
+            else
             while (!ct.IsCancellationRequested)
             {
                 ClusterClaimResponse? claim;
@@ -495,6 +502,214 @@ public sealed class ClusterWorkerHost : IHostedService
                 jobId,
                 localDone);
         }
+    }
+
+    /// <summary>
+    /// Claims the next pages while OCR is still running and posts each finished page
+    /// without holding an engine across the HTTP call. <c>PipelineOcr</c> false keeps
+    /// the claim-whole-batch loop.
+    /// </summary>
+    private async Task<int> RunPipelinedOcrAsync(
+        string coordinatorUrl,
+        string jobId,
+        int dpi,
+        int pageCount,
+        byte[] pdfBytes,
+        DateTimeOffset started,
+        DateTimeOffset progressAt,
+        CancellationToken ct)
+    {
+        int depth = Math.Max(4, _self.Capacity + Math.Max(0, _config.RenderAheadPages));
+        Channel<(string BatchId, int Page)> feed = Channel.CreateBounded<(string, int)>(
+            new BoundedChannelOptions(depth)
+            {
+                SingleReader = true,
+                SingleWriter = true,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+        Channel<(string BatchId, OcrPageResult Page)> posts = Channel.CreateBounded<(string, OcrPageResult)>(
+            new BoundedChannelOptions(Math.Max(depth, 8))
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+        ConcurrentDictionary<string, int> remaining = new(StringComparer.Ordinal);
+        ConcurrentDictionary<string, int> batchSize = new(StringComparer.Ordinal);
+        ConcurrentDictionary<string, byte> poisoned = new(StringComparer.Ordinal);
+        int localDone = 0;
+        SemaphoreSlim wake = new(0, int.MaxValue);
+        using CancellationTokenSource pipeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        async Task ClaimLoopAsync()
+        {
+            try
+            {
+                while (!pipeCts.IsCancellationRequested)
+                {
+                    ClusterClaimResponse? claim;
+                    try
+                    {
+                        claim = await ClaimWithRetryAsync(coordinatorUrl, jobId, pipeCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (pipeCts.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex) when (!ct.IsCancellationRequested)
+                    {
+                        _logger.LogWarning(ex, "Cluster worker {NodeId} claim on {JobId} failed; retrying", _self.NodeId, jobId);
+                        await Task.Delay(500, pipeCts.Token).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    if (claim is null || claim.Done)
+                        break;
+                    if (claim.Wait || claim.Pages is null || claim.Pages.Count == 0 || string.IsNullOrWhiteSpace(claim.BatchId))
+                    {
+                        ClusterJobLog.ClaimWait(_logger, _config.VerboseDispatch, _self.NodeId, jobId);
+                        int retry = Math.Clamp(claim?.RetryAfterMs ?? 200, 50, 2000);
+                        await wake.WaitAsync(TimeSpan.FromMilliseconds(retry), pipeCts.Token).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    remaining[claim.BatchId] = claim.Pages.Count;
+                    batchSize[claim.BatchId] = claim.Pages.Count;
+                    Interlocked.Add(ref _inFlight, claim.Pages.Count);
+                    foreach (int page in claim.Pages)
+                        await feed.Writer.WriteAsync((claim.BatchId, page), pipeCts.Token).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (pipeCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+            }
+            finally
+            {
+                feed.Writer.TryComplete();
+            }
+        }
+
+        async Task OcrLoopAsync()
+        {
+            try
+            {
+                await _pipeline.RecognizeFeedAsync(
+                    pdfBytes,
+                    pdfBytes.Length,
+                    feed.Reader,
+                    dpi,
+                    (page, batchId, token) => new ValueTask(posts.Writer.WriteAsync((batchId, page), token).AsTask()),
+                    pipeCts.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                posts.Writer.TryComplete();
+            }
+        }
+
+        async Task PostLoopAsync()
+        {
+            await foreach (var (batchId, page) in posts.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                if (poisoned.ContainsKey(batchId))
+                    continue;
+
+                try
+                {
+                    await PostResultsAsync(coordinatorUrl, jobId, batchId, [page], ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    if (poisoned.TryAdd(batchId, 1) && remaining.TryGetValue(batchId, out int left) && left > 0)
+                    {
+                        remaining[batchId] = 0;
+                        Interlocked.Add(ref _inFlight, -left);
+                    }
+
+                    _logger.LogWarning(ex, "Cluster worker {NodeId} batch {Batch} failed", _self.NodeId, batchId);
+                    await PostFailAsync(coordinatorUrl, jobId, batchId, ex.Message, CancellationToken.None).ConfigureAwait(false);
+                    continue;
+                }
+
+                int still = remaining.AddOrUpdate(batchId, 0, static (_, n) => n - 1);
+                Interlocked.Decrement(ref _inFlight);
+                int doneNow = Interlocked.Increment(ref localDone);
+                Interlocked.Increment(ref _pagesDone);
+                if (still == 0 && batchSize.TryGetValue(batchId, out int size))
+                {
+                    ClusterJobLog.BatchDone(
+                        _logger, _config.VerboseDispatch, _self.NodeId, jobId, batchId, size);
+                }
+
+                wake.Release();
+                DateTimeOffset now = DateTimeOffset.UtcNow;
+                if (now - progressAt >= ClusterJobLog.ProgressInterval)
+                {
+                    progressAt = now;
+                    double rate = doneNow / Math.Max(0.001, (now - started).TotalSeconds);
+                    _logger.LogInformation(
+                        "Cluster worker {NodeId} job {JobId} progress: localPages={Pages} jobPages={Total} {Rate:F1} pages/s",
+                        _self.NodeId,
+                        jobId,
+                        doneNow,
+                        pageCount,
+                        rate);
+                }
+            }
+        }
+
+        Task claiming = ClaimLoopAsync();
+        Task ocr = OcrLoopAsync();
+        Task posting = PostLoopAsync();
+        await Task.WhenAny(claiming, ocr, posting).ConfigureAwait(false);
+        if ((ocr.IsFaulted || posting.IsFaulted) && !claiming.IsCompleted)
+            await pipeCts.CancelAsync().ConfigureAwait(false);
+
+        try
+        {
+            await claiming.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+        }
+
+        Exception? failure = null;
+        try
+        {
+            await ocr.ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            failure = ex;
+            await pipeCts.CancelAsync().ConfigureAwait(false);
+        }
+
+        try
+        {
+            await posting.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+        }
+
+        foreach (KeyValuePair<string, int> item in remaining)
+        {
+            if (item.Value <= 0 || !poisoned.TryAdd(item.Key, 1))
+                continue;
+            Interlocked.Add(ref _inFlight, -item.Value);
+            await PostFailAsync(coordinatorUrl, jobId, item.Key, "incomplete batch", CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+
+        wake.Release();
+        if (failure is not null)
+            throw failure;
+        ct.ThrowIfCancellationRequested();
+        return Volatile.Read(ref localDone);
     }
 
     private async Task RegisterUntilSuccessAsync(CancellationToken ct)
