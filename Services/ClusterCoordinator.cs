@@ -850,7 +850,7 @@ public sealed class ClusterCoordinator : IHostedService
             {
                 if (ner.IsComplete)
                     return;
-                if (ner.IsSealed && !ner.HasAnyCapacity)
+                if (ner.TryFinishWithoutCapacity())
                     return;
                 await ner.WaitForChangeAsync(ner.Version, TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
             }

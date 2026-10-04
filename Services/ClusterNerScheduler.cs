@@ -66,7 +66,9 @@ public readonly record struct ClusterNerGiveUp(string GroupId, int[] Pages, int 
 /// non-empty pages, split on <c>maxChars</c>, blank pages skipped. A group stays unleased
 /// until the next non-empty page's first 240 characters are known (or OCR is sealed), so
 /// the node that runs the group can join a name cut by the group boundary. Leases expire
-/// and failed groups are retried by another LLM-capable node. Nodes with NER capacity 0
+/// and failed groups are retried by another LLM-capable node. An explicit failure, a lease
+/// expiry, and an unhealthy owner each count toward <see cref="ClusterNerOptions.MaxAttempts"/>;
+/// after that the group is finished with no names. Nodes with NER capacity 0
 /// (no API key) are not given groups. Among active LLM nodes, a group goes to a caller only when
 /// no other active node has a strictly lower in-flight/capacity ratio, so the coordinator cannot
 /// lease every group before workers poll.
@@ -370,7 +372,7 @@ public sealed class ClusterNerScheduler
             }
 
             foreach (string id in held)
-                ReleaseCore(id, expired: false);
+                ReleaseCore(id, expired: false, countAttempt: true);
             _ = now;
             SignalCore();
         }
@@ -391,7 +393,7 @@ public sealed class ClusterNerScheduler
             }
 
             foreach (string id in held)
-                ReleaseCore(id, expired: false);
+                ReleaseCore(id, expired: false, countAttempt: false);
             _ = now;
             SignalCore();
         }
@@ -435,22 +437,27 @@ public sealed class ClusterNerScheduler
     public int AbandonRemaining()
     {
         lock (_gate)
-        {
-            int abandoned = 0;
-            foreach (Group group in _groups.Values)
-            {
-                if (group.Done)
-                    continue;
-                _giveUps.Add(new ClusterNerGiveUp(group.Id, group.Pages, group.Failures));
-                group.Owner = null;
-                MarkDone(group, "");
-                abandoned++;
-            }
+            return AbandonRemainingCore();
+    }
 
-            _ready.Clear();
-            _sealed = true;
-            SignalCore();
-            return abandoned;
+    /// <summary>
+    /// The local node has no NER workers of its own and is deciding whether to keep waiting.
+    /// Stop when OCR is sealed and no LLM node has capacity. If a group already succeeded,
+    /// unfinished groups are abandoned and reported via <see cref="DrainGiveUps"/> so the
+    /// merge does not run while work is still queued. If nothing succeeded, groups stay
+    /// unfinished and the caller uses the non-distributed path. An in-flight lease is left
+    /// alone so its result can still commit.
+    /// </summary>
+    public bool TryFinishWithoutCapacity()
+    {
+        lock (_gate)
+        {
+            if (!_sealed || HasCapacityCore() || InFlightAnyCore())
+                return false;
+            if (!_sawSuccess)
+                return true;
+            AbandonRemainingCore();
+            return true;
         }
     }
 
@@ -637,7 +644,52 @@ public sealed class ClusterNerScheduler
         group.CompletedBy = nodeId;
     }
 
-    private void ReleaseCore(string groupId, bool expired)
+    private int AbandonRemainingCore()
+    {
+        int abandoned = 0;
+        foreach (Group group in _groups.Values)
+        {
+            if (group.Done)
+                continue;
+            _giveUps.Add(new ClusterNerGiveUp(group.Id, group.Pages, group.Failures));
+            group.Owner = null;
+            MarkDone(group, "");
+            abandoned++;
+        }
+
+        _ready.Clear();
+        _sealed = true;
+        SignalCore();
+        return abandoned;
+    }
+
+    private bool HasCapacityCore()
+    {
+        foreach (int cap in _caps.Values)
+        {
+            if (cap > 0)
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool InFlightAnyCore()
+    {
+        foreach (Group group in _groups.Values)
+        {
+            if (!group.Done && group.Owner is not null)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <param name="countAttempt">
+    /// Lease expiry and an unhealthy node count toward <see cref="ClusterNerOptions.MaxAttempts"/>.
+    /// Deadline takeover does not: the local node is about to run the same group.
+    /// </param>
+    private void ReleaseCore(string groupId, bool expired, bool countAttempt)
     {
         if (!_groups.TryGetValue(groupId, out Group? group) || group.Done)
             return;
@@ -656,6 +708,18 @@ public sealed class ClusterNerScheduler
             });
         }
 
+        if (countAttempt)
+        {
+            group.Failures++;
+            if (group.Failures >= _maxAttempts)
+            {
+                _giveUps.Add(new ClusterNerGiveUp(group.Id, group.Pages, group.Failures));
+                MarkDone(group, "");
+                SignalCore();
+                return;
+            }
+        }
+
         Enqueue(group);
     }
 
@@ -669,7 +733,7 @@ public sealed class ClusterNerScheduler
         }
 
         foreach (string id in expired)
-            ReleaseCore(id, expired: true);
+            ReleaseCore(id, expired: true, countAttempt: true);
     }
 
     private void NotePullCore(string nodeId, DateTimeOffset now)

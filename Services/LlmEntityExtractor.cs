@@ -97,6 +97,8 @@ public sealed class LlmEntityExtractor
     /// <summary>
     /// Overlaps LLM NER with OCR. Not thread-safe for <see cref="CompleteAsync"/>
     /// racing <see cref="Add"/>; OCR workers may call <see cref="Add"/> concurrently.
+    /// A full group is held until the next non-empty page is known, so the request
+    /// can include that page's first 240 characters, or until <see cref="CompleteAsync"/>.
     /// </summary>
     public sealed class LlmExtractionSession
     {
@@ -109,6 +111,7 @@ public sealed class LlmEntityExtractor
         private readonly List<Task> _tasks = [];
         private readonly List<string> _companies = [];
         private readonly List<string> _persons = [];
+        private LlmPageGrouper.PageBatch? _held;
 
         internal LlmExtractionSession(
             LlmEntityExtractor owner,
@@ -130,7 +133,7 @@ public sealed class LlmEntityExtractor
         {
             List<LlmPageGrouper.PageBatch> ready;
             lock (_gate)
-                ready = _buffer.Add(page);
+                ready = CollectSendable(_buffer.Add(page), flushHeld: false);
             foreach (LlmPageGrouper.PageBatch batch in ready)
                 Queue(batch);
         }
@@ -141,7 +144,7 @@ public sealed class LlmEntityExtractor
             OcrPageResult[] pages;
             lock (_gate)
             {
-                tail = _buffer.FlushRemainder();
+                tail = CollectSendable(_buffer.FlushRemainder(), flushHeld: true);
                 pages = _buffer.NonEmptyPages.ToArray();
             }
 
@@ -194,6 +197,62 @@ public sealed class LlmEntityExtractor
             {
                 // Caller is already on a failure path.
             }
+        }
+
+        /// <summary>
+        /// Groups already emitted stay unsent until the next non-empty page can supply
+        /// a 240-character head. <paramref name="flushHeld"/> sends the trailing group
+        /// with no further lookahead; that is the end of the document.
+        /// </summary>
+        private List<LlmPageGrouper.PageBatch> CollectSendable(
+            List<LlmPageGrouper.PageBatch> emitted,
+            bool flushHeld)
+        {
+            List<LlmPageGrouper.PageBatch> send = [];
+            foreach (LlmPageGrouper.PageBatch batch in emitted)
+            {
+                if (_held is { } previous)
+                    send.Add(WithLookahead(previous));
+                _held = batch;
+            }
+
+            if (_held is { } waiting && (flushHeld || HasLaterNonEmpty(waiting)))
+            {
+                send.Add(WithLookahead(waiting));
+                _held = null;
+            }
+
+            return send;
+        }
+
+        private bool HasLaterNonEmpty(LlmPageGrouper.PageBatch batch)
+        {
+            int last = batch.PageNumbers.Length == 0 ? 0 : batch.PageNumbers[^1];
+            foreach (OcrPageResult known in _buffer.NonEmptyPages)
+            {
+                if (known.Page > last && !string.IsNullOrEmpty(ClusterNerPrompt.Head(known.Text)))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private LlmPageGrouper.PageBatch WithLookahead(LlmPageGrouper.PageBatch batch)
+        {
+            int last = batch.PageNumbers.Length == 0 ? 0 : batch.PageNumbers[^1];
+            foreach (OcrPageResult known in _buffer.NonEmptyPages)
+            {
+                if (known.Page <= last)
+                    continue;
+                string head = ClusterNerPrompt.Head(known.Text);
+                if (head.Length == 0)
+                    continue;
+                return new LlmPageGrouper.PageBatch(
+                    ClusterNerPrompt.WithLookahead(batch.Text, head, known.Page),
+                    batch.PageNumbers);
+            }
+
+            return batch;
         }
 
         private void Queue(LlmPageGrouper.PageBatch batch)

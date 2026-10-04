@@ -637,6 +637,142 @@ Console.WriteLine("=== NER failure and lease expiry ===");
     AssertTrue(leaseSched.IsComplete, "job completes on the retry node");
 }
 
+Console.WriteLine("=== NER timeout and node drop count toward give-up ===");
+{
+    DateTimeOffset now = new(2026, 4, 2, 0, 0, 0, TimeSpan.Zero);
+    ClusterNerScheduler timeouts = new(new ClusterNerOptions
+    {
+        PageCount = 1,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LeaseMs = 5_000,
+        MaxAttempts = 2,
+        LocalNodeId = "coord",
+    });
+    timeouts.SetNerCapacity("worker-a", 1);
+    timeouts.AddPage(new OcrPageResult { Page = 1, Text = "甲方北京华腾科技有限公司与张伟签订合同" });
+    timeouts.Seal();
+    ClusterNerAssignment firstLease = timeouts.Claim("worker-a", now);
+    AssertTrue(firstLease.Kind == ClusterNerClaimKind.Group, "timeout fixture leased the group");
+    ClusterNerAssignment secondLease = timeouts.Claim("worker-a", now.AddMilliseconds(firstLease.LeaseMs + 1));
+    AssertTrue(secondLease.Kind == ClusterNerClaimKind.Group && secondLease.GroupId == firstLease.GroupId,
+        "the first NER lease expiry is retried");
+    ClusterNerAssignment givenUp = timeouts.Claim("worker-a", now.AddMilliseconds((firstLease.LeaseMs + 1) * 2));
+    AssertTrue(givenUp.Kind == ClusterNerClaimKind.Done, "the second NER lease expiry gives the group up");
+    AssertTrue(timeouts.IsComplete, "give-up after repeated timeouts still finishes NER");
+    ClusterNerGiveUp[] timeoutGives = timeouts.DrainGiveUps();
+    AssertTrue(timeoutGives.Length == 1 && timeoutGives[0].Attempts == 2, "timeout give-up records both attempts");
+    AssertTrue(!timeouts.TryComplete(secondLease.GroupId, "worker-a", ["北京华腾科技有限公司"], ["张伟"], null),
+        "the owner that timed out cannot commit after give-up");
+    AssertTrue(timeouts.Merge().Companies.Count == 0 && timeouts.Merge().Persons.Count == 0,
+        "a group given up on timeout adds no names");
+
+    ClusterNerScheduler dropped = new(new ClusterNerOptions
+    {
+        PageCount = 1,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LeaseMs = 30_000,
+        MaxAttempts = 2,
+        LocalNodeId = "coord",
+    });
+    dropped.SetNerCapacity("worker-a", 1);
+    dropped.SetNerCapacity("coord", 1);
+    dropped.AddPage(new OcrPageResult { Page = 1, Text = "甲方北京华腾科技有限公司与张伟签订合同" });
+    dropped.Seal();
+    ClusterNerAssignment owned = dropped.Claim("worker-a", now);
+    dropped.DropNode("worker-a", now);
+    ClusterNerAssignment again = dropped.Claim("worker-a", now);
+    AssertTrue(again.Kind == ClusterNerClaimKind.Group && again.GroupId == owned.GroupId,
+        "leaving once requeues the NER group");
+    dropped.DropNode("worker-a", now);
+    AssertTrue(dropped.IsComplete, "leaving twice at max attempts finishes the group");
+    AssertTrue(dropped.DrainGiveUps().Length == 1, "a node that keeps leaving is reported");
+    AssertTrue(dropped.Claim("coord", now).Kind == ClusterNerClaimKind.Done, "no further NER claim after give-up");
+
+    ClusterNerScheduler takeover = new(new ClusterNerOptions
+    {
+        PageCount = 1,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LeaseMs = 30_000,
+        MaxAttempts = 1,
+        LocalNodeId = "coord",
+    });
+    takeover.SetNerCapacity("remote", 1);
+    takeover.SetNerCapacity("coord", 1);
+    takeover.AddPage(new OcrPageResult { Page = 1, Text = "甲方北京华腾科技有限公司与张伟签订合同" });
+    takeover.Seal();
+    ClusterNerAssignment remote = takeover.Claim("remote", now);
+    AssertTrue(remote.Kind == ClusterNerClaimKind.Group, "remote holds the group before deadline takeover");
+    takeover.TakeOverLocal(now);
+    ClusterNerAssignment local = takeover.Claim("coord", now);
+    AssertTrue(local.Kind == ClusterNerClaimKind.Group && local.GroupId == remote.GroupId,
+        "deadline takeover does not consume an attempt");
+    AssertTrue(takeover.TryComplete(local.GroupId, "coord", ["北京华腾科技有限公司"], ["张伟"], null),
+        "local node commits the taken-over group");
+}
+
+Console.WriteLine("=== NER stops only after unfinished groups are closed ===");
+{
+    ClusterNerScheduler partial = new(new ClusterNerOptions
+    {
+        PageCount = 2,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LeaseMs = 30_000,
+        MaxAttempts = 4,
+        LocalNodeId = "coord",
+    });
+    partial.SetNerCapacity("worker-a", 1);
+    partial.AddPage(new OcrPageResult { Page = 1, Text = "甲方北京华腾科技有限公司与张伟签订合同" });
+    partial.AddPage(new OcrPageResult { Page = 2, Text = "第二页没有新的公司，只是续写条款。" });
+    partial.Seal();
+    DateTimeOffset now = DateTimeOffset.UtcNow;
+    ClusterNerAssignment done = partial.Claim("worker-a", now);
+    AssertTrue(done.Pages.SequenceEqual([1]), "first group is page 1");
+    AssertTrue(partial.TryComplete(done.GroupId, "worker-a", ["北京华腾科技有限公司"], ["张伟"], null),
+        "page 1 group succeeds");
+    partial.SetNerCapacity("worker-a", 0);
+    AssertTrue(!partial.IsComplete, "page 2 is still queued when the only LLM node drops its capacity");
+    AssertTrue(partial.TryFinishWithoutCapacity(), "no remaining capacity closes the queued group");
+    AssertTrue(partial.IsComplete, "NER is complete after the queued group is abandoned");
+    ClusterNerGiveUp[] skipped = partial.DrainGiveUps();
+    AssertTrue(skipped.Length == 1 && skipped[0].Pages.SequenceEqual([2]), "the unrun group is logged, not dropped silently");
+    OcrEntities kept = partial.Merge();
+    AssertTrue(kept.Companies.Any(c => c.Name == "北京华腾科技有限公司") && kept.Persons.Any(p => p.Name == "张伟"),
+        "names from the finished group survive the abandon");
+
+    ClusterNerScheduler none = new(new ClusterNerOptions
+    {
+        PageCount = 1,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LocalNodeId = "coord",
+    });
+    none.AddPage(new OcrPageResult { Page = 1, Text = "没有任何节点能抽取的正文" });
+    none.Seal();
+    AssertTrue(none.TryFinishWithoutCapacity(), "no capacity and no success lets the caller fall back");
+    AssertTrue(!none.IsComplete && none.DrainGiveUps().Length == 0 && !none.SawSuccessfulExtract,
+        "fallback does not pretend the group ran");
+
+    ClusterNerScheduler busy = new(new ClusterNerOptions
+    {
+        PageCount = 1,
+        PagesPerRequest = 1,
+        MaxChars = 10_000,
+        LeaseMs = 30_000,
+        LocalNodeId = "coord",
+    });
+    busy.SetNerCapacity("worker-a", 1);
+    busy.AddPage(new OcrPageResult { Page = 1, Text = "正在抽取的一页正文" });
+    busy.Seal();
+    AssertTrue(busy.Claim("worker-a", now).Kind == ClusterNerClaimKind.Group, "a node still holds the group");
+    busy.SetNerCapacity("worker-a", 0);
+    AssertTrue(!busy.TryFinishWithoutCapacity() && !busy.IsComplete,
+        "an in-flight group is not abandoned just because capacity dropped");
+}
+
 Console.WriteLine("=== NER capacity and give-up ===");
 {
     ClusterNerScheduler sched = new(new ClusterNerOptions
