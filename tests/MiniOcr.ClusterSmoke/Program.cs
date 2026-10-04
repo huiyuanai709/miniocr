@@ -1005,6 +1005,42 @@ Console.WriteLine("=== pdf range and read cancel ===");
     AssertTrue(job.SourceUrl == "http://files.example/a.pdf", "source url is kept on the job");
 }
 
+Console.WriteLine("=== text-layer pages skip the OCR queue ===");
+ClusterPageScheduler textSched = new(new ClusterScheduleOptions
+{
+    PageCount = 4,
+    LocalNodeId = "local",
+    PrecompletedPages = [0, 2],
+});
+AssertTrue(textSched.IsPageDone(0) && textSched.IsPageDone(2), "text-layer pages start done");
+AssertTrue(!textSched.IsPageDone(1) && !textSched.IsPageDone(3), "ocr pages stay pending");
+List<int> claimedPages = [];
+while (true)
+{
+    ClusterClaim claim = textSched.Claim("local", 4, DateTimeOffset.UtcNow);
+    if (claim.Kind != ClusterClaimKind.Batch)
+        break;
+    foreach (int page in claim.Pages)
+    {
+        claimedPages.Add(page);
+        AssertTrue(textSched.TryCommit(claim.BatchId, page), "commit ocr page " + page);
+    }
+
+    textSched.ReleaseBatch(claim.BatchId);
+}
+
+AssertTrue(!claimedPages.Contains(1) && !claimedPages.Contains(3), "text-layer pages are not claimed");
+AssertTrue(claimedPages.Contains(2) && claimedPages.Contains(4), "ocr pages are claimed");
+AssertTrue(textSched.IsComplete, "scheduler completes after the ocr pages");
+ClusterPageScheduler allText = new(new ClusterScheduleOptions
+{
+    PageCount = 3,
+    LocalNodeId = "local",
+    PrecompletedPages = [0, 1, 2],
+});
+ClusterClaim nothing = allText.Claim("local", 4, DateTimeOffset.UtcNow);
+AssertTrue(nothing.Kind == ClusterClaimKind.Done, "a text-only document has no OCR batches");
+
 if (failed > 0)
 {
     Console.WriteLine($"FAILED {failed}");

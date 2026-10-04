@@ -21,6 +21,12 @@ public sealed class OcrRuntimeConfig
     public string RenderMode { get; init; } = "parallel";
     /// <summary>Worker processes used when <see cref="RenderMode"/> is <c>parallel</c>.</summary>
     public int RenderProcessCount { get; init; } = 1;
+    /// <summary><c>auto</c> (default), <c>off</c>, or <c>force</c>.</summary>
+    public string TextLayer { get; init; } = "auto";
+    public int TextLayerMinChars { get; init; } = 40;
+    public double TextLayerMaxUnknownRatio { get; init; } = 0.02;
+    public double TextLayerImageCoverage { get; init; } = 0.55;
+    public int TextLayerImageMinChars { get; init; } = 200;
     public int RecBatchLines { get; init; }
     public int DetLimitSideLength { get; init; }
     public bool AutoScaleFromCpu { get; init; }
@@ -117,6 +123,20 @@ public sealed class OcrRuntimeConfig
             fixedFallback: renderAuto);
         renderProcesses = Math.Clamp(renderProcesses, 1, 8);
 
+        string textLayer = ResolveTextLayer(ocr.TextLayer);
+        int textMinChars = Math.Clamp(
+            ResolveInt("MINIOCR_TEXT_LAYER_MIN_CHARS", ocr.TextLayerMinChars, 40, autoScale: true, fixedFallback: 40),
+            1, 100_000);
+        double textUnknown = Math.Clamp(
+            ResolveDouble("MINIOCR_TEXT_LAYER_MAX_UNKNOWN_RATIO", ocr.TextLayerMaxUnknownRatio, 0.02),
+            0, 1);
+        double textImage = Math.Clamp(
+            ResolveDouble("MINIOCR_TEXT_LAYER_IMAGE_COVERAGE", ocr.TextLayerImageCoverage, 0.55),
+            0, 1);
+        int textImageChars = Math.Clamp(
+            ResolveInt("MINIOCR_TEXT_LAYER_IMAGE_MIN_CHARS", ocr.TextLayerImageMinChars, 200, autoScale: true, fixedFallback: 200),
+            1, 100_000);
+
         int recBatch = Math.Clamp(ReadInt("MINIOCR_REC_BATCH", 8), 1, 64);
         int detLimit = Math.Clamp(ReadInt("MINIOCR_DET_LIMIT_SIDE", 960), 64, 4096);
 
@@ -160,6 +180,11 @@ public sealed class OcrRuntimeConfig
             RasterWorkerCount = raster,
             RenderMode = renderMode,
             RenderProcessCount = renderProcesses,
+            TextLayer = textLayer,
+            TextLayerMinChars = textMinChars,
+            TextLayerMaxUnknownRatio = textUnknown,
+            TextLayerImageCoverage = textImage,
+            TextLayerImageMinChars = textImageChars,
             RecBatchLines = recBatch,
             DetLimitSideLength = detLimit,
             AutoScaleFromCpu = autoScale,
@@ -262,6 +287,11 @@ public sealed class OcrRuntimeConfig
         RasterWorkerCount = RasterWorkerCount,
         RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),
         RenderProcessCount = RenderProcessCount,
+        TextLayer = TextLayer,
+        TextLayerMinChars = TextLayerMinChars,
+        TextLayerMaxUnknownRatio = TextLayerMaxUnknownRatio,
+        TextLayerImageCoverage = TextLayerImageCoverage,
+        TextLayerImageMinChars = TextLayerImageMinChars,
         RecBatchLines = RecBatchLines,
         DetLimitSideLength = DetLimitSideLength,
         AutoScaleFromCpu = AutoScaleFromCpu,
@@ -276,6 +306,9 @@ public sealed class OcrRuntimeConfig
 
     public bool IsParallelRender =>
         string.Equals(RenderMode, "parallel", StringComparison.OrdinalIgnoreCase);
+
+    public bool TextLayerEnabled =>
+        !string.Equals(TextLayer, "off", StringComparison.OrdinalIgnoreCase);
 
     public bool IsLlmMode =>
         string.Equals(Mode, "llm", StringComparison.OrdinalIgnoreCase);
@@ -310,6 +343,34 @@ public sealed class OcrRuntimeConfig
         if (string.Equals(raw, "inprocess", StringComparison.OrdinalIgnoreCase))
             return "inprocess";
         return "parallel";
+    }
+
+    /// <summary>
+    /// Env MINIOCR_OCR_TEXT_LAYER overrides file. Accepts auto|off|force (case-insensitive).
+    /// Unknown values fall back to auto.
+    /// </summary>
+    public static string ResolveTextLayer(string? fileMode)
+    {
+        string? env = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
+        string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "auto");
+        return CanonicalTextLayer(raw);
+    }
+
+    public static string CanonicalTextLayer(string? raw)
+    {
+        if (string.Equals(raw, "off", StringComparison.OrdinalIgnoreCase))
+            return "off";
+        if (string.Equals(raw, "force", StringComparison.OrdinalIgnoreCase))
+            return "force";
+        return "auto";
+    }
+
+    private static double ResolveDouble(string envName, double? fileValue, double fallback)
+    {
+        string? raw = Environment.GetEnvironmentVariable(envName);
+        if (double.TryParse(raw, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double fromEnv))
+            return fromEnv;
+        return fileValue ?? fallback;
     }
 
     /// <summary>

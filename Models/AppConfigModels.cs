@@ -65,6 +65,16 @@ public sealed class OcrFileConfig
     public string RenderMode { get; set; } = "parallel";
     /// <summary>Worker processes when <see cref="RenderMode"/> is <c>parallel</c>. Null = auto from cores and engine count.</summary>
     public int? RenderProcesses { get; set; }
+    /// <summary><c>auto</c> (default), <c>off</c>, or <c>force</c>. <c>auto</c> skips raster and OCR when the PDF text layer looks usable.</summary>
+    public string TextLayer { get; set; } = "auto";
+    /// <summary>Non-whitespace characters required on a normal text page. Null = 40.</summary>
+    public int? TextLayerMinChars { get; set; }
+    /// <summary>Unknown / U+FFFD / invalid characters divided by PDFium character count. Null = 0.02.</summary>
+    public double? TextLayerMaxUnknownRatio { get; set; }
+    /// <summary>Image-area coverage at or above this treats the page as a scan. Null = 0.55.</summary>
+    public double? TextLayerImageCoverage { get; set; }
+    /// <summary>Non-whitespace characters required on an image-heavy page or a hidden OCR layer. Null = 200.</summary>
+    public int? TextLayerImageMinChars { get; set; }
     public bool? UseCls { get; set; }
     public bool AutoScaleFromCpu { get; set; } = true;
 

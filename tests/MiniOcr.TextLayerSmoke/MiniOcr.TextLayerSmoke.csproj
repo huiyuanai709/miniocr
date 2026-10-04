@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MiniOcr.TextLayerSmoke</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <PublishAot>false</PublishAot>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\external\PDFtoImage\src\PDFtoImage\PDFtoImage.csproj" />
+    <Compile Include="..\..\Services\PdfTextLayer.cs" Link="PdfTextLayer.cs" />
+    <Compile Include="..\..\Services\LlmPageGrouper.cs" Link="LlmPageGrouper.cs" />
+    <Compile Include="..\..\Services\EntityText.cs" Link="EntityText.cs" />
+    <Compile Include="..\..\Services\ChallengeResultMapper.cs" Link="ChallengeResultMapper.cs" />
+    <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />
+    <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
+    <Compile Include="..\..\Models\ClusterModels.cs" Link="ClusterModels.cs" />
+  </ItemGroup>
+
+</Project>

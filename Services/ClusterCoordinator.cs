@@ -331,6 +331,21 @@ public sealed class ClusterCoordinator : IHostedService
             string.IsNullOrWhiteSpace(error) ? "failed" : error);
     }
 
+    private static int[] TextLayerIndexes(IReadOnlyList<OcrPageResult>? pages, int pageCount)
+    {
+        if (pages is null || pages.Count == 0 || pageCount <= 0)
+            return [];
+        List<int> indexes = new(pages.Count);
+        foreach (OcrPageResult page in pages)
+        {
+            int index = page.Page - 1;
+            if ((uint)index < (uint)pageCount)
+                indexes.Add(index);
+        }
+
+        return indexes.ToArray();
+    }
+
     public async Task<ClusterRunResult> RunJobAsync(
         byte[] pdf,
         int pdfLength,
@@ -340,10 +355,12 @@ public sealed class ClusterCoordinator : IHostedService
         Func<int[], string, ClusterJob, CancellationToken, Task> recognizeLocal,
         Action<OcrPageResult> onAccepted,
         bool distributeNer,
+        IReadOnlyList<OcrPageResult>? textLayerPages,
         CancellationToken ct)
     {
         string id = Guid.NewGuid().ToString("N");
         List<ClusterRemote> remotes = _registry.Remotes();
+        int[] precompleted = TextLayerIndexes(textLayerPages, pageCount);
         var scheduler = new ClusterPageScheduler(new ClusterScheduleOptions
         {
             PageCount = pageCount,
@@ -354,6 +371,7 @@ public sealed class ClusterCoordinator : IHostedService
             LeaseCapMs = Math.Max(_config.LeaseFloorMs, 180_000),
             SpeculativeTailPages = _config.SpeculativeTailPages,
             ExpectedNodes = Math.Max(1, 1 + remotes.Count),
+            PrecompletedPages = precompleted,
         });
 
         int localCap = Math.Max(1, _registry.LocalCapacity);
@@ -404,13 +422,21 @@ public sealed class ClusterCoordinator : IHostedService
             if (!job.DeferProgress)
                 MaybeLogProgress(job);
         });
+        if (textLayerPages is not null)
+        {
+            foreach (OcrPageResult page in textLayerPages)
+                job.AcceptPrepared(page);
+        }
+
         _jobs[id] = job;
 
         WarnModelMismatch(remotes, dpi);
         _logger.LogInformation(
-            "Cluster job {JobId} start: pages={Pages}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}",
+            "Cluster job {JobId} start: pages={Pages}, textLayer={TextLayer}, ocr={Ocr}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}",
             id,
             pageCount,
+            precompleted.Length,
+            pageCount - precompleted.Length,
             pdfLength,
             dpi,
             remotes.Count,

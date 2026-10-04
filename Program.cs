@@ -164,6 +164,7 @@ Console.WriteLine(
     $"lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"useCls={runtimeConfig.UseDirectionClassification}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
     $"renderMode={runtimeConfig.RenderMode}, renderProcesses={runtimeConfig.RenderProcessCount}, " +
+    $"textLayer={runtimeConfig.TextLayer}, " +
     $"wechatInstances={runtimeConfig.WeChatInstances}, wechatStatus={wechatStatus}");
 Console.WriteLine(
     $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
@@ -379,6 +380,7 @@ app.MapGet("/health", (IServiceProvider sp) =>
             RasterWorkerCount = cfg.RasterWorkerCount,
             RenderMode = cfg.RenderMode,
             RenderProcessCount = cfg.RenderProcessCount,
+            TextLayer = cfg.TextLayer,
             RecBatchLines = cfg.RecBatchLines,
             DetLimitSideLength = cfg.DetLimitSideLength,
             AutoScaleFromCpu = cfg.AutoScaleFromCpu,

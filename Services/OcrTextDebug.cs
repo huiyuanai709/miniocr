@@ -18,6 +18,7 @@ public static class OcrTextDebug
                 RasterizeMs = page.RasterizeMs,
                 OcrMs = page.OcrMs,
                 Text = page.Text ?? "",
+                Source = string.IsNullOrEmpty(page.Source) ? "ocr" : page.Source,
             });
         }
 
@@ -30,6 +31,9 @@ public static class OcrTextDebug
             PageCount = ocr.PageCount,
             MsPerPage = Math.Round(msPerPage, 1),
             Timings = ocr.Timings,
+            TextLayerMode = string.IsNullOrEmpty(ocr.TextLayerMode) ? "auto" : ocr.TextLayerMode,
+            TextLayerPages = ocr.TextLayerPageCount,
+            OcrPages = ocr.OcrPageCount,
             Pages = pages,
         };
     }

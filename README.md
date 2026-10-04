@@ -254,6 +254,7 @@ cd artifacts/linux-x64-singlefile
     "detThreads": null,
     "rasterWorkers": null,
     "renderMode": "parallel",
+    "textLayer": "auto",
     "renderProcesses": null,
     "useCls": false,
     "autoScaleFromCpu": true,
@@ -269,7 +270,7 @@ cd artifacts/linux-x64-singlefile
 
 **优先级：**
 
-- OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`。`MINIOCR_RENDER_MODE` 覆盖 `ocr.renderMode`。
+- OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`。`MINIOCR_RENDER_MODE` 覆盖 `ocr.renderMode`。`MINIOCR_OCR_TEXT_LAYER` 覆盖 `ocr.textLayer`。
 - LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_PAGES_PER_REQUEST` / `MINIOCR_LLM_OCR_CONCURRENCY` / `MINIOCR_LLM_OCR_JPEG_QUALITY` / `MINIOCR_LLM_THINKING` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
 
 #### OCR 模式：`local` vs `llm`（视觉 OCR）
@@ -377,6 +378,11 @@ cd artifacts/linux-x64-singlefile
 | `MINIOCR_USE_CLS` | `ocr.useCls` | **false** | 是否启用方向分类 |
 | `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm：`min(8,cores)`） | 进程内 PDF 栅格生产者（封顶 8）。`renderMode=parallel` 时只在回退路径使用 |
 | `MINIOCR_RENDER_MODE` | `ocr.renderMode` | **parallel** | `parallel`（`PDFtoImage.Parallel` 工作进程）或 `inprocess`（进程内 `ToImages`）。未知值回退 `parallel` |
+| `MINIOCR_OCR_TEXT_LAYER` | `ocr.textLayer` | **auto** | `auto`：页上有够用的文本层就直接当 OCR 结果，跳过栅格和识别。`off` 一律栅格+OCR。`force` 只要抽得出非空白文本就用，否则仍 OCR。未知值回退 `auto` |
+| `MINIOCR_TEXT_LAYER_MIN_CHARS` | `ocr.textLayerMinChars` | 40 | 普通文本页至少这么多非空白字符才短路 |
+| `MINIOCR_TEXT_LAYER_MAX_UNKNOWN_RATIO` | `ocr.textLayerMaxUnknownRatio` | 0.02 | 未知 / U+FFFD / 非法字符占 PDFium 字符数的上限，超过则 OCR |
+| `MINIOCR_TEXT_LAYER_IMAGE_COVERAGE` | `ocr.textLayerImageCoverage` | 0.55 | 图片面积占比达到该值视为扫描页 |
+| `MINIOCR_TEXT_LAYER_IMAGE_MIN_CHARS` | `ocr.textLayerImageMinChars` | 200 | 扫描页或隐形 OCR 层（文本渲染模式 3）至少这么多非空白字符，且未知字符比例合格，才当成可用文本 |
 | `MINIOCR_RENDER_PROCESSES` | `ocr.renderProcesses` | 自动，见下 | `parallel` 的工作进程数。未设置时 `Clamp(min(4, max(1, cores−engines)), 1, 4)`；显式值钳制 **1–8** |
 | `MINIOCR_REC_BATCH` | — | **8** | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | — | **960** | 检测 `LimitSideLength` |
@@ -408,9 +414,13 @@ cd artifacts/linux-x64-singlefile
 
 三种模式的 OCR 文本 SHA-256 相同（`4de7fa77231623b41ab6572c6ad0b91506b21b4e15f16926ffb68c701d2b09ac`），页序正确，临时 PDF 已删除。OCR 忙时和墙钟几乎重合，引擎没有在等栅格。这份扫描件上并行栅格没有缩短端到端时间；默认仍然是 `parallel`，`MINIOCR_RENDER_MODE=inprocess` 可以切回进程内。
 
+`ocr.textLayer` 默认 **`auto`**。每一页先用 `PdfSession.AnalyzePage` 读阅读顺序文本和内容统计（字符数、未知字符、图片面积占比、文本对象是否全部为渲染模式 3 的隐形层）。普通页非空白字符不少于 `textLayerMinChars` 且未知字符比例不超过 `textLayerMaxUnknownRatio` 时，抽出的文本就是该页 OCR 结果，不再栅格、不再送识别。整页图片（面积占比 ≥ `textLayerImageCoverage`）如果只有标题/少量字，以及隐形 OCR 层质量不够（字符太少或未知字符太多），仍走栅格+OCR。`force` 只要有非空白文本就用；完全没有文本层的页照样 OCR。`off` 或 `MINIOCR_OCR_TEXT_LAYER=off` 关闭短路。换行收成 `\n`，和 Paddle 页文本一样，LLM NER 与 `EntityPostProcessor` 不用改。每页 `source` 为 `textLayer` 或 `ocr`；日志有单页原因和 `textLayer=` / `ocr=` 汇总，`?verbose=1` 与 `GET /health` 也能看到。集群协调节点先对全书分类，文本层页立刻算完成并进入 NER 分组，工人只领取还要 OCR 的页。`renderMode` 为 `parallel` 或 `inprocess` 都先分类再栅格剩余页。
+
+本机 1 个引擎、72 DPI、`parallel`：40 页纯文本 `auto` 墙钟 **53ms**（40 页全是 `textLayer`，栅格和 OCR 都是 0），`off` 为 **4.3s**。20 页文本 + 10 页扫描：`auto` **1.14s**（只 OCR 那 10 页），`off` **2.10s**。同一份 40 页文本在 `inprocess` + `auto` 也是约 51ms。抽出的文本和关掉短路后的 OCR 文本长度几乎相同（3071 / 3075 字符）。
+
 同一份 5 页样例在 linux-x64 Native AOT 和 linux-x64 单文件上用 `parallel` ×2 跑过：文本哈希与进程内一致，日志里只有一次加载模型和一次监听，工作进程是再启动后的本可执行文件（进程树上父进程 + 2 个子进程），没有另起 Web 主机。win-x64 单文件可以在 Linux 上交叉发布，包内含 `pdfium.dll` / `libSkiaSharp.dll`，并且 `StartupHookProvider.IsSupported=true`；win-x64 Native AOT 不能在 Linux 上交叉编译（`Cross-OS native compilation is not supported`），要在 Windows CI 上编。
 
-启动时日志打印 `ProcessorCount` 与选定的 engines/line/det/raster/renderMode/renderProcesses；`GET /health` 同样暴露这些字段及绝对 `configPath` / `configFileExisted` / LLM 状态（`llmApiKey` 仅为 `(set)`/`(empty)`）。
+启动时日志打印 `ProcessorCount` 与选定的 engines/line/det/raster/renderMode/renderProcesses/textLayer；`GET /health` 同样暴露这些字段及绝对 `configPath` / `configFileExisted` / LLM 状态（`llmApiKey` 仅为 `(set)`/`(empty)`）。
 
 > 更快可降 `MINIOCR_DPI=45`；更高精度可设 `MINIOCR_DPI=150`、`MINIOCR_USE_CLS=1`。显式设置 env/文件中的 engines 等会关闭对该项的自动推算。
 
@@ -643,7 +653,7 @@ The current CPU is missing one or more of the required instruction sets.
 | 环节 | 策略 |
 | --- | --- |
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
-| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale`。默认 `renderMode=parallel`：长期存活的 `PDFtoImage.Parallel` 进程池，整本 PDF 只写一次临时文件并内存映射（工作进程不各自拷贝大 PDF）；灰度页走 Gray8 传输后在宿主展开为 BGRA。启动时若拉不起工作进程，打日志并在本进程生命周期内改走 `inprocess`（每 worker 一次 `ToImages`）。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
+| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale`。默认 `textLayer=auto`：先分析文本层，能用的页不栅格。默认 `renderMode=parallel`：长期存活的 `PDFtoImage.Parallel` 进程池，整本 PDF 只写一次临时文件并内存映射（工作进程不各自拷贝大 PDF）；灰度页走 Gray8 传输后在宿主展开为 BGRA。启动时若拉不起工作进程，打日志并在本进程生命周期内改走 `inprocess`（每 worker 一次 `ToImages`）。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
 | OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
 | 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。集群默认把这些组发给有 LLM key 的节点（`cluster.distributedNer`），协调节点合并去重。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
@@ -661,7 +671,7 @@ The current CPU is missing one or more of the required instruction sets.
 | --- | --- |
 | `external/SimdPaddleOCR` @ `6aae0ad` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
 | 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
-| `external/PDFtoImage` @ `f65215f` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfSession` Gray8、`PDFtoImage.Parallel`，以及 net11.0 的 `runtime-async`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
+| `external/PDFtoImage` @ `579b2f2` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfSession` Gray8、`AnalyzePage` 文本/内容统计、`PDFtoImage.Parallel`，以及 net11.0 的 `runtime-async`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
 
 ## API
 

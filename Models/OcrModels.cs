@@ -35,6 +35,9 @@ public sealed class OcrTextDebugResponse
     public int PageCount { get; set; }
     public double MsPerPage { get; set; }
     public OcrTimings Timings { get; set; } = new();
+    public string TextLayerMode { get; set; } = "auto";
+    public int TextLayerPages { get; set; }
+    public int OcrPages { get; set; }
     public List<OcrTextDebugPage> Pages { get; set; } = [];
 }
 
@@ -46,6 +49,8 @@ public sealed class OcrTextDebugPage
     public double RasterizeMs { get; set; }
     public double OcrMs { get; set; }
     public string Text { get; set; } = "";
+    /// <summary><c>textLayer</c> when the PDF text was used, otherwise <c>ocr</c>.</summary>
+    public string Source { get; set; } = "ocr";
 }
 
 public sealed class OcrPageResult
@@ -56,6 +61,8 @@ public sealed class OcrPageResult
     public string Text { get; set; } = "";
     public double RasterizeMs { get; set; }
     public double OcrMs { get; set; }
+    /// <summary><c>textLayer</c> when the PDF text was used, otherwise <c>ocr</c>.</summary>
+    public string Source { get; set; } = "ocr";
     /// <summary>Optional prebuilt contest rules (vision OCR). When set, mapper prefers these.</summary>
     public List<ChallengeRule>? RuleList { get; set; }
 }
@@ -91,6 +98,9 @@ public sealed class OcrResponse
     public int Dpi { get; set; }
     public OcrTimings Timings { get; set; } = new();
     public List<OcrPageResult> Pages { get; set; } = [];
+    public string TextLayerMode { get; set; } = "auto";
+    public int TextLayerPageCount { get; set; }
+    public int OcrPageCount { get; set; }
     public OcrEntities? Entities { get; set; }
     public string? Error { get; set; }
 }
@@ -111,6 +121,8 @@ public sealed class HealthResponse
     public string RenderMode { get; set; } = "parallel";
     /// <summary>PDFtoImage.Parallel worker processes. Unused while <see cref="RenderMode"/> is <c>inprocess</c>.</summary>
     public int RenderProcessCount { get; set; }
+    /// <summary><c>auto</c>, <c>off</c>, or <c>force</c>.</summary>
+    public string TextLayer { get; set; } = "auto";
     public int RecBatchLines { get; set; }
     public int DetLimitSideLength { get; set; }
     public bool AutoScaleFromCpu { get; set; }
