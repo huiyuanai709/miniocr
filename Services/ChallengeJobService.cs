@@ -21,6 +21,7 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
     private readonly PdfOcrPipeline _pipeline;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<ChallengeJobService> _logger;
+    private readonly ClusterCoordinator? _cluster;
     private readonly CancellationTokenSource _cts = new();
     private Task? _worker;
     private readonly SemaphoreSlim _jobGate = new(MaxConcurrentJobs, MaxConcurrentJobs);
@@ -29,12 +30,14 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         ParallelPdfDownloader downloader,
         PdfOcrPipeline pipeline,
         IHttpClientFactory httpClientFactory,
-        ILogger<ChallengeJobService> logger)
+        ILogger<ChallengeJobService> logger,
+        ClusterCoordinator? cluster = null)
     {
         _downloader = downloader;
         _pipeline = pipeline;
         _httpClientFactory = httpClientFactory;
         _logger = logger;
+        _cluster = cluster;
         _channel = Channel.CreateBounded<ChallengeJob>(new BoundedChannelOptions(32)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -149,6 +152,7 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
 
             try
             {
+                _cluster?.BeginSourcePrefetch(url);
                 ParallelPdfDownloader.DownloadResult download =
                     await _downloader.DownloadAsync(url, ct).ConfigureAwait(false);
                 using (download.Buffer)

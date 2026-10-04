@@ -340,7 +340,12 @@ if (clusterConfig.Enabled)
     }
 }
 
-builder.Services.AddSingleton<ChallengeJobService>();
+builder.Services.AddSingleton(sp => new ChallengeJobService(
+    sp.GetRequiredService<ParallelPdfDownloader>(),
+    sp.GetRequiredService<PdfOcrPipeline>(),
+    sp.GetRequiredService<IHttpClientFactory>(),
+    sp.GetRequiredService<ILogger<ChallengeJobService>>(),
+    sp.GetService<ClusterCoordinator>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChallengeJobService>());
 
 WebApplication app = builder.Build();
@@ -528,6 +533,7 @@ app.MapPost("/ocr", async Task<IResult> (
     ParallelPdfDownloader downloader,
     PdfOcrPipeline pipeline,
     OcrRuntimeConfig config,
+    IServiceProvider services,
     CancellationToken ct) =>
 {
     // Sync debug OCR: competition-compatible request/response shapes (same builders as callback).
@@ -644,6 +650,7 @@ app.MapPost("/ocr", async Task<IResult> (
         {
             string fileId = file.FileId ?? "f1";
             string url = file.Url!;
+            services.GetService<ClusterCoordinator>()?.BeginSourcePrefetch(url);
             ParallelPdfDownloader.DownloadResult download =
                 await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
             using (download.Buffer)

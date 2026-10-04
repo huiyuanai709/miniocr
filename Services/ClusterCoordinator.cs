@@ -50,6 +50,51 @@ public sealed class ClusterCoordinator : IHostedService
     public bool ShouldDistribute() =>
         _config.Enabled && _config.IsCoordinator && _registry.HasPotentialRemote;
 
+    /// <summary>
+    /// Tell workers the source URL before this node's own download finishes, so the two
+    /// fetches overlap. No job and no page lease: the real notify still carries page count.
+    /// </summary>
+    public void BeginSourcePrefetch(string? sourceUrl)
+    {
+        if (!ShouldDistribute() || string.IsNullOrWhiteSpace(sourceUrl) || string.IsNullOrWhiteSpace(_config.AdvertiseUrl))
+            return;
+        string url = sourceUrl.Trim();
+        if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            return;
+        List<ClusterRemote> remotes = _registry.Remotes();
+        if (remotes.Count == 0)
+            return;
+
+        var body = new ClusterNotifyRequest
+        {
+            JobId = "prefetch",
+            CoordinatorUrl = _config.AdvertiseUrl,
+            Dpi = 0,
+            PageCount = 0,
+            SourceUrl = url,
+            Prefetch = true,
+        };
+        _logger.LogInformation(
+            "Cluster prefetch: notifying {Remotes} workers to download the source while this node downloads",
+            remotes.Count);
+        _ = PrefetchNotifyAsync(remotes, body);
+    }
+
+    private async Task PrefetchNotifyAsync(List<ClusterRemote> remotes, ClusterNotifyRequest body)
+    {
+        try
+        {
+            HttpClient http = _httpFactory.CreateClient(HttpClientName);
+            await Task.WhenAll(remotes.Select(remote => NotifyOneAsync(http, remote, body, _cts.Token)))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Cluster source prefetch notify failed");
+        }
+    }
+
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         if (!_config.Enabled || !_config.IsCoordinator)
@@ -356,11 +401,13 @@ public sealed class ClusterCoordinator : IHostedService
         Action<OcrPageResult> onAccepted,
         bool distributeNer,
         IReadOnlyList<OcrPageResult>? textLayerPages,
-        CancellationToken ct)
+        CancellationToken ct,
+        Func<ClusterJob, CancellationToken, Task>? alongside = null)
     {
         string id = Guid.NewGuid().ToString("N");
         List<ClusterRemote> remotes = _registry.Remotes();
-        int[] precompleted = TextLayerIndexes(textLayerPages, pageCount);
+        bool streamClassify = alongside is not null;
+        int[] precompleted = streamClassify ? [] : TextLayerIndexes(textLayerPages, pageCount);
         var scheduler = new ClusterPageScheduler(new ClusterScheduleOptions
         {
             PageCount = pageCount,
@@ -372,6 +419,7 @@ public sealed class ClusterCoordinator : IHostedService
             SpeculativeTailPages = _config.SpeculativeTailPages,
             ExpectedNodes = Math.Max(1, 1 + remotes.Count),
             PrecompletedPages = precompleted,
+            DeferAdmission = streamClassify,
         });
 
         int localCap = Math.Max(1, _registry.LocalCapacity);
@@ -422,7 +470,7 @@ public sealed class ClusterCoordinator : IHostedService
             if (!job.DeferProgress)
                 MaybeLogProgress(job);
         });
-        if (textLayerPages is not null)
+        if (!streamClassify && textLayerPages is not null)
         {
             foreach (OcrPageResult page in textLayerPages)
                 job.AcceptPrepared(page);
@@ -431,19 +479,37 @@ public sealed class ClusterCoordinator : IHostedService
         _jobs[id] = job;
 
         WarnModelMismatch(remotes, dpi);
-        _logger.LogInformation(
-            "Cluster job {JobId} start: pages={Pages}, textLayer={TextLayer}, ocr={Ocr}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}",
-            id,
-            pageCount,
-            precompleted.Length,
-            pageCount - precompleted.Length,
-            pdfLength,
-            dpi,
-            remotes.Count,
-            localCap,
-            string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator");
+        if (streamClassify)
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} start: pages={Pages}, textLayer=streaming, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}",
+                id,
+                pageCount,
+                pdfLength,
+                dpi,
+                remotes.Count,
+                localCap,
+                string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator");
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} start: pages={Pages}, textLayer={TextLayer}, ocr={Ocr}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}",
+                id,
+                pageCount,
+                precompleted.Length,
+                pageCount - precompleted.Length,
+                pdfLength,
+                dpi,
+                remotes.Count,
+                localCap,
+                string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator");
+        }
 
         using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task? classify = alongside is null
+            ? null
+            : Task.Run(() => alongside(job, linked.Token), CancellationToken.None);
         Task notify = NotifyWorkersAsync(job, remotes, linked.Token);
         Task grace = HoldGraceAsync(job, expectRemote, linked.Token);
         Task deadline = DeadlineAsync(job, linked.Token);
@@ -454,8 +520,37 @@ public sealed class ClusterCoordinator : IHostedService
         int localFailures = 0;
         try
         {
+            async Task ObserveClassifyAsync()
+            {
+                Task? pending = classify;
+                if (pending is null)
+                    return;
+                try
+                {
+                    await pending.ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Cluster job {JobId} text-layer stream failed; admitting any page still invisible",
+                        id);
+                }
+
+                classify = null;
+                for (int i = 0; i < pageCount; i++)
+                    scheduler.AdmitPage(i);
+            }
+
             while (!ct.IsCancellationRequested)
             {
+                if (classify is { IsCompleted: true } || (scheduler.IsComplete && classify is not null))
+                {
+                    // IsComplete can flip on the last text page before AcceptPrepared returns.
+                    await ObserveClassifyAsync().ConfigureAwait(false);
+                    continue;
+                }
+
                 if (scheduler.IsComplete)
                     break;
 
@@ -510,6 +605,9 @@ public sealed class ClusterCoordinator : IHostedService
                 }
             }
 
+            if (!ct.IsCancellationRequested && classify is not null)
+                await ObserveClassifyAsync().ConfigureAwait(false);
+
             ct.ThrowIfCancellationRequested();
             job.DrainAccepts();
             if (!scheduler.IsComplete)
@@ -554,6 +652,8 @@ public sealed class ClusterCoordinator : IHostedService
         {
             job.MarkFinished();
             await linked.CancelAsync().ConfigureAwait(false);
+            if (classify is not null)
+                await Quiet(classify).ConfigureAwait(false);
             await Quiet(notify).ConfigureAwait(false);
             await Quiet(grace).ConfigureAwait(false);
             await Quiet(deadline).ConfigureAwait(false);
@@ -894,14 +994,33 @@ public sealed class ClusterCoordinator : IHostedService
         }
 
         job.MarkGraceElapsed();
-        bool stillDownloading = job.ShouldHoldLocal(DateTimeOffset.UtcNow);
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        bool stillDownloading = job.ShouldHoldLocal(now);
         job.Scheduler.SetHoldLocalWindow(stillDownloading);
-        _logger.LogInformation(
-            stillDownloading
-                ? "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; holding the local window while a node downloads the PDF"
-                : "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; local node may take remaining pages",
-            job.Id,
-            _config.JoinGraceMs);
+        if (stillDownloading)
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; holding the local window while a node downloads the PDF",
+                job.Id,
+                _config.JoinGraceMs);
+        }
+        else if (job.PageCount >= ClusterJob.DownloadHoldPageLimit &&
+                 job.AnyFreshDownload(now, ClusterJob.DownloadHold))
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; local window opens now (pageCount={Pages} >= {Limit}, not waiting out the worker download)",
+                job.Id,
+                _config.JoinGraceMs,
+                job.PageCount,
+                ClusterJob.DownloadHoldPageLimit);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; local node may take remaining pages",
+                job.Id,
+                _config.JoinGraceMs);
+        }
     }
 
     private async Task DeadlineAsync(ClusterJob job, CancellationToken ct)
@@ -969,13 +1088,12 @@ public sealed class ClusterCoordinator : IHostedService
             SourceUrl = string.IsNullOrWhiteSpace(job.SourceUrl) ? null : job.SourceUrl,
         };
 
-        await Task.WhenAll(remotes.Select(remote => NotifyOneAsync(http, job, remote, body, ct)))
+        await Task.WhenAll(remotes.Select(remote => NotifyOneAsync(http, remote, body, ct)))
             .ConfigureAwait(false);
     }
 
     private async Task NotifyOneAsync(
         HttpClient http,
-        ClusterJob job,
         ClusterRemote remote,
         ClusterNotifyRequest body,
         CancellationToken ct)
@@ -994,7 +1112,7 @@ public sealed class ClusterCoordinator : IHostedService
                 _logger.LogWarning(
                     "Cluster notify {Url} for job {JobId} returned {Status}. The worker can still poll.",
                     url,
-                    job.Id,
+                    body.JobId,
                     (int)resp.StatusCode);
             }
         }
@@ -1004,7 +1122,7 @@ public sealed class ClusterCoordinator : IHostedService
                 ex,
                 "Cluster notify {Url} for job {JobId} failed. The worker can still poll coordinatorUrl.",
                 url,
-                job.Id);
+                body.JobId);
         }
     }
 

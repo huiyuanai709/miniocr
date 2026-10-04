@@ -400,7 +400,7 @@ cd artifacts/linux-x64-singlefile
 | `rasterWorkers` | `Clamp(min(engines, cores/2), 1, 8)` |
 | `renderProcesses` | `Clamp(min(4, max(1, cores−engines)), 1, 4)` |
 
-`renderMode` 默认 **`parallel`**。PDFium 进程内有一把全局锁，多线程 `ToImages` 并不能并行栅格；`parallel` 把同一份临时 PDF 以内存映射交给长期存活的工作进程（灰度页在进程间按 Gray8 传输，宿主展开成 OCR 已直接使用的 BGRA8888）。要强制进程内栅格，设 `ocr.renderMode` 为 `inprocess` 或 `MINIOCR_RENDER_MODE=inprocess`。
+`renderMode` 默认 **`parallel`**。PDFium 进程内有一把全局锁，多线程 `ToImages` 并不能并行栅格；`parallel` 把同一份临时 PDF 以内存映射交给长期存活的工作进程（灰度页在进程间按 Gray8 传输，宿主展开成 OCR 已直接使用的 BGRA8888）。每个进程、每份 PDF 只写一次临时文件，后面的批次复用这个已打开的 `FileStream`（`leaveOpen`，`FileShare.Read|Delete`）。`PDFtoImage.Parallel` 已有的 `ReuseFileStream` 会按路径再打开同一文件，不需要改 fork 的 API。任务或工人会话结束时删掉这个文件。要强制进程内栅格，设 `ocr.renderMode` 为 `inprocess` 或 `MINIOCR_RENDER_MODE=inprocess`。
 
 启动时会先拉起一个工作进程渲染一页空白 PDF。这一步失败（例如容器禁止 `fork` / 无法再执行本程序）时，进程打出一行 `Parallel PDF render workers failed to start: … Falling back to in-process rendering (ocr.renderMode=inprocess).`，本进程此后改走进程内栅格，服务照常起来。请求进行中如果工作进程崩溃，丢掉进程池，未写入 Channel 的页仍改回进程内渲染；取消请求不回退。子进程是再次启动本可执行文件。Native AOT 在 `Main` 之前进入 worker。本仓库的普通 `dotnet run` 仍带着 AOT 的 feature switch（动态代码和 startup hook 都是关的），所以入口程序集里还有一个 module initializer，在 `Main` 之前调用同一个 worker 引导，避免子进程把 Web 主机和 OCR 模型再加载一遍。
 
@@ -414,7 +414,7 @@ cd artifacts/linux-x64-singlefile
 
 三种模式的 OCR 文本 SHA-256 相同（`4de7fa77231623b41ab6572c6ad0b91506b21b4e15f16926ffb68c701d2b09ac`），页序正确，临时 PDF 已删除。OCR 忙时和墙钟几乎重合，引擎没有在等栅格。这份扫描件上并行栅格没有缩短端到端时间；默认仍然是 `parallel`，`MINIOCR_RENDER_MODE=inprocess` 可以切回进程内。
 
-`ocr.textLayer` 默认 **`auto`**。每一页先用 `PdfSession.AnalyzePage` 读阅读顺序文本和内容统计（字符数、未知字符、图片面积占比、文本对象是否全部为渲染模式 3 的隐形层）。普通页非空白字符不少于 `textLayerMinChars` 且未知字符比例不超过 `textLayerMaxUnknownRatio` 时，抽出的文本就是该页 OCR 结果，不再栅格、不再送识别。整页图片（面积占比 ≥ `textLayerImageCoverage`）如果只有标题/少量字，以及隐形 OCR 层质量不够（字符太少或未知字符太多），仍走栅格+OCR。`force` 只要有非空白文本就用；完全没有文本层的页照样 OCR。`off` 或 `MINIOCR_OCR_TEXT_LAYER=off` 关闭短路。换行收成 `\n`，和 Paddle 页文本一样，LLM NER 与 `EntityPostProcessor` 不用改。每页 `source` 为 `textLayer` 或 `ocr`；日志有单页原因和 `textLayer=` / `ocr=` 汇总，`?verbose=1` 与 `GET /health` 也能看到。集群协调节点先对全书分类，文本层页立刻算完成并进入 NER 分组，工人只领取还要 OCR 的页。`renderMode` 为 `parallel` 或 `inprocess` 都先分类再栅格剩余页。
+`ocr.textLayer` 默认 **`auto`**。每一页先用 `PdfSession.AnalyzePage` 读阅读顺序文本和内容统计（字符数、未知字符、图片面积占比、文本对象是否全部为渲染模式 3 的隐形层）。普通页非空白字符不少于 `textLayerMinChars` 且未知字符比例不超过 `textLayerMaxUnknownRatio` 时，抽出的文本就是该页 OCR 结果，不再栅格、不再送识别。整页图片（面积占比 ≥ `textLayerImageCoverage`）如果只有标题/少量字，以及隐形 OCR 层质量不够（字符太少或未知字符太多），仍走栅格+OCR。`force` 只要有非空白文本就用；完全没有文本层的页照样 OCR。`off` 或 `MINIOCR_OCR_TEXT_LAYER=off` 关闭短路。换行收成 `\n`，和 Paddle 页文本一样，LLM NER 与 `EntityPostProcessor` 不用改。每页 `source` 为 `textLayer` 或 `ocr`；日志有单页原因和 `textLayer=` / `ocr=` 汇总，`?verbose=1` 与 `GET /health` 也能看到。单机仍先分完全书再栅格。集群在 `textLayer` 不为 `off` 时改成边分类边公布：文本层页立刻完成并进入 NER，其余页分类完才进入领取队列，所以通知工人不用等全书扫完。某一页若已经被租出去，文本层结果让路，仍是先提交的那一份。`off` 时所有页在任务开始时就进队列。`renderMode` 为 `parallel` 或 `inprocess` 都只栅格还要 OCR 的页。
 
 本机 1 个引擎、72 DPI、`parallel`：40 页纯文本 `auto` 墙钟 **53ms**（40 页全是 `textLayer`，栅格和 OCR 都是 0），`off` 为 **4.3s**。20 页文本 + 10 页扫描：`auto` **1.14s**（只 OCR 那 10 页），`off` **2.10s**。同一份 40 页文本在 `inprocess` + `auto` 也是约 51ms。抽出的文本和关掉短路后的 OCR 文本长度几乎相同（3071 / 3075 字符）。
 
@@ -653,7 +653,7 @@ The current CPU is missing one or more of the required instruction sets.
 | 环节 | 策略 |
 | --- | --- |
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
-| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale`。默认 `textLayer=auto`：先分析文本层，能用的页不栅格。默认 `renderMode=parallel`：长期存活的 `PDFtoImage.Parallel` 进程池，整本 PDF 只写一次临时文件并内存映射（工作进程不各自拷贝大 PDF）；灰度页走 Gray8 传输后在宿主展开为 BGRA。启动时若拉不起工作进程，打日志并在本进程生命周期内改走 `inprocess`（每 worker 一次 `ToImages`）。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
+| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale`。默认 `textLayer=auto`：先分析文本层，能用的页不栅格。默认 `renderMode=parallel`：长期存活的 `PDFtoImage.Parallel` 进程池。每个节点每个任务把 PDF 写到临时文件一次，各批次复用该文件并内存映射（工作进程不各自拷贝大 PDF），任务结束再删除；灰度页走 Gray8 传输后在宿主展开为 BGRA。启动时若拉不起工作进程，打日志并在本进程生命周期内改走 `inprocess`（每 worker 一次 `ToImages`）。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
 | OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
 | 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。集群默认把这些组发给有 LLM key 的节点（`cluster.distributedNer`），协调节点合并去重。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
@@ -713,15 +713,15 @@ The current CPU is missing one or more of the required instruction sets.
 
 拉模式，不是按页数切死：
 
-1. 协调节点创建任务，自己的引擎池是节点之一，立刻开始领页。任务若来自 http(s) 链接，调度响应和 `notify` 里带上原始 `sourceUrl`。
-2. 工人 `POST /cluster/dispatch` 轮询（或被 `POST /cluster/notify` 叫醒）后**先 `POST /join`（`downloading: true`）**，再下 PDF，下完再 `POST /join` 表示可以领页。协调节点从这一刻起就知道该工人在场，日志是 `joined, downloading PDF`，并在下载结束前（最多 30 秒）继续按住本地窗口，避免大文件下载期间协调节点独自做完前半本。
-3. PDF 优先用原始链接的 `ParallelPdfDownloader`（HEAD + 最多 8 路 Range，按 `Content-Length` 一次分配）。原始链接失败或不支持 Range 时，再向协调节点拉；协调节点的 `GET/HEAD /cluster/jobs/{id}/pdf` 同样返回 `Accept-Ranges: bytes` 和准确的 `Content-Length`。同一任务的字节缓存在工人进程里，再次加入不会重下。
+1. 协调节点一拿到 http(s) 链接就 `POST /cluster/notify`（`prefetch: true`，只有 `sourceUrl`，没有页数、不占会话名额）。工人立刻把这份 URL 下进进程内缓存，和协调节点自己的下载重叠。真正的任务通知仍在协调节点拿到字节和页数之后发出，带上 `pageCount`；`textLayer` 不为 `off` 时分类在这条通知之后继续流式进行，不再挡住通知。
+2. 工人 `POST /cluster/dispatch` 轮询（或被任务 `notify` 叫醒）后**先 `POST /join`（`downloading: true`）**，再下 PDF，下完再 `POST /join` 表示可以领页。预取已经完成时，第一次 `join` 就是 `downloading: false`。协调节点从这一刻起就知道该工人在场，日志是 `joined, downloading PDF`。页数少于 48 时，下载结束前（最多 30 秒）继续按住本地窗口，避免短文档在大文件下载期间被协调节点独自做完。
+3. PDF 优先用原始链接的 `ParallelPdfDownloader`（HEAD + 最多 8 路 Range，按 `Content-Length` 一次分配）。预取和稍后的任务会话共用同一次下载。原始链接失败或不支持 Range 时，再向协调节点拉；协调节点的 `GET/HEAD /cluster/jobs/{id}/pdf` 同样返回 `Accept-Ranges: bytes` 和准确的 `Content-Length`。同一任务的字节缓存在工人进程里，再次加入不会重下。
 4. 未设置 `pagesPerBatch` 时，批次按该节点实测 pages/s 调整，大约覆盖 8 秒的活，并且**新节点的第一批最多 2 页**。显式 `pagesPerBatch` 仍然固定。在途页数不超过 capacity。更快的机器更早回来领下一批，自然多干。
-5. 短文档上协调节点会在 `joinGraceMs`（默认 500）内先把自己限制在一个窗口。有工人仍在下载时，这个窗口会保持到下载结束或 30 秒，而不是宽限一到就把剩下的页吃完。
+5. 协调节点会在 `joinGraceMs`（默认 500）内先把自己限制在一个窗口。宽限过后：页数 **少于 48** 且仍有工人在下载时，窗口保持到下载结束或 30 秒；页数 **达到 48** 时窗口随宽限结束打开，不再为了等下载把协调节点闲置。一本几百页的扫描件在那 30 秒里做不完，按住窗口只是空等。
 6. 租约到期、`/fail`、或健康检查连续失败：这些页回到队列，别的节点（含本地）重做。两处投机执行，谁先写回谁算数，后写的提交被丢掉，页文本不会重复：
    - 待处理队列空了且未完成页数 ≤ `speculativeTailPages`（默认 4）时，空闲节点再跑一遍尾巴。
    - 某一页已经租出去、又是下一组 NER 还缺的最早一页，并且租约已经明显超过该节点实测的单页时间（至少 2.5 秒、约 2 倍单页）：空闲节点只复制这一页，让组能先成形。同一页同时最多两份在途。
-7. 工人同时最多 2 个任务。`dispatch` 和 `notify` 都执行这个上限。工人离开任务后的 45 秒内会把该任务放进 `ActiveJobs`，协调节点不会立刻再派给它。OCR 已经完成、而这个节点不能做 NER（或 NER 已经没有待领组）时，也不会再派，避免为了空转再下一遍 PDF。
+7. 工人同时最多 2 个任务。`dispatch` 和任务 `notify` 都执行这个上限；`prefetch: true` 只下载、不开会话，不占这 2 个名额。工人离开任务后的 45 秒内会把该任务放进 `ActiveJobs`，协调节点不会立刻再派给它。OCR 已经完成、而这个节点不能做 NER（或 NER 已经没有待领组）时，也不会再派，避免为了空转再下一遍 PDF。
 8. 领页、加入、NER 领取遇到超时或连接错误会退避重试，不结束整个会话。只有任务令牌真正取消才当作取消；HttpClient 超时走 `/fail` 或 `/ner/fail`，其他节点可以马上重做。任务结束时协调节点取消还没写完的 `/pdf` 流，不再干等最多 60 秒。
 9. 到达 `jobDeadlineSeconds`（默认 300）仍有远程租约：协调节点丢弃远程租约，剩下的页只在本地做完。死掉的工人不会让任务挂死或直接失败。
 10. 页按完成顺序写入，但 LLM NER 仍用原来的有序缓冲：凑满**连续的** 10 个非空页就发出一组，空白页不占名额、也不进协议输出。最终每页文本与单机相同（同一模型、同一 DPI）。
@@ -756,6 +756,24 @@ The current CPU is missing one or more of the required instruction sets.
 | new | 1616 ms | 39 / 39 ms | 575 ms | 18 / 20 / 2 | 2 | 1581 ms |
 
 墙钟少 7525 ms，快工人加入提前 1091 ms，第 20 组提前 7557 ms。慢节点从一次抱走 16 页变成首批 2 页，所以有序 NER 不再被它按住。数字会随机器浮动；CI 只检查新路径比旧路径更早加入、墙钟更短、慢节点首批不超过 2 页。
+
+同机再跑一次（4 核，改动前 / 改动后）：legacy 墙钟 9360 ms → 9458 ms，new 1614 ms → 1615 ms，慢节点首批仍是 2 页。这个基准不写临时 PDF，也不走 `ShouldHoldLocal`，所以三次改动不会出现在这张表里。
+
+### 大文档上剩下的三段等待
+
+下面是 463 页扫描件的调度回放（虚拟时钟 + 真实的 `ClusterPageScheduler` / `ClusterNerScheduler`，不是那份 265 MB PDF 的复跑）。8 核、每节点 4 个引擎、渲染 40 ms/页、OCR 150 ms/页、每批重写 PDF 350 ms、工人在任务开始后 8 秒才拿到 PDF、LLM 5 秒、三节点都有 key：
+
+| 回放 | 墙钟 | OCR 结束 | NER 尾巴 | 协调节点空等 |
+| --- | ---: | ---: | ---: | ---: |
+| 每批重写 PDF，下载期间按住本地窗口 | 34695 ms | 29695 ms | 5000 ms | 7600 ms |
+| 每节点每任务只映射一次 PDF，宽限后放开窗口 | 19342 ms | 13192 ms | 6150 ms | 400 ms |
+| 再加上预取，工人在 OCR 开始时 PDF 已在 | 14038 ms | 7888 ms | 6150 ms | 400 ms |
+
+同一套「观察到的约 5 页/秒」参数（渲染 200 ms/页）：每批重写 37995 ms，只复用文件但仍按住下载 23995 ms，复用且宽限后放开 21495 ms，再把 8 秒下载重叠掉是 15995 ms。20 秒链路、按住窗口 35995 ms，放开后 29395 ms。4 核、每批重写 57260 ms，复用且放开 27362 ms。
+
+预取把第二次下载从关键路径上拿掉：协调节点一开始下自己的那份时，工人已经在下同一个 `sourceUrl`。分类改成流式之后，任务通知也不再等全书文本层扫完；扫描件（整本都要 OCR）页会一边分析一边进队列。页数 ≥ 48 时，`joinGraceMs` 一过协调节点就领页，不再为了工人还在下载而空等最多 30 秒。短文档仍保持这 30 秒，避免协调节点把小文件做完。
+
+`ocr.renderProcesses` 自动上限仍是 4。本机 4 核、130 DPI、12 页 JPEG 扫描、文件只写一次：1 个渲染进程中位 413 ms，2 个 212 ms，4 个 135 ms。4 比 2 更快，所以没有把上限降到 2。这是只栅格、没有 OCR 引擎抢核；8 核上「4 个渲染进程 + 4 个 OCR 引擎」是否互相踩，这次没测。4 核机器的自动值本来就是 `cores − engines = 2`。
 
 ### 配置
 

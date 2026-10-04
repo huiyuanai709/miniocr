@@ -32,6 +32,11 @@ public sealed class ClusterScheduleOptions
     public int ExpectedNodes { get; init; } = 1;
     /// <summary>0-based pages already finished (text layer). They are not queued for OCR.</summary>
     public int[] PrecompletedPages { get; init; } = [];
+    /// <summary>
+    /// When true, pages start invisible. The coordinator admits each one after text-layer
+    /// classification, so notify and worker download are not blocked on a full scan.
+    /// </summary>
+    public bool DeferAdmission { get; init; }
 }
 
 public sealed class ClusterNodeLoad
@@ -126,8 +131,47 @@ public sealed class ClusterPageScheduler
                 continue;
             }
 
+            if (options.DeferAdmission)
+                continue;
             _pending.Enqueue(i);
             _pages[i].Queued = true;
+        }
+    }
+
+    /// <summary>Text-layer pass: this page needs raster + OCR. No-op if it was already admitted or finished.</summary>
+    public bool AdmitPage(int zeroBased)
+    {
+        lock (_gate)
+        {
+            if ((uint)zeroBased >= (uint)_pageCount)
+                return false;
+            PageState page = _pages[zeroBased];
+            if (page.Done || page.Queued || IsLeased(zeroBased))
+                return false;
+            _pending.Enqueue(zeroBased);
+            page.Queued = true;
+            SignalCore();
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Text-layer pass: this page is finished without OCR. Fails if a lease already took it
+    /// (that OCR commit remains the single result).
+    /// </summary>
+    public bool CompleteWithoutOcr(int zeroBased)
+    {
+        lock (_gate)
+        {
+            if ((uint)zeroBased >= (uint)_pageCount)
+                return false;
+            PageState page = _pages[zeroBased];
+            if (page.Done || page.Queued || IsLeased(zeroBased))
+                return false;
+            page.Done = true;
+            _done++;
+            SignalCore();
+            return true;
         }
     }
 

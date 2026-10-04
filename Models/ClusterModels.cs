@@ -168,6 +168,11 @@ public sealed class ClusterNotifyRequest
     public int PageCount { get; set; }
     /// <summary>Original PDF URL. Workers prefer this over the coordinator copy when it is set.</summary>
     public string? SourceUrl { get; set; }
+    /// <summary>
+    /// Download <see cref="SourceUrl"/> into the worker cache only. No session and no page lease.
+    /// Sent as soon as the coordinator knows the link, before its own download finishes.
+    /// </summary>
+    public bool Prefetch { get; set; }
 }
 
 public sealed class ClusterDispatchRequest
