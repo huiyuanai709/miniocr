@@ -46,3 +46,6 @@ jobs:
 
       - name: Config path
         run: dotnet run -c Release --project tests/MiniOcr.ConfigPathSmoke
+
+      - name: PDF text layer
+        run: dotnet run -c Release --project tests/MiniOcr.TextLayerSmoke

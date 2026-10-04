@@ -416,6 +416,7 @@ public static class AppConfigStore
             "rasterWorkers": null,
             "renderMode": "parallel",
             "renderProcesses": null,
+            "textLayer": "auto",
             "useCls": false,
             "autoScaleFromCpu": true,
             "wechatOcrPath": "",

@@ -45,8 +45,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Pinned fork master @ f65215f (PDFtoImage 6.0.0-preview plus PdfSession Gray8,
-         PDFtoImage.Parallel, and net11.0 runtime-async). Native PDFium / SkiaSharp assets flow as runtime
+    <!-- Pinned fork master @ 579b2f2 (PDFtoImage 6.0.0-preview plus PdfSession Gray8,
+         page text/content stats, PDFtoImage.Parallel, and net11.0 runtime-async). Native PDFium / SkiaSharp assets flow as runtime
          assets of the core project (runtimes/<rid>/native); .NET copies them on
          publish the same way a PackageReference to the PDFtoImage nupkg did.
          Parallel re-launches this executable as a worker (CoreCLR startup hook,

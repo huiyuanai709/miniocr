@@ -30,6 +30,8 @@ public sealed class ClusterScheduleOptions
     public int LeaseCapMs { get; init; } = 180_000;
     public int SpeculativeTailPages { get; init; } = 4;
     public int ExpectedNodes { get; init; } = 1;
+    /// <summary>0-based pages already finished (text layer). They are not queued for OCR.</summary>
+    public int[] PrecompletedPages { get; init; } = [];
 }
 
 public sealed class ClusterNodeLoad
@@ -104,12 +106,35 @@ public sealed class ClusterPageScheduler
         _expectedNodes = Math.Max(1, options.ExpectedNodes);
         _pages = new PageState[_pageCount];
         _pending = new Queue<int>(_pageCount);
+        HashSet<int> done = [];
+        if (options.PrecompletedPages is { Length: > 0 })
+        {
+            foreach (int index in options.PrecompletedPages)
+            {
+                if ((uint)index < (uint)_pageCount)
+                    done.Add(index);
+            }
+        }
+
         for (int i = 0; i < _pageCount; i++)
         {
             _pages[i] = new PageState();
+            if (done.Contains(i))
+            {
+                _pages[i].Done = true;
+                _done++;
+                continue;
+            }
+
             _pending.Enqueue(i);
             _pages[i].Queued = true;
         }
+    }
+
+    public bool IsPageDone(int zeroBased)
+    {
+        lock (_gate)
+            return (uint)zeroBased < (uint)_pageCount && _pages[zeroBased].Done;
     }
 
     public string LocalNodeId => _localNodeId;

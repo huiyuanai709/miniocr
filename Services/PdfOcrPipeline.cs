@@ -206,8 +206,10 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             concurrency,
             jpegCapacity);
 
-        Task producer = ProduceParallelAsync(
-            pdfBytes, pdfByteCount, pageCount, renderOptions, rasterized.Writer, ct);
+        TextLayerPlan visionPlan = PlanTextLayer(pdfBytes, pdfByteCount, pageCount);
+        PlacePrepared(pages, visionPlan, ner: null);
+        Task producer = ProduceIndicesAsync(
+            pdfBytes, pdfByteCount, visionPlan.OcrIndices, renderOptions, rasterized.Writer, ct);
 
         async Task EncodeConsumerAsync()
         {
@@ -308,7 +310,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             totalSw.Elapsed.TotalMilliseconds);
 
         LogTextHash(pages);
-        return new OcrResponse
+        OcrResponse response = new()
         {
             Ok = true,
             PageCount = pageCount,
@@ -325,6 +327,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             Pages = visible,
             Entities = entities,
         };
+        StampSources(response, pages);
+        return response;
     }
 
     private async Task<string> RecognizeLocalAsync(SKBitmap bitmap, CancellationToken ct)
@@ -388,8 +392,10 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             ? _llm.Begin(pageCount, llmCts.Token)
             : null;
 
-        Task producer = ProduceParallelAsync(
-            pdfBytes, pdfByteCount, pageCount, renderOptions, rasterized.Writer, ct);
+        TextLayerPlan plan = PlanTextLayer(pdfBytes, pdfByteCount, pageCount);
+        PlacePrepared(pages, plan, ner);
+        Task producer = ProduceIndicesAsync(
+            pdfBytes, pdfByteCount, plan.OcrIndices, renderOptions, rasterized.Writer, ct);
 
         async Task ConsumerAsync()
         {
@@ -411,6 +417,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         Width = width,
                         Height = height,
                         Text = pageText,
+                        Source = PdfTextLayer.SourceOcr,
                         RasterizeMs = Math.Round(rasterMs, 1),
                         OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
                     };
@@ -511,7 +518,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 preview);
         }
 
-        return new OcrResponse
+        OcrResponse response = new()
         {
             Ok = true,
             PageCount = pageCount,
@@ -528,6 +535,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             Pages = visible,
             Entities = entities,
         };
+        StampSources(response, pages);
+        return response;
     }
 
     /// <summary>
@@ -579,6 +588,14 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
         string jobId;
         OcrEntities? distributedEntities = null;
+        TextLayerPlan plan = PlanTextLayer(pdfBytes, pdfByteCount, pageCount);
+        List<OcrPageResult> prepared = [];
+        foreach (OcrPageResult? page in plan.Prepared)
+        {
+            if (page is not null)
+                prepared.Add(page);
+        }
+
         try
         {
             ClusterCoordinator.ClusterRunResult outcome = await _cluster!.RunJobAsync(
@@ -602,6 +619,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 },
                 Accept,
                 distributeNer,
+                prepared,
                 ct).ConfigureAwait(false);
             jobId = outcome.JobId;
             distributedEntities = outcome.UsedDistributedNer ? outcome.Entities ?? new OcrEntities() : null;
@@ -635,7 +653,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         List<OcrPageResult> visible = VisiblePages(pages);
         totalSw.Stop();
 
-        return new OcrResponse
+        OcrResponse response = new()
         {
             Ok = true,
             PageCount = pageCount,
@@ -652,6 +670,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             Pages = visible,
             Entities = entities,
         };
+        StampSources(response, pages);
+        return response;
     }
 
     /// <summary>
@@ -723,6 +743,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         Width = width,
                         Height = height,
                         Text = pageText,
+                        Source = PdfTextLayer.SourceOcr,
                         RasterizeMs = Math.Round(rasterMs, 1),
                         OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
                     });
@@ -843,11 +864,25 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 nonempty++;
         }
 
+        int textLayer = 0;
+        int ocrPages = 0;
+        foreach (OcrPageResult? page in pages)
+        {
+            if (page is null)
+                continue;
+            if (string.Equals(page.Source, PdfTextLayer.SourceTextLayer, StringComparison.Ordinal))
+                textLayer++;
+            else
+                ocrPages++;
+        }
+
         _logger.LogInformation(
-            "OCR_TEXT_SHA256={Hash} pages={Pages} nonempty={NonEmpty}",
+            "OCR_TEXT_SHA256={Hash} pages={Pages} nonempty={NonEmpty} textLayer={TextLayer} ocr={Ocr}",
             hash,
             pages.Length,
-            nonempty);
+            nonempty,
+            textLayer,
+            ocrPages);
         Console.Out.Flush();
         return hash;
     }
@@ -943,6 +978,156 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         _logger.LogInformation(
             "LLM NER unused/unconfigured and fallbackToHeuristics=false — empty entities");
         return new OcrEntities();
+    }
+
+    private sealed class TextLayerPlan
+    {
+        public OcrPageResult?[] Prepared { get; init; } = [];
+        public int[] OcrIndices { get; init; } = [];
+        public double AnalyzeMs { get; init; }
+    }
+
+    /// <summary>
+    /// Read every page's text layer once. Usable pages become OCR results immediately;
+    /// the rest are the only indices sent to the raster pipeline.
+    /// </summary>
+    private TextLayerPlan PlanTextLayer(byte[] pdfBytes, int pdfLength, int pageCount)
+    {
+        int[] every = new int[Math.Max(0, pageCount)];
+        for (int i = 0; i < every.Length; i++)
+            every[i] = i;
+        if (!_config.TextLayerEnabled || pageCount <= 0)
+            return new TextLayerPlan { Prepared = new OcrPageResult?[pageCount], OcrIndices = every };
+
+        PdfTextLayer.Thresholds thresholds = new(
+            _config.TextLayerMinChars,
+            _config.TextLayerMaxUnknownRatio,
+            _config.TextLayerImageCoverage,
+            _config.TextLayerImageMinChars);
+        OcrPageResult?[] prepared = new OcrPageResult?[pageCount];
+        List<int> ocr = new(pageCount);
+        Stopwatch sw = Stopwatch.StartNew();
+        try
+        {
+            using MemoryStream stream = new(pdfBytes, 0, pdfLength, writable: false, publiclyVisible: true);
+            using PdfSession session = PdfSession.Open(stream, leaveOpen: true);
+            int limit = Math.Min(pageCount, session.PageCount);
+            for (int i = 0; i < limit; i++)
+            {
+                PdfPageAnalysis analysis;
+                try
+                {
+                    analysis = session.AnalyzePage(i);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Text layer analysis failed for page {Page}; it will be OCR'd", i + 1);
+                    ocr.Add(i);
+                    continue;
+                }
+
+                PdfTextLayer.Decision decision = PdfTextLayer.Classify(_config.TextLayer, analysis, thresholds);
+                if (!decision.Use)
+                {
+                    _logger.LogDebug(
+                        "Text layer page {Page}/{Total} source=ocr reason={Reason} chars={Chars} unknown={Unknown} coverage={Coverage:F3}",
+                        i + 1,
+                        pageCount,
+                        decision.Reason,
+                        analysis.Text.CharacterCount,
+                        analysis.Text.UnknownCharacterCount,
+                        analysis.Content.ImageAreaCoverage);
+                    ocr.Add(i);
+                    continue;
+                }
+
+                string text = PdfTextLayer.Normalize(analysis.Text.Text);
+                prepared[i] = new OcrPageResult
+                {
+                    Page = i + 1,
+                    Text = text,
+                    Source = PdfTextLayer.SourceTextLayer,
+                };
+                _logger.LogInformation(
+                    "Text layer page {Page}/{Total} source=textLayer reason={Reason} chars={Chars} unknown={Unknown} textObjects={Objects} invisible={Invisible} coverage={Coverage:F3}",
+                    i + 1,
+                    pageCount,
+                    decision.Reason,
+                    PdfTextLayer.CountNonWhitespace(text),
+                    analysis.Text.UnknownCharacterCount,
+                    analysis.Content.TextObjectCount,
+                    analysis.Content.TextObjectsAreInvisible,
+                    analysis.Content.ImageAreaCoverage);
+            }
+
+            for (int i = limit; i < pageCount; i++)
+                ocr.Add(i);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Text layer analysis failed; rendering every page");
+            return new TextLayerPlan
+            {
+                Prepared = new OcrPageResult?[pageCount],
+                OcrIndices = every,
+                AnalyzeMs = sw.Elapsed.TotalMilliseconds,
+            };
+        }
+
+        sw.Stop();
+        int textCount = 0;
+        foreach (OcrPageResult? page in prepared)
+        {
+            if (page is not null)
+                textCount++;
+        }
+
+        _logger.LogInformation(
+            "Text layer summary: mode={Mode} textLayer={TextLayer} ocr={Ocr} analyzeMs={Analyze:F1}",
+            _config.TextLayer,
+            textCount,
+            ocr.Count,
+            sw.Elapsed.TotalMilliseconds);
+        return new TextLayerPlan
+        {
+            Prepared = prepared,
+            OcrIndices = ocr.ToArray(),
+            AnalyzeMs = sw.Elapsed.TotalMilliseconds,
+        };
+    }
+
+    private static void PlacePrepared(
+        OcrPageResult[] pages,
+        TextLayerPlan plan,
+        LlmEntityExtractor.LlmExtractionSession? ner)
+    {
+        int n = Math.Min(pages.Length, plan.Prepared.Length);
+        for (int i = 0; i < n; i++)
+        {
+            if (plan.Prepared[i] is not { } page)
+                continue;
+            pages[i] = page;
+            ner?.Add(page);
+        }
+    }
+
+    private void StampSources(OcrResponse response, OcrPageResult?[] pages)
+    {
+        int text = 0;
+        int ocr = 0;
+        foreach (OcrPageResult? page in pages)
+        {
+            if (page is null)
+                continue;
+            if (string.Equals(page.Source, PdfTextLayer.SourceTextLayer, StringComparison.Ordinal))
+                text++;
+            else
+                ocr++;
+        }
+
+        response.TextLayerMode = _config.TextLayer;
+        response.TextLayerPageCount = text;
+        response.OcrPageCount = ocr;
     }
 
     private Task ProduceParallelAsync(

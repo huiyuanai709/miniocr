@@ -229,6 +229,7 @@ string? prevPath = Environment.GetEnvironmentVariable("MINIOCR_WECHAT_OCR_PATH")
 string? prevInstances = Environment.GetEnvironmentVariable("MINIOCR_WECHAT_INSTANCES");
 string? prevRenderMode = Environment.GetEnvironmentVariable("MINIOCR_RENDER_MODE");
 string? prevRenderProcesses = Environment.GetEnvironmentVariable("MINIOCR_RENDER_PROCESSES");
+string? prevTextLayer = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
 try
 {
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "wechat");
@@ -315,6 +316,21 @@ try
     AssertEqual("8", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RenderProcessCount.ToString(), "render processes clamp to 8");
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", "0");
     AssertEqual("1", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RenderProcessCount.ToString(), "render processes clamp to 1");
+
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", null);
+    AssertEqual("auto", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).TextLayer, "default text layer is auto");
+    AssertEqual("off", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { TextLayer = "off" },
+    }).TextLayer, "file text layer off");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", "FORCE");
+    AssertEqual("force", OcrRuntimeConfig.ResolveTextLayer("off"), "env text layer overrides file");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", "nope");
+    AssertEqual("auto", OcrRuntimeConfig.ResolveTextLayer("off"), "unknown text layer is auto");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", null);
+    Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", "80");
+    AssertEqual("80", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).TextLayerMinChars.ToString(), "env min chars");
+    Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
 }
 finally
 {
@@ -323,6 +339,8 @@ finally
     Environment.SetEnvironmentVariable("MINIOCR_WECHAT_INSTANCES", prevInstances);
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", prevRenderMode);
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", prevRenderProcesses);
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", prevTextLayer);
+    Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
 }
 
 Console.WriteLine("=== non-ASCII PDF path ===");

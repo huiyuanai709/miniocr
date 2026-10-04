@@ -84,6 +84,22 @@ public sealed class ClusterJob
         }
     }
 
+    /// <summary>
+    /// A page finished before any OCR lease (text layer). It is already marked done
+    /// on the scheduler, so NER and the pipeline see it without a batch commit.
+    /// </summary>
+    public void AcceptPrepared(OcrPageResult page)
+    {
+        lock (_acceptGate)
+        {
+            int index = page.Page - 1;
+            if ((uint)index >= (uint)PageCount || !Scheduler.IsPageDone(index))
+                return;
+            Ner?.AddPage(page);
+            _onAccepted?.Invoke(page);
+        }
+    }
+
     /// <summary>Block until any in-flight <see cref="TryAccept"/> has finished mutating page state.</summary>
     public void DrainAccepts()
     {
