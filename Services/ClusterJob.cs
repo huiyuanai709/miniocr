@@ -10,9 +10,18 @@ public sealed class ClusterJob
 {
     /// <summary>
     /// While a joined node is still fetching the PDF, the coordinator keeps its local window
-    /// hold so it does not eat the document alone. A stuck download cannot hold forever.
+    /// hold so it does not eat a short document alone. A stuck download cannot hold forever.
+    /// At or above <see cref="DownloadHoldPageLimit"/> pages this hold ends with the join grace:
+    /// the coordinator cannot finish that document during the download.
     /// </summary>
     public static readonly TimeSpan DownloadHold = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// At or above this many pages the coordinator resumes after join grace even if workers
+    /// are still downloading. A 463-page scan cannot be finished in that window, and holding
+    /// the whole download leaves the coordinator idle.
+    /// </summary>
+    public const int DownloadHoldPageLimit = 48;
 
     private readonly object _acceptGate = new();
     private readonly object _readGate = new();
@@ -138,6 +147,8 @@ public sealed class ClusterJob
             return false;
         if (!GraceElapsed)
             return true;
+        if (PageCount >= DownloadHoldPageLimit)
+            return false;
         return AnyFreshDownload(now, DownloadHold);
     }
 

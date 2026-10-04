@@ -21,6 +21,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     private readonly int _defaultDpi;
     private readonly int _rasterWorkers;
     private readonly object _parallelGate = new();
+    private readonly SemaphoreSlim _mapGate = new(1, 1);
+    private readonly List<MappedPdf> _mapped = [];
     private ParallelPdfProcessor? _parallel;
     private int _parallelDisposed;
 
@@ -91,6 +93,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         string? sourceUrl,
         CancellationToken ct)
     {
+        try
+        {
         int pageCount;
         using (MemoryStream countStream = new(pdfBytes, index: 0, count: pdfByteCount, writable: false, publiclyVisible: true))
             pageCount = Conversion.GetPageCount(countStream, leaveOpen: false);
@@ -146,6 +150,11 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             workers: _engine.EngineCount,
             recognize: RecognizeLocalAsync)
             .ConfigureAwait(false);
+        }
+        finally
+        {
+            ReleaseMappedPdf(pdfBytes);
+        }
     }
 
     private async Task<OcrResponse> ProcessWithVisionAsync(
@@ -588,13 +597,11 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
         string jobId;
         OcrEntities? distributedEntities = null;
-        TextLayerPlan plan = PlanTextLayer(pdfBytes, pdfByteCount, pageCount);
-        List<OcrPageResult> prepared = [];
-        foreach (OcrPageResult? page in plan.Prepared)
-        {
-            if (page is not null)
-                prepared.Add(page);
-        }
+        // Classification streams beside notify so workers can download while pages are sorted.
+        // Text layer off keeps the old path: every page is queued before the first claim.
+        Func<ClusterJob, CancellationToken, Task>? classify = _config.TextLayerEnabled
+            ? (job, token) => StreamTextLayer(pdfBytes, pdfByteCount, pageCount, job, token)
+            : null;
 
         try
         {
@@ -619,8 +626,9 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 },
                 Accept,
                 distributeNer,
-                prepared,
-                ct).ConfigureAwait(false);
+                textLayerPages: null,
+                ct: ct,
+                alongside: classify).ConfigureAwait(false);
             jobId = outcome.JobId;
             distributedEntities = outcome.UsedDistributedNer ? outcome.Entities ?? new OcrEntities() : null;
         }
@@ -1096,6 +1104,125 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         };
     }
 
+    /// <summary>
+    /// Classify pages on a side thread and publish each decision as it is known.
+    /// A text-layer page is completed once; anything else is admitted for OCR.
+    /// On failure or cancel, whatever is still invisible is admitted so the job cannot stall.
+    /// </summary>
+    private Task StreamTextLayer(
+        byte[] pdfBytes,
+        int pdfLength,
+        int pageCount,
+        ClusterJob job,
+        CancellationToken ct)
+    {
+        int next = 0;
+        int textCount = 0;
+        int ocrCount = 0;
+        Stopwatch sw = Stopwatch.StartNew();
+        try
+        {
+            PdfTextLayer.Thresholds thresholds = new(
+                _config.TextLayerMinChars,
+                _config.TextLayerMaxUnknownRatio,
+                _config.TextLayerImageCoverage,
+                _config.TextLayerImageMinChars);
+            using MemoryStream stream = new(pdfBytes, 0, pdfLength, writable: false, publiclyVisible: true);
+            using PdfSession session = PdfSession.Open(stream, leaveOpen: true);
+            int limit = Math.Min(pageCount, session.PageCount);
+            for (; next < limit; next++)
+            {
+                ct.ThrowIfCancellationRequested();
+                PdfPageAnalysis analysis;
+                try
+                {
+                    analysis = session.AnalyzePage(next);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Text layer analysis failed for page {Page}; it will be OCR'd", next + 1);
+                    if (job.Scheduler.AdmitPage(next))
+                        ocrCount++;
+                    continue;
+                }
+
+                PdfTextLayer.Decision decision = PdfTextLayer.Classify(_config.TextLayer, analysis, thresholds);
+                if (!decision.Use)
+                {
+                    _logger.LogDebug(
+                        "Text layer page {Page}/{Total} source=ocr reason={Reason} chars={Chars} unknown={Unknown} coverage={Coverage:F3}",
+                        next + 1,
+                        pageCount,
+                        decision.Reason,
+                        analysis.Text.CharacterCount,
+                        analysis.Text.UnknownCharacterCount,
+                        analysis.Content.ImageAreaCoverage);
+                    if (job.Scheduler.AdmitPage(next))
+                        ocrCount++;
+                    continue;
+                }
+
+                string text = PdfTextLayer.Normalize(analysis.Text.Text);
+                if (!job.Scheduler.CompleteWithoutOcr(next))
+                {
+                    if (job.Scheduler.AdmitPage(next))
+                        ocrCount++;
+                    continue;
+                }
+
+                textCount++;
+                job.AcceptPrepared(new OcrPageResult
+                {
+                    Page = next + 1,
+                    Text = text,
+                    Source = PdfTextLayer.SourceTextLayer,
+                });
+                _logger.LogInformation(
+                    "Text layer page {Page}/{Total} source=textLayer reason={Reason} chars={Chars} unknown={Unknown} textObjects={Objects} invisible={Invisible} coverage={Coverage:F3}",
+                    next + 1,
+                    pageCount,
+                    decision.Reason,
+                    PdfTextLayer.CountNonWhitespace(text),
+                    analysis.Text.UnknownCharacterCount,
+                    analysis.Content.TextObjectCount,
+                    analysis.Content.TextObjectsAreInvisible,
+                    analysis.Content.ImageAreaCoverage);
+            }
+
+            for (; next < pageCount; next++)
+            {
+                if (job.Scheduler.AdmitPage(next))
+                    ocrCount++;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "Text layer analysis failed; remaining pages will be OCR'd");
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Text layer analysis cancelled; remaining pages will be OCR'd");
+        }
+        finally
+        {
+            for (int i = next; i < pageCount; i++)
+            {
+                if (job.Scheduler.AdmitPage(i))
+                    ocrCount++;
+            }
+
+            sw.Stop();
+            _logger.LogInformation(
+                "Text layer summary: mode={Mode} textLayer={TextLayer} ocr={Ocr} analyzeMs={Analyze:F1}",
+                _config.TextLayer,
+                textCount,
+                ocrCount,
+                sw.Elapsed.TotalMilliseconds);
+        }
+
+        return Task.CompletedTask;
+    }
+
     private static void PlacePrepared(
         OcrPageResult[] pages,
         TextLayerPlan plan,
@@ -1223,15 +1350,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         HashSet<int> written,
         CancellationToken ct)
     {
-        string path = Path.Combine(Path.GetTempPath(), "miniocr-render-" + Guid.NewGuid().ToString("N") + ".pdf");
+        // One temp file per PDF per process. PDFtoImage.Parallel reopens that path
+        // (ReuseFileStream + TryOpenSourceFile) for every batch; leaveOpen keeps our handle.
+        MappedPdf mapped = await RetainMappedAsync(pdfBytes, pdfLength, ct).ConfigureAwait(false);
         try
         {
-            await WritePdfTempAsync(path, pdfBytes, pdfLength, ct).ConfigureAwait(false);
-            // Share.Read|Delete lets the processor reopen the same file (no second
-            // copy of a hundreds-of-MB PDF) and lets us unlink it after the request.
-            // Not DeleteOnClose: workers reopen by path and must see the file.
-            await using FileStream stream = new(
-                path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            FileStream stream = mapped.Stream
+                ?? throw new InvalidOperationException("Mapped PDF was closed before render.");
             ParallelPdfProcessor processor = GetOrCreateParallel();
             Stopwatch sw = Stopwatch.StartNew();
             int idx = 0;
@@ -1271,7 +1396,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
         finally
         {
-            TryDeleteTemp(path);
+            await EndMappedUseAsync(mapped).ConfigureAwait(false);
         }
     }
 
@@ -1379,10 +1504,158 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Drop the temp PDF kept for <paramref name="pdf"/>. Called when the job or worker
+    /// session that owns this buffer is finished. In-flight batches keep the file until
+    /// they return it.
+    /// </summary>
+    public void ReleaseMappedPdf(byte[] pdf)
+    {
+        _mapGate.Wait();
+        try
+        {
+            for (int i = _mapped.Count - 1; i >= 0; i--)
+            {
+                MappedPdf mapped = _mapped[i];
+                if (!ReferenceEquals(mapped.Bytes, pdf))
+                    continue;
+                mapped.ReleaseRequested = true;
+                if (mapped.Uses == 0)
+                    CloseMapped(mapped);
+            }
+        }
+        finally
+        {
+            _mapGate.Release();
+        }
+    }
+
+    private async Task<MappedPdf> RetainMappedAsync(byte[] pdfBytes, int pdfLength, CancellationToken ct)
+    {
+        await _mapGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            for (int i = 0; i < _mapped.Count; i++)
+            {
+                MappedPdf existing = _mapped[i];
+                if (!ReferenceEquals(existing.Bytes, pdfBytes) || existing.Length != pdfLength || existing.Stream is null)
+                    continue;
+                existing.Uses++;
+                _logger.LogDebug(
+                    "Parallel render reusing mapped PDF bytes={Bytes} uses={Uses}",
+                    pdfLength,
+                    existing.Uses);
+                return existing;
+            }
+
+            string path = Path.Combine(Path.GetTempPath(), "miniocr-render-" + Guid.NewGuid().ToString("N") + ".pdf");
+            FileStream? stream = null;
+            try
+            {
+                await WritePdfTempAsync(path, pdfBytes, pdfLength, ct).ConfigureAwait(false);
+                // Share.Read|Delete: the processor reopens by path, and we can unlink at job end.
+                // Not DeleteOnClose: a later batch must still see the file.
+                stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            }
+            catch
+            {
+                if (stream is not null)
+                {
+                    try
+                    {
+                        stream.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to close partial mapped PDF {Path}", path);
+                    }
+                }
+
+                TryDeleteTemp(path);
+                throw;
+            }
+
+            var created = new MappedPdf
+            {
+                Bytes = pdfBytes,
+                Length = pdfLength,
+                Path = path,
+                Stream = stream,
+                Uses = 1,
+            };
+            _mapped.Add(created);
+            _logger.LogInformation("Parallel render mapped PDF once bytes={Bytes}", pdfLength);
+            return created;
+        }
+        finally
+        {
+            _mapGate.Release();
+        }
+    }
+
+    private async Task EndMappedUseAsync(MappedPdf mapped)
+    {
+        await _mapGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (mapped.Uses > 0)
+                mapped.Uses--;
+            if (mapped.Uses == 0 && mapped.ReleaseRequested)
+                CloseMapped(mapped);
+        }
+        finally
+        {
+            _mapGate.Release();
+        }
+    }
+
+    private void CloseMapped(MappedPdf mapped)
+    {
+        FileStream? stream = mapped.Stream;
+        string path = mapped.Path;
+        mapped.Stream = null;
+        mapped.Bytes = [];
+        _mapped.Remove(mapped);
+        if (stream is not null)
+        {
+            try
+            {
+                stream.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to close mapped PDF {Path}", path);
+            }
+        }
+
+        TryDeleteTemp(path);
+    }
+
+    private void ReleaseAllMapped()
+    {
+        _mapGate.Wait();
+        try
+        {
+            for (int i = _mapped.Count - 1; i >= 0; i--)
+            {
+                MappedPdf mapped = _mapped[i];
+                mapped.ReleaseRequested = true;
+                mapped.Uses = 0;
+                CloseMapped(mapped);
+            }
+        }
+        finally
+        {
+            _mapGate.Release();
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _parallelDisposed, 1) != 0)
             return;
+
+        ReleaseAllMapped();
 
         ParallelPdfProcessor? processor;
         lock (_parallelGate)
@@ -1481,4 +1754,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     }
 
     private readonly record struct PageJpeg(int Index, int Width, int Height, byte[]? Jpeg, double RasterMs);
+
+    /// <summary>
+    /// One temp PDF shared by every parallel-render batch of the same buffer.
+    /// Keyed by array reference because rented buffers return to the pool after the job.
+    /// </summary>
+    private sealed class MappedPdf
+    {
+        public byte[] Bytes = [];
+        public int Length;
+        public string Path = "";
+        public FileStream? Stream;
+        public int Uses;
+        public bool ReleaseRequested;
+    }
 }

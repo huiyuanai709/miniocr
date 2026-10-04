@@ -1041,6 +1041,52 @@ ClusterPageScheduler allText = new(new ClusterScheduleOptions
 ClusterClaim nothing = allText.Claim("local", 4, DateTimeOffset.UtcNow);
 AssertTrue(nothing.Kind == ClusterClaimKind.Done, "a text-only document has no OCR batches");
 
+Console.WriteLine("=== deferred admission streams classification ===");
+ClusterPageScheduler deferred = new(new ClusterScheduleOptions
+{
+    PageCount = 4,
+    LocalNodeId = "local",
+    DeferAdmission = true,
+    SpeculativeTailPages = 4,
+});
+ClusterClaim unseen = deferred.Claim("local", 4, DateTimeOffset.UtcNow);
+AssertTrue(unseen.Kind == ClusterClaimKind.Wait, "unseen pages are not claimable");
+AssertTrue(deferred.CompleteWithoutOcr(0), "text page completes without OCR");
+AssertTrue(deferred.IsPageDone(0), "text page is done");
+AssertTrue(!deferred.CompleteWithoutOcr(0), "a finished text page is not completed twice");
+AssertTrue(!deferred.AdmitPage(0), "a finished text page is not admitted for OCR");
+AssertTrue(deferred.AdmitPage(1), "an OCR page is admitted when classified");
+ClusterClaim onlyAdmitted = deferred.Claim("worker", 4, DateTimeOffset.UtcNow);
+AssertTrue(
+    onlyAdmitted.Kind == ClusterClaimKind.Batch && onlyAdmitted.Pages.SequenceEqual([2]),
+    "only the admitted page is leased");
+AssertTrue(!deferred.CompleteWithoutOcr(1), "a leased page keeps its OCR result");
+AssertTrue(deferred.TryCommit(onlyAdmitted.BatchId, 2), "the OCR commit still wins");
+AssertTrue(deferred.AdmitPage(2) && deferred.AdmitPage(3), "the rest of the book can still be admitted");
+AssertTrue(!deferred.AdmitPage(2), "an admitted page is not queued twice");
+
+Console.WriteLine("=== large jobs drop the download hold after grace ===");
+DateTimeOffset holdNow = DateTimeOffset.UtcNow;
+var shortJob = new ClusterJob("short", NewScheduler(5), new byte[4], 4, 5, 96, "http://files.example/short.pdf");
+shortJob.MarkDownloading("worker");
+AssertTrue(shortJob.ShouldHoldLocal(holdNow), "a short job holds before join grace");
+shortJob.MarkGraceElapsed();
+AssertTrue(shortJob.ShouldHoldLocal(holdNow), "a short job keeps holding a fresh download");
+shortJob.ClearDownloading("worker");
+AssertTrue(!shortJob.ShouldHoldLocal(holdNow), "a short job releases when nothing is downloading");
+
+var justUnder = new ClusterJob("under", NewScheduler(47), new byte[4], 4, 47, 96, "http://files.example/under.pdf");
+justUnder.MarkDownloading("worker");
+justUnder.MarkGraceElapsed();
+AssertTrue(justUnder.ShouldHoldLocal(holdNow), "47 pages still hold for the worker download");
+
+var largeJob = new ClusterJob("large", NewScheduler(48), new byte[4], 4, 48, 96, "http://files.example/large.pdf");
+largeJob.MarkDownloading("worker");
+AssertTrue(largeJob.ShouldHoldLocal(holdNow), "a large job still holds during join grace");
+largeJob.MarkGraceElapsed();
+AssertTrue(!largeJob.ShouldHoldLocal(holdNow), "48 pages open the local window after grace");
+AssertTrue(largeJob.PageCount >= ClusterJob.DownloadHoldPageLimit, "the hold limit is the large-job cutoff");
+
 if (failed > 0)
 {
     Console.WriteLine($"FAILED {failed}");

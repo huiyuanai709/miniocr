@@ -23,7 +23,10 @@ public sealed class ClusterWorkerHost : IHostedService
     private readonly ILogger<ClusterWorkerHost> _logger;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte[]> _pdfCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Task<byte[]>> _urlFetches = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _recentlyLeft = new(StringComparer.Ordinal);
+    private readonly object _urlFetchOrderGate = new();
+    private readonly List<string> _urlFetchOrder = [];
     private readonly object _pdfCacheOrder = new();
     private readonly List<string> _pdfCacheKeys = [];
     private readonly CancellationTokenSource _cts = new();
@@ -140,6 +143,18 @@ public sealed class ClusterWorkerHost : IHostedService
         {
             error = "This process is not a cluster worker.";
             return false;
+        }
+
+        if (req.Prefetch)
+        {
+            if (string.IsNullOrWhiteSpace(req.SourceUrl))
+            {
+                error = "sourceUrl is required for prefetch.";
+                return false;
+            }
+
+            StartPrefetch(req.SourceUrl);
+            return true;
         }
 
         if (string.IsNullOrWhiteSpace(req.JobId) || string.IsNullOrWhiteSpace(req.CoordinatorUrl))
@@ -268,6 +283,7 @@ public sealed class ClusterWorkerHost : IHostedService
         DateTimeOffset started = DateTimeOffset.UtcNow;
         DateTimeOffset progressAt = started;
         Task? nerTask = null;
+        byte[]? renderPdf = null;
         try
         {
             _logger.LogInformation(
@@ -279,6 +295,20 @@ public sealed class ClusterWorkerHost : IHostedService
                 pageCount,
                 DescribePdfSource(sourceUrl));
             bool cached = TryGetCachedPdf(jobId, out byte[]? pdf);
+            Task<byte[]>? shared = null;
+            if (!cached && !string.IsNullOrWhiteSpace(sourceUrl))
+            {
+                Task<byte[]> fetch = GetOrStartUrlFetch(sourceUrl.Trim());
+                if (fetch.IsCompletedSuccessfully)
+                {
+                    pdf = await fetch.ConfigureAwait(false);
+                    RememberPdf(jobId, pdf);
+                    cached = true;
+                }
+                else if (!fetch.IsCompleted)
+                    shared = fetch;
+            }
+
             if (!await JoinWithRetryAsync(coordinatorUrl, jobId, downloading: !cached, ct).ConfigureAwait(false))
                 return;
             nerTask = RunsDistributedNer
@@ -287,7 +317,28 @@ public sealed class ClusterWorkerHost : IHostedService
             if (!cached)
             {
                 Stopwatch download = Stopwatch.StartNew();
-                pdf = await DownloadPdfWithRetryAsync(coordinatorUrl, jobId, sourceUrl, ct).ConfigureAwait(false);
+                if (shared is not null)
+                {
+                    try
+                    {
+                        pdf = await shared.WaitAsync(ct).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Cluster worker {NodeId} job {JobId} source prefetch failed; falling back to the coordinator",
+                            _self.NodeId,
+                            jobId);
+                        pdf = await DownloadPdfWithRetryAsync(coordinatorUrl, jobId, sourceUrl: null, ct)
+                            .ConfigureAwait(false);
+                    }
+                }
+                else
+                {
+                    pdf = await DownloadPdfWithRetryAsync(coordinatorUrl, jobId, sourceUrl, ct).ConfigureAwait(false);
+                }
+
                 download.Stop();
                 RememberPdf(jobId, pdf);
                 _logger.LogInformation(
@@ -310,6 +361,7 @@ public sealed class ClusterWorkerHost : IHostedService
             }
 
             byte[] pdfBytes = pdf ?? throw new InvalidOperationException("PDF was not downloaded.");
+            renderPdf = pdfBytes;
             while (!ct.IsCancellationRequested)
             {
                 ClusterClaimResponse? claim;
@@ -419,6 +471,8 @@ public sealed class ClusterWorkerHost : IHostedService
         }
         finally
         {
+            if (renderPdf is not null)
+                _pipeline.ReleaseMappedPdf(renderPdf);
             if (nerTask is not null && !nerTask.IsCompleted)
             {
                 try
@@ -569,6 +623,114 @@ public sealed class ClusterWorkerHost : IHostedService
         await using Stream stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         return await JsonSerializer.DeserializeAsync(stream, AppJsonContext.Default.ClusterDispatchResponse, ct)
             .ConfigureAwait(false);
+    }
+
+    private void StartPrefetch(string sourceUrl)
+    {
+        string url = sourceUrl.Trim();
+        if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            _logger.LogWarning(
+                "Cluster worker {NodeId} ignored a prefetch whose sourceUrl is not absolute http(s)",
+                _self.NodeId);
+            return;
+        }
+
+        _logger.LogInformation(
+            "Cluster worker {NodeId} prefetching source PDF {Source}",
+            _self.NodeId,
+            DescribePdfSource(url));
+        _ = GetOrStartUrlFetch(url);
+    }
+
+    /// <summary>
+    /// One download per source URL, shared by the prefetch notify and the later job session.
+    /// </summary>
+    private Task<byte[]> GetOrStartUrlFetch(string url)
+    {
+        if (_urlFetches.TryGetValue(url, out Task<byte[]>? existing))
+            return existing;
+
+        var gate = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_urlFetches.TryAdd(url, gate.Task))
+        {
+            return _urlFetches.TryGetValue(url, out Task<byte[]>? winner)
+                ? winner
+                : GetOrStartUrlFetch(url);
+        }
+
+        lock (_urlFetchOrderGate)
+            _urlFetchOrder.Add(url);
+        TrimUrlFetches(url);
+        _ = FinishUrlFetchAsync(url, gate);
+        return gate.Task;
+    }
+
+    private async Task FinishUrlFetchAsync(string url, TaskCompletionSource<byte[]> gate)
+    {
+        try
+        {
+            byte[] bytes = await DownloadUrlForShareAsync(url).ConfigureAwait(false);
+            gate.TrySetResult(bytes);
+        }
+        catch (Exception ex)
+        {
+            _urlFetches.TryRemove(new KeyValuePair<string, Task<byte[]>>(url, gate.Task));
+            lock (_urlFetchOrderGate)
+                _urlFetchOrder.Remove(url);
+            gate.TrySetException(ex);
+        }
+    }
+
+    private async Task<byte[]> DownloadUrlForShareAsync(string url)
+    {
+        Exception? last = null;
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                return await DownloadExactAsync(url, prepare: null, _cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                last = ex;
+                _logger.LogWarning(
+                    ex,
+                    "Cluster worker {NodeId} source PDF prefetch failed (attempt {Attempt}); retrying",
+                    _self.NodeId,
+                    attempt + 1);
+                await Task.Delay(Backoff(attempt), _cts.Token).ConfigureAwait(false);
+            }
+        }
+
+        throw last ?? new HttpRequestException("PDF prefetch failed");
+    }
+
+    private void TrimUrlFetches(string keep)
+    {
+        lock (_urlFetchOrderGate)
+        {
+            int i = 0;
+            while (_urlFetches.Count > MaxCachedPdfs && i < _urlFetchOrder.Count)
+            {
+                string key = _urlFetchOrder[i];
+                if (string.Equals(key, keep, StringComparison.Ordinal) ||
+                    !_urlFetches.TryGetValue(key, out Task<byte[]>? task) ||
+                    !task.IsCompletedSuccessfully)
+                {
+                    i++;
+                    continue;
+                }
+
+                _urlFetchOrder.RemoveAt(i);
+                _urlFetches.TryRemove(new KeyValuePair<string, Task<byte[]>>(key, task));
+            }
+        }
     }
 
     private async Task<byte[]> DownloadPdfWithRetryAsync(
