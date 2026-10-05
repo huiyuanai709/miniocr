@@ -21,7 +21,10 @@ public static class PdfParallelStartup
 
         try
         {
+            long started = StageClock.Stamp();
             ParallelPdfProcessor processor = await StartAndRenderProbeAsync(config, ct).ConfigureAwait(false);
+            if (logger.IsEnabled(LogLevel.Debug))
+                StageLog.RenderColdStart(logger, Math.Round(StageClock.MsSince(started), 1));
             logger.LogInformation(
                 "Parallel PDF render workers started (processes={Processes})",
                 config.RenderProcessCount);

@@ -197,12 +197,16 @@ Console.WriteLine("=== speculative tail ===");
     ClusterClaim copy = sched.Claim("idle", 2, now);
     AssertTrue(copy.Kind == ClusterClaimKind.Batch && copy.Speculative, "idle node speculatively copies the tail");
     AssertTrue(copy.Pages.OrderBy(p => p).SequenceEqual(slow.Pages.OrderBy(p => p)), "speculative pages match");
+    AssertTrue(sched.SpeculativeCopies == copy.Pages.Length, "speculative copies count pages");
     CommitAll(sched, copy);
     AssertTrue(sched.IsComplete, "speculative finish completes the job");
     foreach (int page in slow.Pages)
         AssertTrue(!sched.TryCommit(slow.BatchId, page), $"original lease page {page} lost the race");
     ClusterScheduleSnapshot snap = sched.Snapshot();
     AssertTrue(snap.Nodes.First(n => n.NodeId == "idle").PagesCommitted == 2, "idle node credited");
+    AssertTrue(
+        ClusterJobLog.FormatByNodeRate(snap, 1000).Contains("idle=2(2.0/s)", StringComparison.Ordinal),
+        "job-end byNode includes a per-node rate");
     AssertTrue((snap.Nodes.FirstOrDefault(n => n.NodeId == "slow")?.PagesCommitted ?? 0) == 0, "slow node not credited");
 }
 
@@ -850,6 +854,7 @@ Console.WriteLine("=== NER capacity and give-up ===");
     AssertTrue(bad2.Kind == ClusterNerClaimKind.Group && bad2.GroupId == bad.GroupId, "the only LLM node may retry");
     poison.Fail(bad2.GroupId, "only");
     AssertTrue(poison.IsComplete, "giving up after max attempts still finishes the job");
+    AssertTrue(poison.AbandonedGroups == 1, "abandoned group counter matches the give-up");
     AssertTrue(poison.DrainGiveUps().Length == 1, "give-up is reported");
     AssertTrue(poison.Merge().Companies.Count == 0 && poison.Merge().Persons.Count == 0, "abandoned group adds no names");
 

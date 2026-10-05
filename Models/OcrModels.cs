@@ -73,6 +73,29 @@ public sealed class OcrTimings
     public double RasterizeMs { get; set; }
     public double OcrMs { get; set; }
     public double TotalMs { get; set; }
+
+    /// <summary>Text-layer classification wall time. Zero when the text layer is off.</summary>
+    public double AnalyzeMs { get; set; }
+
+    /// <summary>
+    /// Local LLM NER wall span: first request start through the last response.
+    /// Requests overlap OCR, so this can be larger than the piece of <see cref="TotalMs"/>
+    /// that is still waiting on NER. On a distributed cluster job this is the tail after
+    /// the last OCR page until NER finishes, and <see cref="NerRequestMs"/> stays 0
+    /// (those requests run on the workers).
+    /// </summary>
+    public double NerMs { get; set; }
+
+    /// <summary>
+    /// Sum of local LLM NER request durations. Concurrent requests add up, so this can
+    /// exceed <see cref="NerMs"/>. Zero when this process did not call the LLM.
+    /// </summary>
+    public double NerRequestMs { get; set; }
+
+    public int NerGroups { get; set; }
+
+    /// <summary>Most local NER requests in flight at once.</summary>
+    public int NerPeak { get; set; }
 }
 
 public sealed class EntityHit
