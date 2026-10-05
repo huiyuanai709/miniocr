@@ -1145,15 +1145,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     }
 
     private static RenderOptions CreateRenderOptions(int dpi) =>
-        new(
-            Dpi: dpi,
-            WithAnnotations: false,
-            WithFormFill: false,
-            AntiAliasing: PdfAntiAliasing.None,
-            // Grayscale + no tiling makes PDFtoImage.Parallel ship Gray8 and expand
-            // back to BGRA8888 in the host. OCR only accepts BGR/RGB(A); that host
-            // bitmap is already Bgra8888, so EnsureBgra8888 does not convert again.
-            Grayscale: true);
+        PdfParallelOptions.CreateRenderOptions(dpi);
 
     private static OcrEntities EntitiesFromVisionPages(OcrPageResult[] pages)
     {
@@ -1510,11 +1502,11 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
     /// <summary>
     /// In-process PDFium calls share one global lock, so extra threads do not
-    /// rasterize in parallel. <c>ocr.renderMode=parallel</c> renders in worker
-    /// processes that share one memory-mapped temp PDF (Gray8 on the wire when
-    /// <see cref="CreateRenderOptions"/> asks for grayscale). A worker crash
-    /// drops the pool and finishes the unwritten pages in-process. Cancellation
-    /// does not fall back.
+    /// rasterize in parallel. <c>ocr.renderMode=parallel</c> renders in the
+    /// process-lifetime worker pool. Each job writes one temp PDF per node and
+    /// every page lease of that file reuses it (<see cref="PdfParallelOptions"/>).
+    /// A worker crash drops the pool and finishes the unwritten pages in-process.
+    /// Cancellation does not fall back.
     /// </summary>
     private async Task DispatchRenderAsync(
         byte[] pdfBytes,
@@ -1589,8 +1581,9 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         HashSet<int> written,
         CancellationToken ct)
     {
-        // One temp file per PDF per process. PDFtoImage.Parallel reopens that path
-        // (ReuseFileStream + TryOpenSourceFile) for every batch; leaveOpen keeps our handle.
+        // One temp file per PDF per process. The same ParallelPdfProcessor reopens that
+        // path for every batch (ReuseFileStream) and keeps the parsed document
+        // (RetainDocuments). leaveOpen keeps our handle. Do not construct a new processor here.
         MappedPdf mapped = await RetainMappedAsync(pdfBytes, pdfLength, ct).ConfigureAwait(false);
         try
         {
@@ -1713,12 +1706,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         lock (_parallelGate)
         {
             ObjectDisposedException.ThrowIf(_parallelDisposed != 0, this);
-            return _parallel ??= new ParallelPdfProcessor(new ProcessorOptions
-            {
-                WorkerCount = Math.Clamp(_config.RenderProcessCount, 1, 8),
-                TransferMode = ProcessorTransferMode.MemoryMappedFile,
-                ReuseFileStream = true,
-            });
+            return _parallel ??= new ParallelPdfProcessor(
+                PdfParallelOptions.CreateProcessor(_config.RenderProcessCount));
         }
     }
 

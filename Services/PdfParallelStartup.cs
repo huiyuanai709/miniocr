@@ -42,21 +42,11 @@ public static class PdfParallelStartup
         OcrRuntimeConfig config,
         CancellationToken ct)
     {
-        var processor = new ParallelPdfProcessor(new ProcessorOptions
-        {
-            WorkerCount = Math.Clamp(config.RenderProcessCount, 1, 8),
-            TransferMode = ProcessorTransferMode.MemoryMappedFile,
-            ReuseFileStream = true,
-        });
+        var processor = new ParallelPdfProcessor(PdfParallelOptions.CreateProcessor(config.RenderProcessCount));
         try
         {
             await using MemoryStream pdf = new(ProbePdf, writable: false);
-            RenderOptions options = new(
-                Dpi: 36,
-                WithAnnotations: false,
-                WithFormFill: false,
-                AntiAliasing: PdfAntiAliasing.None,
-                Grayscale: true);
+            RenderOptions options = PdfParallelOptions.CreateRenderOptions(36);
             await foreach (SKBitmap bitmap in processor.ToImagesAsync(
                 pdf, leaveOpen: true, options: options, cancellationToken: ct).ConfigureAwait(false))
             {

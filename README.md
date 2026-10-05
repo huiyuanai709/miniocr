@@ -400,7 +400,7 @@ cd artifacts/linux-x64-singlefile
 | `rasterWorkers` | `Clamp(min(engines, cores/2), 1, 8)` |
 | `renderProcesses` | `Clamp(min(4, max(1, cores−engines)), 1, 4)` |
 
-`renderMode` 默认 **`parallel`**。PDFium 进程内有一把全局锁，多线程 `ToImages` 并不能并行栅格；`parallel` 把同一份临时 PDF 以内存映射交给长期存活的工作进程（灰度页在进程间按 Gray8 传输，宿主展开成 OCR 已直接使用的 BGRA8888）。每个进程、每份 PDF 只写一次临时文件，后面的批次复用这个已打开的 `FileStream`（`leaveOpen`，`FileShare.Read|Delete`）。`PDFtoImage.Parallel` 已有的 `ReuseFileStream` 会按路径再打开同一文件，不需要改 fork 的 API。任务或工人会话结束时删掉这个文件。要强制进程内栅格，设 `ocr.renderMode` 为 `inprocess` 或 `MINIOCR_RENDER_MODE=inprocess`。
+`renderMode` 默认 **`parallel`**。PDFium 进程内有一把全局锁，多线程 `ToImages` 并不能并行栅格。`parallel` 在进程启动时拉起一组工作进程，同一节点上同一份 PDF 的后续页批次一直用这一组；按批次再创建一个处理器大约要 300 ms 冷启动。每个任务在该节点把 PDF 写到临时文件一次，后面的批次复用这个已打开的 `FileStream`（`leaveOpen`，`FileShare.Read|Delete`）。`ProcessorOptions` 固定为 `WorkerCount = renderProcesses`（1–8）、`TransferMode = MemoryMappedFile`、`ReuseFileStream = true`、`ShareSourceFile = true`、`RetainDocuments = true`。内存映射按路径打开这份文件，位图走映射；`RetainDocuments` 在路径、长度、修改时间和密码都没变时让工作进程跳过再次解析。灰度 OCR 同时打开 `Grayscale` 和 `NativeGrayscale`：PDFium 直接画 Gray8，宿主展开成 BGRA8888。进程内回退走 `Conversion.ToImages`，该 API 忽略 `NativeGrayscale`。这些三项没有单独的配置开关，工作进程数仍是 `ocr.renderProcesses` / `MINIOCR_RENDER_PROCESSES`。任务或工人会话结束时删掉临时文件。要强制进程内栅格，设 `ocr.renderMode` 为 `inprocess` 或 `MINIOCR_RENDER_MODE=inprocess`。
 
 启动时会先拉起一个工作进程渲染一页空白 PDF。这一步失败（例如容器禁止 `fork` / 无法再执行本程序）时，进程打出一行 `Parallel PDF render workers failed to start: … Falling back to in-process rendering (ocr.renderMode=inprocess).`，本进程此后改走进程内栅格，服务照常起来。请求进行中如果工作进程崩溃，丢掉进程池，未写入 Channel 的页仍改回进程内渲染；取消请求不回退。子进程是再次启动本可执行文件。Native AOT 在 `Main` 之前进入 worker。本仓库的普通 `dotnet run` 仍带着 AOT 的 feature switch（动态代码和 startup hook 都是关的），所以入口程序集里还有一个 module initializer，在 `Main` 之前调用同一个 worker 引导，避免子进程把 Web 主机和 OCR 模型再加载一遍。
 
@@ -653,7 +653,7 @@ The current CPU is missing one or more of the required instruction sets.
 | 环节 | 策略 |
 | --- | --- |
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
-| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale`。默认 `textLayer=auto`：先分析文本层，能用的页不栅格。默认 `renderMode=parallel`：长期存活的 `PDFtoImage.Parallel` 进程池。每个节点每个任务把 PDF 写到临时文件一次，各批次复用该文件并内存映射（工作进程不各自拷贝大 PDF），任务结束再删除；灰度页走 Gray8 传输后在宿主展开为 BGRA。启动时若拉不起工作进程，打日志并在本进程生命周期内改走 `inprocess`（每 worker 一次 `ToImages`）。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
+| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale` + `NativeGrayscale`。默认 `textLayer=auto`：先分析文本层，能用的页不栅格。默认 `renderMode=parallel`：进程级一个 `PDFtoImage.Parallel` 进程池（`ShareSourceFile` + `RetainDocuments`，同一临时 PDF 的页批次不重建、不重复解析）。每个节点每个任务把 PDF 写到临时文件一次，各批次复用该文件并内存映射，任务结束再删除；Gray8 在宿主展开为 BGRA。启动时若拉不起工作进程，打日志并在本进程生命周期内改走 `inprocess`（每 worker 一次 `ToImages`，忽略 `NativeGrayscale`）。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
 | OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
 | 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。集群默认把这些组发给有 LLM key 的节点（`cluster.distributedNer`），协调节点合并去重。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
@@ -671,7 +671,7 @@ The current CPU is missing one or more of the required instruction sets.
 | --- | --- |
 | `external/SimdPaddleOCR` @ `6aae0ad` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
 | 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
-| `external/PDFtoImage` @ `579b2f2` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfSession` Gray8、`AnalyzePage` 文本/内容统计、`PDFtoImage.Parallel`，以及 net11.0 的 `runtime-async`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
+| `external/PDFtoImage` @ `8dfa9a5` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfSession` Gray8、`AnalyzePage`、`PDFtoImage.Parallel` 的 `ShareSourceFile` / `RetainDocuments` / `NativeGrayscale`，以及 net11.0 的 `runtime-async`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
 
 ## API
 
