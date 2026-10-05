@@ -25,6 +25,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     private readonly List<MappedPdf> _mapped = [];
     private ParallelPdfProcessor? _parallel;
     private int _parallelDisposed;
+    private int _firstParallelLease;
 
     public PdfOcrPipeline(
         OcrRuntimeConfig config,
@@ -326,17 +327,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             PdfBytes = pdfByteCount,
             DownloadMode = downloadMode,
             Dpi = dpi,
-            Timings = new OcrTimings
-            {
-                DownloadMs = Math.Round(downloadMs, 1),
-                RasterizeMs = Math.Round(rasterTotal, 1),
-                OcrMs = Math.Round(ocrTotal, 1),
-                TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
-            },
+            Timings = MakeTimings(
+                downloadMs,
+                rasterTotal,
+                ocrTotal,
+                totalSw.Elapsed.TotalMilliseconds,
+                visionPlan.AnalyzeMs,
+                default),
             Pages = visible,
             Entities = entities,
         };
         StampSources(response, pages);
+        LogOcrStages(response.Timings);
         return response;
     }
 
@@ -497,7 +499,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             }
         }
 
-        OcrEntities entities = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+        (OcrEntities entities, NerStages nerStages) = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
         List<OcrPageResult> visible = VisiblePages(pages);
 
         totalSw.Stop();
@@ -534,17 +536,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             PdfBytes = pdfByteCount,
             DownloadMode = downloadMode,
             Dpi = dpi,
-            Timings = new OcrTimings
-            {
-                DownloadMs = Math.Round(downloadMs, 1),
-                RasterizeMs = Math.Round(rasterTotal, 1),
-                OcrMs = Math.Round(ocrTotal, 1),
-                TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
-            },
+            Timings = MakeTimings(
+                downloadMs,
+                rasterTotal,
+                ocrTotal,
+                totalSw.Elapsed.TotalMilliseconds,
+                plan.AnalyzeMs,
+                nerStages),
             Pages = visible,
             Entities = entities,
         };
         StampSources(response, pages);
+        LogOcrStages(response.Timings);
         return response;
     }
 
@@ -597,10 +600,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
         string jobId;
         OcrEntities? distributedEntities = null;
+        double clusterOcrDoneMs = 0;
+        double clusterNerDoneMs = 0;
+        int clusterNerGroups = 0;
         // Classification streams beside notify so workers can download while pages are sorted.
         // Text layer off keeps the old path: every page is queued before the first claim.
+        double analyzeMs = 0;
         Func<ClusterJob, CancellationToken, Task>? classify = _config.TextLayerEnabled
-            ? (job, token) => StreamTextLayer(pdfBytes, pdfByteCount, pageCount, job, token)
+            ? (job, token) =>
+            {
+                analyzeMs = StreamTextLayer(pdfBytes, pdfByteCount, pageCount, job, token);
+                return Task.CompletedTask;
+            }
             : null;
 
         try
@@ -642,6 +653,9 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     token)).ConfigureAwait(false);
             jobId = outcome.JobId;
             distributedEntities = outcome.UsedDistributedNer ? outcome.Entities ?? new OcrEntities() : null;
+            clusterOcrDoneMs = outcome.OcrDoneMs;
+            clusterNerDoneMs = outcome.NerDoneMs;
+            clusterNerGroups = outcome.NerGroups;
         }
         catch (Exception)
         {
@@ -664,11 +678,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
         string hash = LogTextHash(pages);
         _cluster.PublishLastJobHash(jobId, hash);
-        OcrEntities entities = vision
-            ? EntitiesFromVisionPages(pages)
-            : distributedEntities is not null
-                ? distributedEntities
-                : await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+        NerStages nerStages = default;
+        OcrEntities entities;
+        if (vision)
+            entities = EntitiesFromVisionPages(pages);
+        else if (distributedEntities is not null)
+        {
+            entities = distributedEntities;
+            double tail = Math.Max(0, clusterNerDoneMs - clusterOcrDoneMs);
+            nerStages = new NerStages(tail, 0, clusterNerGroups, 0);
+        }
+        else
+            (entities, nerStages) = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
         List<OcrPageResult> visible = VisiblePages(pages);
         totalSw.Stop();
 
@@ -679,17 +700,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             PdfBytes = pdfByteCount,
             DownloadMode = downloadMode,
             Dpi = dpi,
-            Timings = new OcrTimings
-            {
-                DownloadMs = Math.Round(downloadMs, 1),
-                RasterizeMs = Math.Round(rasterTotal, 1),
-                OcrMs = Math.Round(ocrTotal, 1),
-                TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
-            },
+            Timings = MakeTimings(
+                downloadMs,
+                rasterTotal,
+                ocrTotal,
+                totalSw.Elapsed.TotalMilliseconds,
+                analyzeMs,
+                nerStages),
             Pages = visible,
             Entities = entities,
         };
         StampSources(response, pages);
+        LogOcrStages(response.Timings);
         return response;
     }
 
@@ -1147,6 +1169,39 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     private static RenderOptions CreateRenderOptions(int dpi) =>
         PdfParallelOptions.CreateRenderOptions(dpi);
 
+    private static OcrTimings MakeTimings(
+        double downloadMs,
+        double rasterMs,
+        double ocrMs,
+        double totalMs,
+        double analyzeMs,
+        NerStages ner) =>
+        new()
+        {
+            DownloadMs = Math.Round(downloadMs, 1),
+            RasterizeMs = Math.Round(rasterMs, 1),
+            OcrMs = Math.Round(ocrMs, 1),
+            TotalMs = Math.Round(totalMs, 1),
+            AnalyzeMs = Math.Round(analyzeMs, 1),
+            NerMs = Math.Round(ner.WallMs, 1),
+            NerRequestMs = Math.Round(ner.RequestMs, 1),
+            NerGroups = ner.Groups,
+            NerPeak = ner.Peak,
+        };
+
+    private void LogOcrStages(OcrTimings timings) =>
+        StageLog.OcrStages(
+            _logger,
+            timings.DownloadMs,
+            timings.RasterizeMs,
+            timings.OcrMs,
+            timings.AnalyzeMs,
+            timings.NerMs,
+            timings.NerRequestMs,
+            timings.NerGroups,
+            timings.NerPeak,
+            timings.TotalMs);
+
     private static OcrEntities EntitiesFromVisionPages(OcrPageResult[] pages)
     {
         EntityAccumulator acc = new();
@@ -1178,7 +1233,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         return EntityExtractor.ToEntities(acc);
     }
 
-    private async Task<OcrEntities> ExtractEntitiesAsync(
+    private async Task<(OcrEntities Entities, NerStages Ner)> ExtractEntitiesAsync(
         OcrPageResult[] pages,
         LlmEntityExtractor.LlmExtractionSession? ner)
     {
@@ -1195,26 +1250,26 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     "LLM NER done: companies={Companies}, persons={Persons}",
                     llmEntities.Companies.Count,
                     llmEntities.Persons.Count);
-                return llmEntities;
+                return (llmEntities, ner.Stages);
             }
             catch (Exception ex)
             {
                 _logger.LogError(
                     ex,
                     "LLM NER failed; returning empty entities (no heuristic fallback after LLM)");
-                return new OcrEntities();
+                return (new OcrEntities(), ner.Stages);
             }
         }
 
         if (fallbackWhenNoLlm)
         {
             List<string> texts = pages.Select(p => p.Text ?? "").ToList();
-            return EntityExtractor.ExtractFromPages(texts);
+            return (EntityExtractor.ExtractFromPages(texts), default);
         }
 
         _logger.LogInformation(
             "LLM NER unused/unconfigured and fallbackToHeuristics=false — empty entities");
-        return new OcrEntities();
+        return (new OcrEntities(), default);
     }
 
     private sealed class TextLayerPlan
@@ -1338,7 +1393,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     /// A text-layer page is completed once; anything else is admitted for OCR.
     /// On failure or cancel, whatever is still invisible is admitted so the job cannot stall.
     /// </summary>
-    private Task StreamTextLayer(
+    private double StreamTextLayer(
         byte[] pdfBytes,
         int pdfLength,
         int pageCount,
@@ -1449,7 +1504,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 sw.Elapsed.TotalMilliseconds);
         }
 
-        return Task.CompletedTask;
+        return sw.Elapsed.TotalMilliseconds;
     }
 
     private static void PlacePrepared(
@@ -1585,6 +1640,16 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         // path for every batch (ReuseFileStream) and keeps the parsed document
         // (RetainDocuments). leaveOpen keeps our handle. Do not construct a new processor here.
         MappedPdf mapped = await RetainMappedAsync(pdfBytes, pdfLength, ct).ConfigureAwait(false);
+        // Once per process. Later batches only read the flag; the stamp is taken only when Debug is on.
+        bool timeFirstLease = false;
+        long firstLease = 0;
+        if (Volatile.Read(ref _firstParallelLease) == 0
+            && Interlocked.CompareExchange(ref _firstParallelLease, 1, 0) == 0
+            && _logger.IsEnabled(LogLevel.Debug))
+        {
+            timeFirstLease = true;
+            firstLease = StageClock.Stamp();
+        }
         try
         {
             FileStream stream = mapped.Stream
@@ -1628,6 +1693,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
         finally
         {
+            if (timeFirstLease)
+                StageLog.RenderFirstLease(_logger, Math.Round(StageClock.MsSince(firstLease), 1));
             await EndMappedUseAsync(mapped).ConfigureAwait(false);
         }
     }

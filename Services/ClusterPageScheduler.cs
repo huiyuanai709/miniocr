@@ -105,6 +105,7 @@ public sealed class ClusterPageScheduler
     private int _expectedNodes;
     private int _done;
     private int _batchSeq;
+    private int _speculativeCopies;
     private long _version;
     private bool _holdLocalWindow;
     /// <summary>0-based page that blocks the next NER group. -1 when NER is not waiting on a hole.</summary>
@@ -205,6 +206,12 @@ public sealed class ClusterPageScheduler
     public long Version
     {
         get { lock (_gate) return _version; }
+    }
+
+    /// <summary>Pages included in speculative leases. A page copied twice counts twice.</summary>
+    public int SpeculativeCopies
+    {
+        get { lock (_gate) return _speculativeCopies; }
     }
 
     public void SetCapacity(string nodeId, int capacity)
@@ -697,6 +704,8 @@ public sealed class ClusterPageScheduler
             Created = now,
         };
         _leases[batchId] = lease;
+        if (speculative)
+            _speculativeCopies += zeroBased.Length;
         SignalCore();
         int[] oneBased = new int[zeroBased.Length];
         for (int i = 0; i < zeroBased.Length; i++)

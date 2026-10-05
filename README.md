@@ -918,14 +918,16 @@ MiniOcr.exe --urls http://0.0.0.0:5080
 默认 Information 保留：
 
 - 任务开始、PDF 下载、渲染 / OCR / NER 的阶段和耗时、任务结束
-- 进度汇总：大约每 3 秒，或每跨过 10%（两次至少隔 1 秒）：`done/total`、pages/s、`byNode=`。分布式 NER 打开时同一行带 `ner=已完成/已成组 nerInFlight= nerByNode=`。结束时仍有一行带 pages/s 的 `byNode=`（以及 NER 汇总）
-- 工人注册、加入任务、离开任务（离开行带本节点页数）
+- 单机（以及协调节点自己的 `OcrResponse.timings`）结束时一行 `OCR stages:`。`downloadMs` / `rasterizeMs` / `ocrMs` / `totalMs` 仍是原来的字段。`analyzeMs` 是文本层分类的墙钟。`nerWallMs` 是本地 LLM 从第一次请求到最后一次返回的墙钟（和 OCR 重叠，所以可以大于 NER 在 `totalMs` 里多出来的那段）；`nerRequestMs` 是各次请求耗时之和，并发时会大于 `nerWallMs`；`nerGroups` / `nerPeak` 是组数和同时在飞的请求峰值。分布式 NER 时协调节点响应里的 `nerMs` 是最后一页 OCR 完成到 NER 结束的尾巴，`nerRequestMs` 为 0（请求在工人上）。每组耗时只在 Debug：`LLM NER group pages=… requestMs=…`
+- 进度汇总：大约每 3 秒，或每跨过 10%（两次至少隔 1 秒）：`done/total`、pages/s、`byNode=`。分布式 NER 打开时同一行带 `ner=已完成/已成组 nerInFlight= nerByNode=`。结束时一行 `ocrDoneMs=`（从任务开始到页全部提交）、`nerDoneMs=`（到分布式 NER 结束；没开则为 0）、`speculativeCopies=`（投机复制的页数，同一页复制两次算两次）、`abandonedNer=`，`byNode=` 写成 `节点=页数(页/秒)`
+- 工人注册、加入任务、离开任务。离开行带本节点页数、pages/s，以及 `downloadMs` / `renderMs` / `ocrMs` / `postMs` / `waitMs`（`renderMs` 和 `ocrMs` 是各页耗时之和，和 `timings` 同一口径；`postMs` 是回传结果的墙钟；`waitMs` 是空领页等待）。进度行也带这几项。`GET /health` 的 `cluster.lastJob` 同样有 `ocrDoneMs`、`nerDoneMs`、`speculativeCopies`、`abandonedNerGroups`
 - 租约到期后页被重新排队、投机重试
 - 全部 warning / error
 
 改到 Debug 的例行事件（没有任务时的空轮询以前不打应用日志，现在也只在 Debug）：
 
-- 每次领页 / 发放 OCR 租约，以及每次领取 / 完成 NER 组
+- 每次领页 / 发放 OCR 租约，以及每次领取 / 完成 NER 组（含每组 `requestMs`）
+- 并行渲染进程池的冷启动和第一次正式租页（各一次：`Parallel PDF render pool cold start` / `first lease`）
 - 心跳成功
 - 每批完成、协调节点收下一批结果
 - 空的 dispatch / claim 轮询
@@ -934,7 +936,7 @@ MiniOcr.exe --urls http://0.0.0.0:5080
 
 要看回每批调度明细，二选一：
 
-- `cluster.verboseDispatch: true`，或 `MINIOCR_CLUSTER_VERBOSE_DISPATCH=1`（上面的 Debug 行升到 Information，默认日志级别就能看见）
+- `cluster.verboseDispatch: true`，或 `MINIOCR_CLUSTER_VERBOSE_DISPATCH=1`（领页、心跳、批次完成、空轮询升到 Information。每组 NER `requestMs` 和渲染池冷启动 / 第一次租页仍只在 Debug）
 - 不改这个开关，把类别调到 Debug：`Logging__LogLevel__MiniOcr.Services.ClusterCoordinator=Debug` 和 `Logging__LogLevel__MiniOcr.Services.ClusterWorkerHost=Debug`
 
 要看每条 HTTP：`Logging__LogLevel__Microsoft.AspNetCore=Information` 和 `Logging__LogLevel__System.Net.Http.HttpClient=Information`。

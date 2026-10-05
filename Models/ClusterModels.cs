@@ -119,6 +119,14 @@ public sealed class ClusterLastJobHealth
     public List<ClusterNodePages> Nodes { get; set; } = [];
     /// <summary>NER groups completed by each node. <see cref="ClusterNodePages.Pages"/> is a group count.</summary>
     public List<ClusterNodePages>? NerByNode { get; set; }
+    /// <summary>Milliseconds from job start until every OCR page was committed. Zero if the job stopped first.</summary>
+    public double OcrDoneMs { get; set; }
+    /// <summary>Milliseconds from job start until distributed NER finished. Zero when NER was not distributed.</summary>
+    public double NerDoneMs { get; set; }
+    /// <summary>Pages handed out as speculative copies.</summary>
+    public int SpeculativeCopies { get; set; }
+    /// <summary>NER groups given up after retries or dropped at the deadline.</summary>
+    public int AbandonedNerGroups { get; set; }
 }
 
 public sealed class ClusterNodePages

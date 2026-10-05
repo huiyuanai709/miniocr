@@ -98,6 +98,7 @@ public sealed class ClusterNerScheduler
     private long _version;
     private bool _sealed;
     private bool _sawSuccess;
+    private int _abandoned;
     private DateTimeOffset _fairHoldUntil;
 
     public ClusterNerScheduler(ClusterNerOptions options)
@@ -348,7 +349,7 @@ public sealed class ClusterNerScheduler
             group.Owner = null;
             if (group.Failures >= _maxAttempts)
             {
-                _giveUps.Add(new ClusterNerGiveUp(group.Id, group.Pages, group.Failures));
+                GiveUp(group);
                 MarkDone(group, "");
                 SignalCore();
                 return;
@@ -628,6 +629,17 @@ public sealed class ClusterNerScheduler
         return group;
     }
 
+    public int AbandonedGroups
+    {
+        get { lock (_gate) return _abandoned; }
+    }
+
+    private void GiveUp(Group group)
+    {
+        _giveUps.Add(new ClusterNerGiveUp(group.Id, group.Pages, group.Failures));
+        _abandoned++;
+    }
+
     private void Enqueue(Group group)
     {
         if (group.Done || group.Queued || group.Owner is not null)
@@ -651,7 +663,7 @@ public sealed class ClusterNerScheduler
         {
             if (group.Done)
                 continue;
-            _giveUps.Add(new ClusterNerGiveUp(group.Id, group.Pages, group.Failures));
+            GiveUp(group);
             group.Owner = null;
             MarkDone(group, "");
             abandoned++;
@@ -713,7 +725,7 @@ public sealed class ClusterNerScheduler
             group.Failures++;
             if (group.Failures >= _maxAttempts)
             {
-                _giveUps.Add(new ClusterNerGiveUp(group.Id, group.Pages, group.Failures));
+                GiveUp(group);
                 MarkDone(group, "");
                 SignalCore();
                 return;

@@ -519,6 +519,8 @@ public sealed class ClusterCoordinator : IHostedService
         Task deadline = DeadlineAsync(job, linked.Token);
         Task? localNer = ner is null ? null : RunLocalNerAsync(job, ner, localNerCap, linked.Token);
 
+        double ocrDoneMs = 0;
+        double nerDoneMs = 0;
         OcrEntities? distributedEntities = null;
         bool usedDistributed = false;
         int localFailures = 0;
@@ -718,11 +720,13 @@ public sealed class ClusterCoordinator : IHostedService
                     $"Cluster job {id} ended with {scheduler.Snapshot().Done}/{pageCount} pages.");
             }
 
+            ocrDoneMs = (DateTimeOffset.UtcNow - job.Started).TotalMilliseconds;
             if (ner is not null)
             {
                 ner.Seal();
                 if (localNer is not null)
                     await localNer.ConfigureAwait(false);
+                nerDoneMs = (DateTimeOffset.UtcNow - job.Started).TotalMilliseconds;
                 foreach (ClusterNerGiveUp give in ner.DrainGiveUps())
                 {
                     _logger.LogWarning(
@@ -778,7 +782,7 @@ public sealed class ClusterCoordinator : IHostedService
             }
 
             double elapsed = (DateTimeOffset.UtcNow - job.Started).TotalMilliseconds;
-            string byNode = ClusterJobLog.FormatByNode(snap);
+            string byNode = ClusterJobLog.FormatByNodeRate(snap, elapsed);
             string nerSuffix = "";
             int nerGroups = 0;
             List<ClusterNodePages>? nerByNode = null;
@@ -797,12 +801,18 @@ public sealed class ClusterCoordinator : IHostedService
             }
 
             double pagesPerSecond = pageCount / Math.Max(0.001, elapsed / 1000.0);
+            int speculativeCopies = scheduler.SpeculativeCopies;
+            int abandonedNer = ner?.AbandonedGroups ?? 0;
             _logger.LogInformation(
-                "Cluster job {JobId} done: pages={Pages} elapsedMs={Elapsed:F0} {Rate:F1} pages/s byNode={ByNode}{Ner}",
+                "Cluster job {JobId} done: pages={Pages} elapsedMs={Elapsed:F0} {Rate:F1} pages/s ocrDoneMs={OcrDone:F0} nerDoneMs={NerDone:F0} speculativeCopies={Speculative} abandonedNer={Abandoned} byNode={ByNode}{Ner}",
                 id,
                 pageCount,
                 elapsed,
                 pagesPerSecond,
+                ocrDoneMs,
+                nerDoneMs,
+                speculativeCopies,
+                abandonedNer,
                 byNode,
                 nerSuffix);
 
@@ -814,6 +824,10 @@ public sealed class ClusterCoordinator : IHostedService
                 Nodes = breakdown,
                 NerGroups = nerGroups,
                 NerByNode = nerByNode,
+                OcrDoneMs = Math.Round(ocrDoneMs, 1),
+                NerDoneMs = Math.Round(nerDoneMs, 1),
+                SpeculativeCopies = speculativeCopies,
+                AbandonedNerGroups = abandonedNer,
             };
 
             lock (_publish)
@@ -824,10 +838,16 @@ public sealed class ClusterCoordinator : IHostedService
             }
         }
 
-        return new ClusterRunResult(id, usedDistributed, distributedEntities);
+        return new ClusterRunResult(id, usedDistributed, distributedEntities, ocrDoneMs, nerDoneMs, ner is null ? 0 : ner.Snapshot().Formed);
     }
 
-    public readonly record struct ClusterRunResult(string JobId, bool UsedDistributedNer, OcrEntities? Entities);
+    public readonly record struct ClusterRunResult(
+        string JobId,
+        bool UsedDistributedNer,
+        OcrEntities? Entities,
+        double OcrDoneMs = 0,
+        double NerDoneMs = 0,
+        int NerGroups = 0);
 
     /// <summary>How long <c>/ner/claim</c> stays open when no group is handed out. Workers block here instead of polling.</summary>
     public const int NerClaimWaitMs = 15_000;

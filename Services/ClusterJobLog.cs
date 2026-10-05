@@ -57,6 +57,24 @@ internal static class ClusterJobLog
         return parts.Count == 0 ? "(none)" : string.Join(", ", parts);
     }
 
+    /// <summary>Job-end form of <see cref="FormatByNode"/>: pages and pages/s over <paramref name="elapsedMs"/>.</summary>
+    public static string FormatByNodeRate(ClusterScheduleSnapshot snap, double elapsedMs)
+    {
+        if (snap.Nodes.Count == 0)
+            return "(none)";
+        double seconds = Math.Max(0.001, elapsedMs / 1000.0);
+        List<string> parts = [];
+        foreach (ClusterNodeLoad load in snap.Nodes.OrderBy(n => n.NodeId, StringComparer.Ordinal))
+        {
+            if (load.PagesCommitted <= 0)
+                continue;
+            double rate = load.PagesCommitted / seconds;
+            parts.Add(load.NodeId + "=" + load.PagesCommitted + "(" + rate.ToString("F1") + "/s)");
+        }
+
+        return parts.Count == 0 ? "(none)" : string.Join(", ", parts);
+    }
+
     public static string FormatNer(ClusterNerSnapshot snap)
     {
         string by = FormatByNode(new ClusterScheduleSnapshot { Nodes = snap.Nodes });

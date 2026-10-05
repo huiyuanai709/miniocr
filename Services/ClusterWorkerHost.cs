@@ -285,6 +285,7 @@ public sealed class ClusterWorkerHost : IHostedService
         DateTimeOffset progressAt = started;
         Task? nerTask = null;
         byte[]? renderPdf = null;
+        var stages = new WorkerStageTotals();
         try
         {
             _logger.LogInformation(
@@ -341,6 +342,7 @@ public sealed class ClusterWorkerHost : IHostedService
                 }
 
                 download.Stop();
+                stages.DownloadMs = download.Elapsed.TotalMilliseconds;
                 RememberPdf(jobId, pdf);
                 _logger.LogInformation(
                     "Cluster worker {NodeId} job {JobId} PDF downloaded bytes={Bytes} ms={Ms:F0} via={Source}",
@@ -366,12 +368,13 @@ public sealed class ClusterWorkerHost : IHostedService
             if (_config.PipelineOcr)
             {
                 localDone += await RunPipelinedOcrAsync(
-                    coordinatorUrl, jobId, dpi, pageCount, pdfBytes, started, progressAt, ct).ConfigureAwait(false);
+                    coordinatorUrl, jobId, dpi, pageCount, pdfBytes, started, progressAt, stages, ct).ConfigureAwait(false);
             }
             else
             while (!ct.IsCancellationRequested)
             {
                 ClusterClaimResponse? claim;
+                long waitStart = StageClock.Stamp();
                 try
                 {
                     claim = await ClaimWithRetryAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
@@ -384,6 +387,7 @@ public sealed class ClusterWorkerHost : IHostedService
                 {
                     _logger.LogWarning(ex, "Cluster worker {NodeId} claim on {JobId} failed; retrying", _self.NodeId, jobId);
                     await Task.Delay(500, ct).ConfigureAwait(false);
+                    stages.AddWait(waitStart);
                     continue;
                 }
                 if (claim is null)
@@ -394,6 +398,7 @@ public sealed class ClusterWorkerHost : IHostedService
                 {
                     ClusterJobLog.ClaimWait(_logger, _config.VerboseDispatch, _self.NodeId, jobId);
                     await Task.Delay(Math.Clamp(claim.RetryAfterMs, 50, 2000), ct).ConfigureAwait(false);
+                    stages.AddWait(waitStart);
                     continue;
                 }
 
@@ -412,7 +417,11 @@ public sealed class ClusterWorkerHost : IHostedService
                         dpi,
                         results.Add,
                         ct).ConfigureAwait(false);
+                    foreach (OcrPageResult page in results)
+                        stages.AddPage(page.RasterizeMs, page.OcrMs);
+                    long postStart = StageClock.Stamp();
                     await PostResultsAsync(coordinatorUrl, jobId, claim.BatchId, results, ct).ConfigureAwait(false);
+                    stages.AddPost(postStart);
                     Interlocked.Add(ref _pagesDone, results.Count);
                     localDone += results.Count;
                     ClusterJobLog.BatchDone(
@@ -426,27 +435,7 @@ public sealed class ClusterWorkerHost : IHostedService
                     if (now - progressAt >= ClusterJobLog.ProgressInterval)
                     {
                         double rate = localDone / Math.Max(0.001, (now - started).TotalSeconds);
-                        if (nerTask is null)
-                        {
-                            _logger.LogInformation(
-                                "Cluster worker {NodeId} job {JobId} progress: localPages={Pages} jobPages={Total} {Rate:F1} pages/s",
-                                _self.NodeId,
-                                jobId,
-                                localDone,
-                                pageCount,
-                                rate);
-                        }
-                        else
-                        {
-                            _logger.LogInformation(
-                                "Cluster worker {NodeId} job {JobId} progress: localPages={Pages} jobPages={Total} {Rate:F1} pages/s nerGroups={NerGroups}",
-                                _self.NodeId,
-                                jobId,
-                                localDone,
-                                pageCount,
-                                rate,
-                                Volatile.Read(ref nerGroups));
-                        }
+                        LogWorkerProgress(jobId, localDone, pageCount, rate, stages, nerTask is not null ? Volatile.Read(ref nerGroups) : -1);
 
                         progressAt = now;
                     }
@@ -496,11 +485,18 @@ public sealed class ClusterWorkerHost : IHostedService
             _sessions.TryRemove(jobId, out _);
             _recentlyLeft[jobId] = DateTimeOffset.UtcNow.UtcTicks;
             sessionCts.Dispose();
-            _logger.LogInformation(
-                "Cluster worker {NodeId} left job {JobId} localPages={Pages}",
+            double rate = localDone / Math.Max(0.001, (DateTimeOffset.UtcNow - started).TotalSeconds);
+            StageLog.WorkerDone(
+                _logger,
                 _self.NodeId,
                 jobId,
-                localDone);
+                localDone,
+                rate,
+                stages.DownloadMs,
+                stages.RenderMs,
+                stages.OcrMs,
+                stages.PostMs,
+                stages.WaitMs);
         }
     }
 
@@ -509,6 +505,46 @@ public sealed class ClusterWorkerHost : IHostedService
     /// without holding an engine across the HTTP call. <c>PipelineOcr</c> false keeps
     /// the claim-whole-batch loop.
     /// </summary>
+    private void LogWorkerProgress(
+        string jobId,
+        int localDone,
+        int pageCount,
+        double rate,
+        WorkerStageTotals stages,
+        int nerGroups)
+    {
+        if (nerGroups < 0)
+        {
+            StageLog.WorkerProgress(
+                _logger,
+                _self.NodeId,
+                jobId,
+                localDone,
+                pageCount,
+                rate,
+                stages.DownloadMs,
+                stages.RenderMs,
+                stages.OcrMs,
+                stages.PostMs,
+                stages.WaitMs);
+            return;
+        }
+
+        StageLog.WorkerProgressNer(
+            _logger,
+            _self.NodeId,
+            jobId,
+            localDone,
+            pageCount,
+            rate,
+            stages.DownloadMs,
+            stages.RenderMs,
+            stages.OcrMs,
+            stages.PostMs,
+            stages.WaitMs,
+            nerGroups);
+    }
+
     private async Task<int> RunPipelinedOcrAsync(
         string coordinatorUrl,
         string jobId,
@@ -517,6 +553,7 @@ public sealed class ClusterWorkerHost : IHostedService
         byte[] pdfBytes,
         DateTimeOffset started,
         DateTimeOffset progressAt,
+        WorkerStageTotals stages,
         CancellationToken ct)
     {
         int depth = Math.Max(4, _self.Capacity + Math.Max(0, _config.RenderAheadPages));
@@ -548,6 +585,7 @@ public sealed class ClusterWorkerHost : IHostedService
                 while (!pipeCts.IsCancellationRequested)
                 {
                     ClusterClaimResponse? claim;
+                    long waitStart = StageClock.Stamp();
                     try
                     {
                         claim = await ClaimWithRetryAsync(coordinatorUrl, jobId, pipeCts.Token).ConfigureAwait(false);
@@ -560,6 +598,7 @@ public sealed class ClusterWorkerHost : IHostedService
                     {
                         _logger.LogWarning(ex, "Cluster worker {NodeId} claim on {JobId} failed; retrying", _self.NodeId, jobId);
                         await Task.Delay(500, pipeCts.Token).ConfigureAwait(false);
+                        stages.AddWait(waitStart);
                         continue;
                     }
 
@@ -570,6 +609,7 @@ public sealed class ClusterWorkerHost : IHostedService
                         ClusterJobLog.ClaimWait(_logger, _config.VerboseDispatch, _self.NodeId, jobId);
                         int retry = Math.Clamp(claim?.RetryAfterMs ?? 200, 50, 2000);
                         await wake.WaitAsync(TimeSpan.FromMilliseconds(retry), pipeCts.Token).ConfigureAwait(false);
+                        stages.AddWait(waitStart);
                         continue;
                     }
 
@@ -614,9 +654,12 @@ public sealed class ClusterWorkerHost : IHostedService
                 if (poisoned.ContainsKey(batchId))
                     continue;
 
+                stages.AddPage(page.RasterizeMs, page.OcrMs);
+                long postStart = StageClock.Stamp();
                 try
                 {
                     await PostResultsAsync(coordinatorUrl, jobId, batchId, [page], ct).ConfigureAwait(false);
+                    stages.AddPost(postStart);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -651,13 +694,7 @@ public sealed class ClusterWorkerHost : IHostedService
                 {
                     progressAt = now;
                     double rate = doneNow / Math.Max(0.001, (now - started).TotalSeconds);
-                    _logger.LogInformation(
-                        "Cluster worker {NodeId} job {JobId} progress: localPages={Pages} jobPages={Total} {Rate:F1} pages/s",
-                        _self.NodeId,
-                        jobId,
-                        doneNow,
-                        pageCount,
-                        rate);
+                    LogWorkerProgress(jobId, doneNow, pageCount, rate, stages, -1);
                 }
             }
         }

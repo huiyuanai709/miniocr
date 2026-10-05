@@ -112,6 +112,15 @@ public sealed class LlmEntityExtractor
         private readonly List<string> _companies = [];
         private readonly List<string> _persons = [];
         private LlmPageGrouper.PageBatch? _held;
+        private long _requestTicks;
+        private long _firstStart;
+        private long _lastEnd;
+        private int _groups;
+        private int _inFlight;
+        private int _peak;
+
+        /// <summary>Filled when <see cref="CompleteAsync"/> finishes, including the failure path.</summary>
+        internal NerStages Stages { get; private set; }
 
         internal LlmExtractionSession(
             LlmEntityExtractor owner,
@@ -169,9 +178,32 @@ public sealed class LlmEntityExtractor
             }
             finally
             {
+                Stages = SnapshotStages();
+                if (Stages.Groups > 0)
+                {
+                    StageLog.NerSummary(
+                        _owner._logger,
+                        Stages.Groups,
+                        Math.Round(Stages.WallMs, 1),
+                        Math.Round(Stages.RequestMs, 1),
+                        Stages.Peak);
+                }
+
                 _slots.Dispose();
                 _failCts.Dispose();
             }
+        }
+
+        private NerStages SnapshotStages()
+        {
+            long first = Volatile.Read(ref _firstStart);
+            long last = Volatile.Read(ref _lastEnd);
+            double wall = first == 0 || last < first ? 0 : StageClock.TicksToMs(last - first);
+            return new NerStages(
+                wall,
+                StageClock.TicksToMs(Volatile.Read(ref _requestTicks)),
+                Volatile.Read(ref _groups),
+                Volatile.Read(ref _peak));
         }
 
         /// <summary>Observe in-flight calls after a failure. Safe to call once.</summary>
@@ -264,10 +296,16 @@ public sealed class LlmEntityExtractor
         private async Task RunAsync(LlmPageGrouper.PageBatch batch)
         {
             bool acquired = false;
+            bool started = false;
+            long start = 0;
             try
             {
                 await _slots.WaitAsync(_failCts.Token).ConfigureAwait(false);
                 acquired = true;
+                int now = Interlocked.Increment(ref _inFlight);
+                StageClock.RaisePeak(ref _peak, now);
+                start = StageClock.Stamp();
+                started = true;
                 LlmEntityPayload payload = await _owner.CompleteBatchAsync(batch, _failCts.Token)
                     .ConfigureAwait(false);
 
@@ -314,6 +352,24 @@ public sealed class LlmEntityExtractor
             }
             finally
             {
+                if (started)
+                {
+                    long end = StageClock.Stamp();
+                    long elapsed = end - start;
+                    Interlocked.Add(ref _requestTicks, elapsed);
+                    StageClock.NoteMin(ref _firstStart, start);
+                    StageClock.NoteMax(ref _lastEnd, end);
+                    Interlocked.Increment(ref _groups);
+                    Interlocked.Decrement(ref _inFlight);
+                    if (_owner._logger.IsEnabled(LogLevel.Debug))
+                    {
+                        StageLog.NerGroup(
+                            _owner._logger,
+                            string.Join(',', batch.PageNumbers),
+                            Math.Round(StageClock.TicksToMs(elapsed), 1));
+                    }
+                }
+
                 if (acquired)
                     _slots.Release();
             }
