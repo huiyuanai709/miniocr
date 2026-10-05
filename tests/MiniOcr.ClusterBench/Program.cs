@@ -72,8 +72,7 @@ static async Task<BenchReport> RunScenarioAsync(string mode, string sourceUrl)
     try
     {
         await WaitHealthAsync(coord + "/health", TimeSpan.FromSeconds(15));
-        await Task.Delay(200);
-        using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(5) };
+        using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(20) };
         using HttpResponseMessage start = await http.PostAsync(coord + "/start", new StringContent(""));
         start.EnsureSuccessStatusCode();
         string? line = await ReadBenchLineAsync(coordinator, TimeSpan.FromSeconds(40));
@@ -215,6 +214,12 @@ static async Task HandleAsync(HttpListenerContext ctx, JobState job, byte[] pdf)
 
         if (path == "/start")
         {
+            if (!await job.WaitForWorkersAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false))
+            {
+                await WriteTextAsync(ctx, 503, "{\"ok\":false}");
+                return;
+            }
+
             job.Start();
             await WriteTextAsync(ctx, 200, "ok");
             return;
@@ -222,6 +227,9 @@ static async Task HandleAsync(HttpListenerContext ctx, JobState job, byte[] pdf)
 
         if (path == "/dispatch")
         {
+            using JsonDocument seen = await ReadJsonAsync(ctx.Request);
+            if (seen.RootElement.TryGetProperty("node", out JsonElement seenNode))
+                job.SeeWorker(seenNode.GetString() ?? "");
             string json = job.Started.Task.IsCompleted
                 ? "{\"wait\":false,\"sourceUrl\":" + JsonQuoted(job.SourceUrl) + "}"
                 : "{\"wait\":true}";
@@ -249,6 +257,15 @@ static async Task HandleAsync(HttpListenerContext ctx, JobState job, byte[] pdf)
 
             using JsonDocument doc = await ReadJsonAsync(ctx.Request);
             string node = doc.RootElement.GetProperty("node").GetString() ?? "";
+            // Legacy joins only after a full download. The fast node can finish that
+            // download and drain every page before the slow node joins, which cancels
+            // the slow download. Hold claims until both workers are ready.
+            if (!job.Adaptive && !job.BothWorkersReady)
+            {
+                await WriteTextAsync(ctx, 200, "{\"wait\":true}");
+                return;
+            }
+
             if (job.Adaptive)
                 job.Sched.SetNerBlocker(job.EarliestMissing());
             ClusterClaim claim = job.Sched.Claim(node, 16, DateTimeOffset.UtcNow);
@@ -360,7 +377,9 @@ static async Task<int> WorkerAsync(string[] args)
     string? source = null;
     for (int i = 0; i < 400; i++)
     {
-        using HttpResponseMessage resp = await http.PostAsync(coord + "/dispatch", new StringContent("{}"));
+        using HttpResponseMessage resp = await http.PostAsync(
+            coord + "/dispatch",
+            new StringContent("{\"node\":" + JsonQuoted(id) + "}", Encoding.UTF8, "application/json"));
         using JsonDocument doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
         if (doc.RootElement.TryGetProperty("wait", out JsonElement wait) && wait.GetBoolean())
         {
@@ -570,6 +589,8 @@ sealed class JobState
     private readonly Dictionary<string, int> _pages = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _maxBatch = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _firstBatch = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _seen = new(StringComparer.Ordinal);
+    private readonly TaskCompletionSource _workersSeen = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly CancellationTokenSource _reads = new();
     private long _t0;
     public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -627,8 +648,42 @@ sealed class JobState
 
         if (Adaptive)
             Sched.SetHoldLocalWindow(hold);
-        else if (!downloading)
+        else if (BothWorkersReady)
             Sched.SetHoldLocalWindow(false);
+    }
+
+    public void SeeWorker(string node)
+    {
+        if (node is not ("fast" or "slow"))
+            return;
+        lock (_gate)
+        {
+            _seen.Add(node);
+            if (_seen.Contains("fast") && _seen.Contains("slow"))
+                _workersSeen.TrySetResult();
+        }
+    }
+
+    public async Task<bool> WaitForWorkersAsync(TimeSpan timeout)
+    {
+        try
+        {
+            await _workersSeen.Task.WaitAsync(timeout).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+    }
+
+    public bool BothWorkersReady
+    {
+        get
+        {
+            lock (_gate)
+                return ReadyFastMs >= 0 && ReadySlowMs >= 0;
+        }
     }
 
     public void NoteBatch(string node, int count)
