@@ -147,7 +147,7 @@ public sealed class HealthResponse
     /// <summary><c>auto</c>, <c>off</c>, or <c>force</c>.</summary>
     public string TextLayer { get; set; } = "auto";
     public int RecBatchLines { get; set; }
-    /// <summary><c>cpu</c> (default), <c>auto</c>, or <c>vulkan</c>.</summary>
+    /// <summary>Backend that will actually run: <c>cpu</c>, <c>vulkan</c>, or <c>metal</c>. A <c>metal</c> request off macOS is reported as <c>cpu</c>.</summary>
     public string OcrBackend { get; set; } = "cpu";
     /// <summary>Recognizer intra-op threads on each pooled engine. <c>0</c> is the library default.</summary>
     public int RecIntraOpThreads { get; set; } = 1;
@@ -155,6 +155,10 @@ public sealed class HealthResponse
     public string VulkanDevice { get; set; } = "";
     /// <summary>Device-local heap of <see cref="VulkanDevice"/>, in bytes.</summary>
     public ulong VulkanDeviceLocalBytes { get; set; }
+    /// <summary>Vulkan or Metal device name. Empty on CPU.</summary>
+    public string GpuDevice { get; set; } = "";
+    /// <summary>Vulkan device-local bytes, or Metal recommendedMaxWorkingSetSize.</summary>
+    public ulong GpuMemoryBytes { get; set; }
     public int DetLimitSideLength { get; set; }
     public bool AutoScaleFromCpu { get; set; }
     public string ConfigPath { get; set; } = "";

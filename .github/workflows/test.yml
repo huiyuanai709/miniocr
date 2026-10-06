@@ -49,3 +49,37 @@ jobs:
 
       - name: PDF text layer
         run: dotnet run -c Release --project tests/MiniOcr.TextLayerSmoke
+
+  # Native AOT Metal path on Apple Silicon. Shaders are embedded resources;
+  # this publish fails the job if ILC drops them or the session falls back to CPU.
+  metal-smoke:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET 11 RC
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "11.0.x"
+          dotnet-quality: preview
+
+      - name: Publish Native AOT metal smoke (osx-arm64)
+        run: |
+          set -euo pipefail
+          uname -m
+          dotnet publish tests/MiniOcr.MetalSmoke/MiniOcr.MetalSmoke.csproj \
+            -c Release \
+            -r osx-arm64 \
+            --self-contained true \
+            -p:PublishAot=true \
+            -o artifacts/metal-smoke
+
+      - name: Compare CPU and Metal text
+        run: |
+          set -euo pipefail
+          chmod +x artifacts/metal-smoke/MiniOcr.MetalSmoke
+          ./artifacts/metal-smoke/MiniOcr.MetalSmoke samples/sample-multipage.pdf
