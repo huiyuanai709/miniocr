@@ -191,6 +191,13 @@ else
     engine = await OcrEngine.CreateAsync(
         bootstrapLogs.CreateLogger<OcrEngine>(),
         runtimeConfig);
+    if (engine.EngineCount != runtimeConfig.EngineCount)
+        runtimeConfig = runtimeConfig.With(engineCount: engine.EngineCount);
+    if (!string.IsNullOrEmpty(engine.VulkanDeviceName))
+    {
+        Console.WriteLine(
+            $"Vulkan device: {engine.VulkanDeviceName} deviceLocalMB={engine.VulkanDeviceLocalBytes / (1024 * 1024)} bufferCapMB={engine.VulkanBufferCapBytes / (1024 * 1024)} engines={engine.EngineCount}");
+    }
 }
 
 builder.Services.AddSingleton(runtimeConfig);
@@ -390,6 +397,8 @@ app.MapGet("/health", (IServiceProvider sp) =>
             RecBatchLines = cfg.RecBatchLines,
             OcrBackend = cfg.Backend,
             RecIntraOpThreads = cfg.RecIntraOpThreads,
+            VulkanDevice = ocr?.VulkanDeviceName ?? "",
+            VulkanDeviceLocalBytes = ocr?.VulkanDeviceLocalBytes ?? 0,
             DetLimitSideLength = cfg.DetLimitSideLength,
             AutoScaleFromCpu = cfg.AutoScaleFromCpu,
             ConfigPath = configPath,
@@ -847,7 +856,7 @@ app.MapGet("/", () => Results.Text(
     $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} " +
     $"ocr.mode={runtimeConfig.Mode} wechat={wechatStatus} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
-    "Env OCR: MINIOCR_OCR_MODE MINIOCR_OCR_BACKEND MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_REC_INTRA_OP_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS MINIOCR_RENDER_MODE MINIOCR_RENDER_PROCESSES\n" +
+    "Env OCR: MINIOCR_OCR_MODE MINIOCR_OCR_BACKEND MINIOCR_OCR_VULKAN_DEVICE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_REC_INTRA_OP_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS MINIOCR_RENDER_MODE MINIOCR_RENDER_PROCESSES\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
     "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH MINIOCR_CLUSTER_DISTRIBUTED_NER\n" +
