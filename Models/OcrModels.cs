@@ -151,6 +151,10 @@ public sealed class HealthResponse
     public string OcrBackend { get; set; } = "cpu";
     /// <summary>Recognizer intra-op threads on each pooled engine. <c>0</c> is the library default.</summary>
     public int RecIntraOpThreads { get; set; } = 1;
+    /// <summary>Selected Vulkan device, empty when the process is not using Vulkan.</summary>
+    public string VulkanDevice { get; set; } = "";
+    /// <summary>Device-local heap of <see cref="VulkanDevice"/>, in bytes.</summary>
+    public ulong VulkanDeviceLocalBytes { get; set; }
     public int DetLimitSideLength { get; set; }
     public bool AutoScaleFromCpu { get; set; }
     public string ConfigPath { get; set; } = "";

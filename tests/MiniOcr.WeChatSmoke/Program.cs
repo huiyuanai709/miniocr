@@ -261,6 +261,14 @@ try
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", null);
     AssertEqual("cpu", cfg.Backend, "default backend is cpu");
     AssertEqual("1", cfg.RecIntraOpThreads.ToString(), "default rec intra-op threads is 1");
+    AssertEqual("", cfg.VulkanDevice, "default vulkan device is empty");
+    AssertEqual("", cfg.With().VulkanDevice, "With copies vulkan device");
+    AssertEqual("1", OcrRuntimeConfig.VulkanEngineCount(2UL << 30, 2).ToString(), "2 GB Vulkan heap uses 1 engine");
+    AssertEqual("2", OcrRuntimeConfig.VulkanEngineCount(8UL << 30, 2).ToString(), "8 GB Vulkan heap keeps 2 engines");
+    AssertEqual("6", OcrRuntimeConfig.VulkanEngineCount(4UL << 30, 6).ToString(), "4 GB heap is not capped");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_VULKAN_DEVICE", "MX450");
+    AssertEqual("MX450", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).VulkanDevice, "env vulkan device overrides file");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_VULKAN_DEVICE", null);
     AssertEqual("cpu", cfg.With().Backend, "With copies backend");
     AssertEqual("1", cfg.With().RecIntraOpThreads.ToString(), "With copies rec intra-op threads");
     AssertEqual("cpu", OcrRuntimeConfig.CanonicalBackend("gpu"), "unknown backend stays cpu");

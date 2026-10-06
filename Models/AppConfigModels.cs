@@ -80,6 +80,8 @@ public sealed class OcrFileConfig
     public string Backend { get; set; } = "cpu";
     /// <summary>Recognizer intra-op threads per engine. Null = 1. <c>0</c> lets the library pick.</summary>
     public int? RecIntraOpThreads { get; set; }
+    /// <summary>Vulkan device index (<c>0</c>) or name substring (<c>MX450</c>). Empty picks the first discrete GPU.</summary>
+    public string? VulkanDevice { get; set; }
     public bool AutoScaleFromCpu { get; set; } = true;
 
     /// <summary>Full path to WeChatOCR.exe (3.9) or wxocr.dll (4.x). Empty = auto-detect.</summary>

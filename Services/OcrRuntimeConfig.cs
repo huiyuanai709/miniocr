@@ -32,6 +32,8 @@ public sealed class OcrRuntimeConfig
     public string Backend { get; init; } = "cpu";
     /// <summary>Recognizer intra-op threads per engine. <c>0</c> lets the library choose.</summary>
     public int RecIntraOpThreads { get; init; } = 1;
+    /// <summary>Vulkan device index or name substring. Empty picks the first discrete GPU.</summary>
+    public string VulkanDevice { get; init; } = "";
     public int DetLimitSideLength { get; init; }
     public bool AutoScaleFromCpu { get; init; }
     public int ProcessorCount { get; init; }
@@ -152,6 +154,9 @@ public sealed class OcrRuntimeConfig
         string backend = CanonicalBackend(FirstSet(
             Environment.GetEnvironmentVariable("MINIOCR_OCR_BACKEND"),
             ocr.Backend));
+        string vulkanDevice = FirstSet(
+            Environment.GetEnvironmentVariable("MINIOCR_OCR_VULKAN_DEVICE"),
+            ocr.VulkanDevice) ?? "";
 
         // One WeChatOCR process is single-threaded. Default is a few processes, not one per core:
         // a 12-thread laptop gets 3. Cap the auto default at 3; explicit values may go up to 8.
@@ -201,6 +206,7 @@ public sealed class OcrRuntimeConfig
             RecBatchLines = recBatch,
             Backend = backend,
             RecIntraOpThreads = recIntra,
+            VulkanDevice = vulkanDevice,
             DetLimitSideLength = detLimit,
             AutoScaleFromCpu = autoScale,
             ProcessorCount = cores,
@@ -317,6 +323,7 @@ public sealed class OcrRuntimeConfig
         RecBatchLines = RecBatchLines,
         Backend = Backend,
         RecIntraOpThreads = RecIntraOpThreads,
+        VulkanDevice = VulkanDevice,
         DetLimitSideLength = DetLimitSideLength,
         AutoScaleFromCpu = AutoScaleFromCpu,
         ProcessorCount = ProcessorCount,
@@ -414,6 +421,20 @@ public sealed class OcrRuntimeConfig
     /// Auto worker-process count for parallel render. The fork's render benchmark
     /// knees around 4 processes; leave the remaining cores for OCR engines.
     /// </summary>
+    /// <summary>
+    /// Device-local heaps under 4 GB keep a single Vulkan engine. Two engines
+    /// each keep a detection arena and a recognition arena, which does not fit
+    /// a 2 GB part such as the MX450 once the desktop is using the card.
+    /// </summary>
+    public static int VulkanEngineCount(ulong deviceLocalBytes, int requested)
+    {
+        requested = Math.Clamp(requested, 1, 16);
+        const ulong fourGiB = 4UL << 30;
+        if (deviceLocalBytes > 0 && deviceLocalBytes < fourGiB)
+            return 1;
+        return requested;
+    }
+
     public static int ComputeRenderProcesses(int cores, int engines)
     {
         cores = Math.Max(1, cores);

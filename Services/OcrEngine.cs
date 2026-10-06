@@ -21,6 +21,9 @@ public sealed class OcrEngine : IAsyncDisposable
     public int LineWorkerCount { get; }
     public int DetIntraOpThreads { get; }
     public bool UseDirectionClassification { get; }
+    public string VulkanDeviceName { get; private set; } = "";
+    public ulong VulkanDeviceLocalBytes { get; private set; }
+    public ulong VulkanBufferCapBytes { get; private set; }
     public OcrRuntimeConfig Config { get; }
 
     private OcrEngine(
@@ -58,6 +61,47 @@ public sealed class OcrEngine : IAsyncDisposable
             "vulkan" => OcrBackend.Vulkan,
             _ => OcrBackend.Cpu,
         };
+        string vulkanName = "";
+        ulong vulkanBytes = 0;
+        ulong vulkanCap = 0;
+        if (config.Backend is "vulkan" or "auto")
+        {
+            if (!string.IsNullOrWhiteSpace(config.VulkanDevice))
+                OcrVulkan.DeviceSelector = config.VulkanDevice;
+            OcrVulkan.OnWarning ??= message => logger.LogWarning("{Message}", message);
+            OcrVulkan.OnDebug ??= message => logger.LogDebug("{Message}", message);
+            if (OcrVulkan.TryProbe() is { } gpu)
+            {
+                vulkanName = gpu.Name;
+                vulkanBytes = gpu.DeviceLocalBytes;
+                vulkanCap = gpu.BufferByteCap;
+                int capped = OcrRuntimeConfig.VulkanEngineCount(gpu.DeviceLocalBytes, pageWorkers);
+                if (capped != pageWorkers)
+                {
+                    logger.LogWarning(
+                        "Vulkan device {Name} reports {DeviceLocalMb} MB device-local memory; engine count {Requested} -> {Capped}",
+                        gpu.Name,
+                        gpu.DeviceLocalBytes / (1024 * 1024),
+                        pageWorkers,
+                        capped);
+                    pageWorkers = capped;
+                    config = config.With(engineCount: capped);
+                }
+                logger.LogInformation(
+                    "Vulkan device {Name} kind={Kind} index={Index} deviceLocalMb={DeviceLocalMb} bufferCapMb={BufferCapMb}",
+                    gpu.Name,
+                    gpu.Kind,
+                    gpu.Index,
+                    gpu.DeviceLocalBytes / (1024 * 1024),
+                    gpu.BufferByteCap / (1024 * 1024));
+            }
+        }
+        // One detector session and one recognizer session per line worker.
+        // The library default (ProcessorCount) would keep a full-size arena
+        // on every pooled session, which is how a 2 GB card runs out on the
+        // second document.
+        bool tightGpuPools = config.Backend == "vulkan" || vulkanName.Length > 0;
+        int recPool = Math.Max(1, config.LineWorkerCount);
         var options = new PaddleOcrOptions
         {
             LineWorkerCount = config.LineWorkerCount,
@@ -69,14 +113,17 @@ public sealed class OcrEngine : IAsyncDisposable
             {
                 LimitSideLength = config.DetLimitSideLength,
                 Backend = backend,
+                MaxPooledSessions = tightGpuPools ? 1 : Environment.ProcessorCount,
             },
             Classifier = new PaddleOcrClassifierOptions
             {
                 Backend = backend,
+                MaxPooledSessions = tightGpuPools ? 1 : Environment.ProcessorCount,
             },
             Recognizer = new PaddleOcrRecognizerOptions
             {
                 Backend = backend,
+                MaxPooledSessions = tightGpuPools ? recPool : Environment.ProcessorCount,
             },
         };
 
@@ -125,7 +172,13 @@ public sealed class OcrEngine : IAsyncDisposable
             throw;
         }
 
-        return new OcrEngine(engines, config, logger);
+        var created = new OcrEngine(engines, config, logger)
+        {
+            VulkanDeviceName = vulkanName,
+            VulkanDeviceLocalBytes = vulkanBytes,
+            VulkanBufferCapBytes = vulkanCap,
+        };
+        return created;
     }
 
     public async Task<T> UseAsync<T>(Func<PaddleOcrAll, T> work, CancellationToken ct)

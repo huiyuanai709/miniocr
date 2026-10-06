@@ -419,6 +419,7 @@ public static class AppConfigStore
             "textLayer": "auto",
             "useCls": false,
             "backend": "cpu",
+            "vulkanDevice": "",
             "recIntraOpThreads": 1,
             "autoScaleFromCpu": true,
             "wechatOcrPath": "",

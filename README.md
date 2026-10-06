@@ -258,6 +258,7 @@ cd artifacts/linux-x64-singlefile
     "renderProcesses": null,
     "useCls": false,
     "backend": "cpu",
+    "vulkanDevice": "",
     "recIntraOpThreads": 1,
     "autoScaleFromCpu": true,
     "wechatOcrPath": "",
@@ -378,6 +379,7 @@ cd artifacts/linux-x64-singlefile
 | `MINIOCR_LINE_WORKERS` | `ocr.lineWorkers` | 自动 | 页内 CLS/REC 并行 |
 | `MINIOCR_DET_THREADS` | `ocr.detThreads` | 自动 | 检测图内卷积线程 |
 | `MINIOCR_OCR_BACKEND` | `ocr.backend` | **cpu** | `cpu` / `auto` / `vulkan`。未知值留在 `cpu`。库的默认 `Auto` 可能选 Vulkan，GPU fp16 会改字，所以默认钉死 CPU |
+| `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空（第一块独显） | 序号（`0`）或名称子串（`MX450`）。独显优先于核显。设备显存低于 4 GB 时引擎数收成 1，单块 arena 不超过 256 MB；分配失败的那一页回落到 CPU 并打 Warning |
 | `MINIOCR_REC_INTRA_OP_THREADS` | `ocr.recIntraOpThreads` | **1** | 每个引擎里识别卷积的线程。`0` 交给库自己分配（多引擎时每个都会去占满 CPU） |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | **false** | 是否启用方向分类 |
 | `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm：`min(8,cores)`） | 进程内 PDF 栅格生产者（封顶 8）。`renderMode=parallel` 时只在回退路径使用 |
