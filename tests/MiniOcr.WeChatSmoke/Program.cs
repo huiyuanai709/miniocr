@@ -259,6 +259,19 @@ try
 
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", null);
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", null);
+    AssertEqual("cpu", cfg.Backend, "default backend is cpu");
+    AssertEqual("1", cfg.RecIntraOpThreads.ToString(), "default rec intra-op threads is 1");
+    AssertEqual("cpu", cfg.With().Backend, "With copies backend");
+    AssertEqual("1", cfg.With().RecIntraOpThreads.ToString(), "With copies rec intra-op threads");
+    AssertEqual("cpu", OcrRuntimeConfig.CanonicalBackend("gpu"), "unknown backend stays cpu");
+    AssertEqual("vulkan", OcrRuntimeConfig.CanonicalBackend("Vulkan"), "vulkan backend name");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_BACKEND", "auto");
+    Environment.SetEnvironmentVariable("MINIOCR_REC_INTRA_OP_THREADS", "0");
+    OcrRuntimeConfig tuned = OcrRuntimeConfig.FromAppConfig(new AppConfigFile());
+    AssertEqual("auto", tuned.Backend, "env backend overrides file");
+    AssertEqual("0", tuned.RecIntraOpThreads.ToString(), "env rec intra-op 0 is library auto");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_BACKEND", null);
+    Environment.SetEnvironmentVariable("MINIOCR_REC_INTRA_OP_THREADS", null);
     AssertEqual("parallel", cfg.RenderMode, "default render mode is parallel");
     AssertTrue(cfg.RenderProcessCount is >= 1 and <= 4, "auto render processes stay in 1..4");
     AssertEqual("parallel", cfg.With().RenderMode, "With copies render mode");

@@ -257,6 +257,8 @@ cd artifacts/linux-x64-singlefile
     "textLayer": "auto",
     "renderProcesses": null,
     "useCls": false,
+    "backend": "cpu",
+    "recIntraOpThreads": 1,
     "autoScaleFromCpu": true,
     "wechatOcrPath": "",
     "wechatDir": "",
@@ -375,6 +377,8 @@ cd artifacts/linux-x64-singlefile
 | `MINIOCR_DPI` | `ocr.dpi` | **96**（local）/ **72**（llm，未显式设置时） | 栅格化 DPI（也可在 JSON/`?dpi=` 覆盖） |
 | `MINIOCR_LINE_WORKERS` | `ocr.lineWorkers` | 自动 | 页内 CLS/REC 并行 |
 | `MINIOCR_DET_THREADS` | `ocr.detThreads` | 自动 | 检测图内卷积线程 |
+| `MINIOCR_OCR_BACKEND` | `ocr.backend` | **cpu** | `cpu` / `auto` / `vulkan`。未知值留在 `cpu`。库的默认 `Auto` 可能选 Vulkan，GPU fp16 会改字，所以默认钉死 CPU |
+| `MINIOCR_REC_INTRA_OP_THREADS` | `ocr.recIntraOpThreads` | **1** | 每个引擎里识别卷积的线程。`0` 交给库自己分配（多引擎时每个都会去占满 CPU） |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | **false** | 是否启用方向分类 |
 | `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm：`min(8,cores)`） | 进程内 PDF 栅格生产者（封顶 8）。`renderMode=parallel` 时只在回退路径使用 |
 | `MINIOCR_RENDER_MODE` | `ocr.renderMode` | **parallel** | `parallel`（`PDFtoImage.Parallel` 工作进程）或 `inprocess`（进程内 `ToImages`）。未知值回退 `parallel` |
@@ -400,9 +404,9 @@ cd artifacts/linux-x64-singlefile
 | `rasterWorkers` | `Clamp(min(engines, cores/2), 1, 8)` |
 | `renderProcesses` | `Clamp(min(4, max(1, cores−engines)), 1, 4)` |
 
-`renderMode` 默认 **`parallel`**。PDFium 进程内有一把全局锁，多线程 `ToImages` 并不能并行栅格。`parallel` 在进程启动时拉起一组工作进程，同一节点上同一份 PDF 的后续页批次一直用这一组；按批次再创建一个处理器大约要 300 ms 冷启动。每个任务在该节点把 PDF 写到临时文件一次，后面的批次复用这个已打开的 `FileStream`（`leaveOpen`，`FileShare.Read|Delete`）。`ProcessorOptions` 固定为 `WorkerCount = renderProcesses`（1–8）、`TransferMode = MemoryMappedFile`、`ReuseFileStream = true`、`ShareSourceFile = true`、`RetainDocuments = true`。内存映射按路径打开这份文件，位图走映射；`RetainDocuments` 在路径、长度、修改时间和密码都没变时让工作进程跳过再次解析。灰度 OCR 同时打开 `Grayscale` 和 `NativeGrayscale`：PDFium 直接画 Gray8，宿主展开成 BGRA8888。进程内回退走 `Conversion.ToImages`，该 API 忽略 `NativeGrayscale`。这些三项没有单独的配置开关，工作进程数仍是 `ocr.renderProcesses` / `MINIOCR_RENDER_PROCESSES`。任务或工人会话结束时删掉临时文件。要强制进程内栅格，设 `ocr.renderMode` 为 `inprocess` 或 `MINIOCR_RENDER_MODE=inprocess`。
+`renderMode` 默认 **`parallel`**。PDFium 进程内有一把全局锁，多线程 `ToImages` 并不能并行栅格。`parallel` 在进程启动时拉起一组工作进程，同一节点上同一份 PDF 的后续页批次一直用这一组；按批次再创建一个处理器大约要 300 ms 冷启动。每个任务在该节点把 PDF 写到临时文件一次，后面的批次复用这个已打开的 `FileStream`（`leaveOpen`，`FileShare.Read|Delete`）。`ProcessorOptions` 固定为 `WorkerCount = renderProcesses`（1–8）、`TransferMode = MemoryMappedFile`、`ReuseFileStream = true`、`ShareSourceFile = true`、`RetainDocuments = true`、`PrewarmWorkers = true`。内存映射按路径打开这份文件，位图走映射；`RetainDocuments` 在路径、长度、修改时间和密码都没变时让工作进程跳过再次解析。灰度 OCR 同时打开 `Grayscale` 和 `NativeGrayscale`：PDFium 直接画 Gray8。`local` 的并行路径用 `ToImagesPixelsAsync` 把这块缓冲按 `ImagePixelFormat.Gray8` 送进识别，用完 `Dispose` 归还池，不再在宿主展开成 BGRA。微信和视觉模式仍要 `SKBitmap`，走原来的 `ToImagesAsync`。进程内回退走 `Conversion.ToImages`，该 API 忽略 `NativeGrayscale`，位图若已是 Gray8 就按 Gray8 识别，否则再转 BGRA。这些三项没有单独的配置开关，工作进程数仍是 `ocr.renderProcesses` / `MINIOCR_RENDER_PROCESSES`。任务或工人会话结束时删掉临时文件。要强制进程内栅格，设 `ocr.renderMode` 为 `inprocess` 或 `MINIOCR_RENDER_MODE=inprocess`。
 
-启动时会先拉起一个工作进程渲染一页空白 PDF。这一步失败（例如容器禁止 `fork` / 无法再执行本程序）时，进程打出一行 `Parallel PDF render workers failed to start: … Falling back to in-process rendering (ocr.renderMode=inprocess).`，本进程此后改走进程内栅格，服务照常起来。请求进行中如果工作进程崩溃，丢掉进程池，未写入 Channel 的页仍改回进程内渲染；取消请求不回退。子进程是再次启动本可执行文件。Native AOT 在 `Main` 之前进入 worker。本仓库的普通 `dotnet run` 仍带着 AOT 的 feature switch（动态代码和 startup hook 都是关的），所以入口程序集里还有一个 module initializer，在 `Main` 之前调用同一个 worker 引导，避免子进程把 Web 主机和 OCR 模型再加载一遍。
+启动时 `PrewarmWorkers=true`，并 `await PrewarmAsync()` 把工作进程拉起来，不渲染空白页。成功打一行 Information：`Parallel PDF render workers started (processes=…, coldStartMs=…)`。这一步失败（例如容器禁止 `fork` / 无法再执行本程序）时，进程打出一行 `Parallel PDF render workers failed to start: … Falling back to in-process rendering (ocr.renderMode=inprocess).`，本进程此后改走进程内栅格，服务照常起来。请求进行中如果工作进程崩溃，丢掉进程池，未写入 Channel 的页仍改回进程内渲染；取消请求不回退。子进程是再次启动本可执行文件。Native AOT 在 `Main` 之前进入 worker。本仓库的普通 `dotnet run` 仍带着 AOT 的 feature switch（动态代码和 startup hook 都是关的），所以入口程序集里还有一个 module initializer，在 `Main` 之前调用同一个 worker 引导，避免子进程把 Web 主机和 OCR 模型再加载一遍。
 
 在 4 核 Linux 上用 `MINIOCR_ENGINES=2`、96 DPI、ChineseV6Tiny，对一份 120 页、约 103MB、每页内嵌 JPEG 的扫描 PDF 做端到端（栅格+OCR）。这次 OCR 是瓶颈，并行栅格没有缩短墙钟；默认仍用 `parallel`，需要时可以改回 `inprocess`：
 
@@ -653,7 +657,7 @@ The current CPU is missing one or more of the required instruction sets.
 | 环节 | 策略 |
 | --- | --- |
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
-| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale` + `NativeGrayscale`。默认 `textLayer=auto`：先分析文本层，能用的页不栅格。默认 `renderMode=parallel`：进程级一个 `PDFtoImage.Parallel` 进程池（`ShareSourceFile` + `RetainDocuments`，同一临时 PDF 的页批次不重建、不重复解析）。每个节点每个任务把 PDF 写到临时文件一次，各批次复用该文件并内存映射，任务结束再删除；Gray8 在宿主展开为 BGRA。启动时若拉不起工作进程，打日志并在本进程生命周期内改走 `inprocess`（每 worker 一次 `ToImages`，忽略 `NativeGrayscale`）。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
+| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；`AntiAliasing=None` + `Grayscale` + `NativeGrayscale`。默认 `textLayer=auto`：先分析文本层，能用的页不栅格。默认 `renderMode=parallel`：进程级一个 `PDFtoImage.Parallel` 进程池（`ShareSourceFile` + `RetainDocuments`，同一临时 PDF 的页批次不重建、不重复解析）。每个节点每个任务把 PDF 写到临时文件一次，各批次复用该文件并内存映射，任务结束再删除。`local` 并行路径把 Gray8 直接送识别。启动时 `PrewarmAsync` 拉起工作进程；失败则打日志并在本进程生命周期内改走 `inprocess`（每 worker 一次 `ToImages`，忽略 `NativeGrayscale`）。有界 Channel，**绝不**同时持有全部页位图。llm 默认更多进程内 raster workers（`min(8,cores)`）。 |
 | OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
 | 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。集群默认把这些组发给有 LLM key 的节点（`cluster.distributedNer`），协调节点合并去重。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
@@ -669,9 +673,9 @@ The current CPU is missing one or more of the required instruction sets.
 
 | 包 | 说明 |
 | --- | --- |
-| `external/SimdPaddleOCR` @ `6aae0ad` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
+| `external/SimdPaddleOCR` @ `27bf7cc` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`：上游 2.0 的 CPU/Vulkan/Metal，以及 Gray8 输入和 `RecIntraOpThreads`）。miniocr 默认 `Backend=Cpu`。不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
 | 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
-| `external/PDFtoImage` @ `8dfa9a5` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfSession` Gray8、`AnalyzePage`、`PDFtoImage.Parallel` 的 `ShareSourceFile` / `RetainDocuments` / `NativeGrayscale`，以及 net11.0 的 `runtime-async`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
+| `external/PDFtoImage` @ `68e30fe` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfPixels` / `ToImagesPixelsAsync`、`PrewarmAsync`、`AnalyzePage`、`ShareSourceFile` / `RetainDocuments` / `NativeGrayscale`，以及 net11.0 的 `runtime-async`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
 
 ## API
 
@@ -927,7 +931,7 @@ MiniOcr.exe --urls http://0.0.0.0:5080
 改到 Debug 的例行事件（没有任务时的空轮询以前不打应用日志，现在也只在 Debug）：
 
 - 每次领页 / 发放 OCR 租约，以及每次领取 / 完成 NER 组（含每组 `requestMs`）
-- 并行渲染进程池的冷启动和第一次正式租页（各一次：`Parallel PDF render pool cold start` / `first lease`）
+- 并行渲染进程池的第一次正式租页（一次：`Parallel PDF render pool first lease`）。冷启动是启动时的一行 Information：`coldStartMs=`
 - 心跳成功
 - 每批完成、协调节点收下一批结果
 - 空的 dispatch / claim 轮询
@@ -936,7 +940,7 @@ MiniOcr.exe --urls http://0.0.0.0:5080
 
 要看回每批调度明细，二选一：
 
-- `cluster.verboseDispatch: true`，或 `MINIOCR_CLUSTER_VERBOSE_DISPATCH=1`（领页、心跳、批次完成、空轮询升到 Information。每组 NER `requestMs` 和渲染池冷启动 / 第一次租页仍只在 Debug）
+- `cluster.verboseDispatch: true`，或 `MINIOCR_CLUSTER_VERBOSE_DISPATCH=1`（领页、心跳、批次完成、空轮询升到 Information。每组 NER `requestMs` 和渲染池第一次租页仍只在 Debug）
 - 不改这个开关，把类别调到 Debug：`Logging__LogLevel__MiniOcr.Services.ClusterCoordinator=Debug` 和 `Logging__LogLevel__MiniOcr.Services.ClusterWorkerHost=Debug`
 
 要看每条 HTTP：`Logging__LogLevel__Microsoft.AspNetCore=Information` 和 `Logging__LogLevel__System.Net.Http.HttpClient=Information`。
@@ -1046,7 +1050,7 @@ miniocr/
 
 冒烟（5 页 `sample-multipage.pdf`）仍可用于快速验证；大吞吐请以 2000 页表为准。
 
-**精度 / 速度权衡：** 默认 DPI 96 相对 150 像素面积约 41%，相对旧默认 45 约 4.6×；中文细部明显好于 45。栅格默认 `AntiAliasing=None` + `Grayscale`（仍 BGRA，利于 OCR 锐利字形）。若需 &lt;5 min / 2000 页可降 `MINIOCR_DPI=45`；更高精度可设 `MINIOCR_DPI=150` 并视情况开启 `MINIOCR_USE_CLS=1`。
+**精度 / 速度权衡：** 默认 DPI 96 相对 150 像素面积约 41%，相对旧默认 45 约 4.6×；中文细部明显好于 45。栅格默认 `AntiAliasing=None` + `Grayscale` + `NativeGrayscale`。并行 `local` 路径按 Gray8 识别，不再展开成 BGRA。若需 &lt;5 min / 2000 页可降 `MINIOCR_DPI=45`；更高精度可设 `MINIOCR_DPI=150` 并视情况开启 `MINIOCR_USE_CLS=1`。
 
 ## 许可证
 

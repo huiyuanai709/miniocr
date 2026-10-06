@@ -49,15 +49,34 @@ public sealed class OcrEngine : IAsyncDisposable
         config ??= OcrRuntimeConfig.FromEnvironment();
         int pageWorkers = config.EngineCount;
 
+        // Upstream defaults Backend to Auto, which may pick Vulkan. GPU fp16 can change
+        // the text, so every graph is pinned unless ocr.backend says otherwise.
+        // RecBatchLines is set explicitly, so a GPU backend does not raise it to 16.
+        OcrBackend backend = config.Backend switch
+        {
+            "auto" => OcrBackend.Auto,
+            "vulkan" => OcrBackend.Vulkan,
+            _ => OcrBackend.Cpu,
+        };
         var options = new PaddleOcrOptions
         {
             LineWorkerCount = config.LineWorkerCount,
             DetIntraOpThreads = config.DetIntraOpThreads,
             UseDirectionClassification = config.UseDirectionClassification,
             RecBatchLines = config.RecBatchLines,
+            RecIntraOpThreads = config.RecIntraOpThreads,
             Detector = new PaddleOcrDetectorOptions
             {
                 LimitSideLength = config.DetLimitSideLength,
+                Backend = backend,
+            },
+            Classifier = new PaddleOcrClassifierOptions
+            {
+                Backend = backend,
+            },
+            Recognizer = new PaddleOcrRecognizerOptions
+            {
+                Backend = backend,
             },
         };
 
@@ -75,10 +94,13 @@ public sealed class OcrEngine : IAsyncDisposable
         }
 
         logger.LogInformation(
-            "Loading ChineseV6Tiny × {Engines} (LineWorkerCount={LineWorkers}, DetIntraOpThreads={DetThreads}, UseCls={UseCls}, DpiDefault={Dpi})",
+            "Loading ChineseV6Tiny × {Engines} (backend={Backend}, LineWorkerCount={LineWorkers}, DetIntraOpThreads={DetThreads}, RecIntraOpThreads={RecIntra}, RecBatchLines={RecBatch}, UseCls={UseCls}, DpiDefault={Dpi})",
             pageWorkers,
+            config.Backend,
             options.LineWorkerCount,
             options.DetIntraOpThreads,
+            options.RecIntraOpThreads,
+            options.RecBatchLines,
             options.UseDirectionClassification,
             config.DefaultDpi);
 
