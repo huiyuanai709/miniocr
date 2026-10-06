@@ -400,9 +400,12 @@ cd artifacts/linux-x64-singlefile
 | 项 | 新公式 |
 | --- | --- |
 | `engines` | `Clamp(cores/2, 1, min(16, cores))` |
-| `lineWorkers` / `detThreads` | 使 `engines × (line + det)` 约在 **1.0–1.5× cores**（目标约 1.25×） |
+| `lineWorkers` | 识别阶段页内并行。引擎数取核数一半时默认 **2**，`engines × lineWorkers` 约等于逻辑核数 |
+| `detThreads` | 检测阶段独占 CPU，和识别不同时跑。自动值 `Clamp(ceil(cores / engines), 1, 8)`，使 `engines × detThreads` 约等于逻辑核数。显式 `ocr.detThreads` / `MINIOCR_DET_THREADS` 仍优先 |
 | `rasterWorkers` | `Clamp(min(engines, cores/2), 1, 8)` |
 | `renderProcesses` | `Clamp(min(4, max(1, cores−engines)), 1, 4)` |
+
+4 逻辑核上的自动结果是 **2 引擎 × line 2 × det 2**。12 逻辑核（6 核 12 线程的笔记本上 `Environment.ProcessorCount` 通常是 12）是 **6 引擎 × line 2 × det 2**，`recIntraOpThreads` 仍是 1，`RecBatchLines` 仍是 8。检测阶段大约 `engines × det` 条线程，识别阶段大约 `engines × line × recIntraOpThreads` 条线程，两段都接近逻辑核数。渲染进程数公式不变：12 逻辑核、6 个引擎时仍是 4。这 4 个渲染进程和正在跑的 OCR 共用 CPU。
 
 `renderMode` 默认 **`parallel`**。PDFium 进程内有一把全局锁，多线程 `ToImages` 并不能并行栅格。`parallel` 在进程启动时拉起一组工作进程，同一节点上同一份 PDF 的后续页批次一直用这一组；按批次再创建一个处理器大约要 300 ms 冷启动。每个任务在该节点把 PDF 写到临时文件一次，后面的批次复用这个已打开的 `FileStream`（`leaveOpen`，`FileShare.Read|Delete`）。`ProcessorOptions` 固定为 `WorkerCount = renderProcesses`（1–8）、`TransferMode = MemoryMappedFile`、`ReuseFileStream = true`、`ShareSourceFile = true`、`RetainDocuments = true`、`PrewarmWorkers = true`。内存映射按路径打开这份文件，位图走映射；`RetainDocuments` 在路径、长度、修改时间和密码都没变时让工作进程跳过再次解析。灰度 OCR 同时打开 `Grayscale` 和 `NativeGrayscale`：PDFium 直接画 Gray8。`local` 的并行路径用 `ToImagesPixelsAsync` 把这块缓冲按 `ImagePixelFormat.Gray8` 送进识别，用完 `Dispose` 归还池，不再在宿主展开成 BGRA。微信和视觉模式仍要 `SKBitmap`，走原来的 `ToImagesAsync`。进程内回退走 `Conversion.ToImages`，该 API 忽略 `NativeGrayscale`，位图若已是 Gray8 就按 Gray8 识别，否则再转 BGRA。这些三项没有单独的配置开关，工作进程数仍是 `ocr.renderProcesses` / `MINIOCR_RENDER_PROCESSES`。任务或工人会话结束时删掉临时文件。要强制进程内栅格，设 `ocr.renderMode` 为 `inprocess` 或 `MINIOCR_RENDER_MODE=inprocess`。
 

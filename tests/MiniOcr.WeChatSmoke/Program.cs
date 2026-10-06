@@ -279,6 +279,14 @@ try
     AssertEqual("2", OcrRuntimeConfig.ComputeRenderProcesses(4, 2).ToString(), "4 cores and 2 engines -> 2 render processes");
     AssertEqual("4", OcrRuntimeConfig.ComputeRenderProcesses(16, 8).ToString(), "render process auto cap is 4");
     AssertEqual("1", OcrRuntimeConfig.ComputeRenderProcesses(2, 1).ToString(), "small machine uses 1 render process");
+    AutoScaleDefaults fourCore = OcrRuntimeConfig.ComputeWorkersForEngines(4, 2);
+    AssertEqual("2", fourCore.LineWorkers.ToString(), "4 cores keep 2 line workers");
+    AssertEqual("2", fourCore.DetThreads.ToString(), "4 cores fill detection with 2 threads per engine");
+    AutoScaleDefaults twelveThread = OcrRuntimeConfig.ComputeWorkersForEngines(12, 6);
+    AssertEqual("2", twelveThread.LineWorkers.ToString(), "12 logical CPUs keep 2 line workers");
+    AssertEqual("2", twelveThread.DetThreads.ToString(), "12 logical CPUs fill detection with 2 threads per engine");
+    AssertEqual("1", OcrRuntimeConfig.ComputeWorkersForEngines(1, 1).DetThreads.ToString(), "1 core stays at 1 detection thread");
+    AssertEqual("6", OcrRuntimeConfig.ComputeAutoScale(12).Engines.ToString(), "12 logical CPUs use 6 engines");
 
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", "parallel");
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", "4");
