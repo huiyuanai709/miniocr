@@ -388,7 +388,7 @@ public sealed class OcrRuntimeConfig
     }
 
     /// <summary>
-    /// <c>cpu</c> (default), <c>auto</c>, or <c>vulkan</c>. Anything else stays on CPU
+    /// <c>cpu</c> (default), <c>auto</c>, <c>vulkan</c>, or <c>metal</c>. Anything else stays on CPU
     /// so an unknown value cannot switch the text to a GPU fp16 path.
     /// </summary>
     public static string CanonicalBackend(string? raw)
@@ -397,8 +397,17 @@ public sealed class OcrRuntimeConfig
             return "auto";
         if (string.Equals(raw, "vulkan", StringComparison.OrdinalIgnoreCase))
             return "vulkan";
+        if (string.Equals(raw, "metal", StringComparison.OrdinalIgnoreCase))
+            return "metal";
         return "cpu";
     }
+
+    /// <summary>
+    /// <c>metal</c> runs only on macOS. Other hosts keep the name in config
+    /// (<see cref="CanonicalBackend"/>) but the engine uses CPU.
+    /// </summary>
+    public static string BackendForHost(string backend) =>
+        backend == "metal" && !OperatingSystem.IsMacOS() ? "cpu" : backend;
 
     public static string CanonicalTextLayer(string? raw)
     {
@@ -425,6 +434,10 @@ public sealed class OcrRuntimeConfig
     /// Device-local heaps under 4 GB keep a single Vulkan engine. Two engines
     /// each keep a detection arena and a recognition arena, which does not fit
     /// a 2 GB part such as the MX450 once the desktop is using the card.
+    /// </summary>
+    /// <summary>
+    /// Device memory under 4 GB runs one engine. Pass the Vulkan device-local
+    /// heap, or Metal <c>recommendedMaxWorkingSetSize</c>.
     /// </summary>
     public static int VulkanEngineCount(ulong deviceLocalBytes, int requested)
     {

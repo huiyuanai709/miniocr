@@ -24,6 +24,13 @@ public sealed class OcrEngine : IAsyncDisposable
     public string VulkanDeviceName { get; private set; } = "";
     public ulong VulkanDeviceLocalBytes { get; private set; }
     public ulong VulkanBufferCapBytes { get; private set; }
+    /// <summary><c>cpu</c>, <c>vulkan</c>, or <c>metal</c>. This is the backend that will run, after a non-macOS <c>metal</c> request falls back to CPU.</summary>
+    public string EffectiveBackend { get; private set; } = "cpu";
+    /// <summary>Vulkan or Metal device name. Empty on CPU.</summary>
+    public string GpuDeviceName { get; private set; } = "";
+    /// <summary>Vulkan device-local heap, or Metal <c>recommendedMaxWorkingSetSize</c>, in bytes.</summary>
+    public ulong GpuMemoryBytes { get; private set; }
+    public ulong GpuBufferCapBytes { get; private set; }
     public OcrRuntimeConfig Config { get; }
 
     private OcrEngine(
@@ -52,29 +59,77 @@ public sealed class OcrEngine : IAsyncDisposable
         config ??= OcrRuntimeConfig.FromEnvironment();
         int pageWorkers = config.EngineCount;
 
-        // Upstream defaults Backend to Auto, which may pick Vulkan. GPU fp16 can change
-        // the text, so every graph is pinned unless ocr.backend says otherwise.
+        // Upstream defaults Backend to Auto, which may pick Vulkan or, on
+        // macOS arm64, Metal. GPU fp16 can change the text, so every graph is
+        // pinned unless ocr.backend says otherwise.
         // RecBatchLines is set explicitly, so a GPU backend does not raise it to 16.
-        OcrBackend backend = config.Backend switch
-        {
-            "auto" => OcrBackend.Auto,
-            "vulkan" => OcrBackend.Vulkan,
-            _ => OcrBackend.Cpu,
-        };
+        OcrVulkan.OnWarning ??= message => logger.LogWarning("{Message}", message);
+        OcrVulkan.OnDebug ??= message => logger.LogDebug("{Message}", message);
+
+        OcrBackend backend = OcrBackend.Cpu;
+        string effective = "cpu";
         string vulkanName = "";
         ulong vulkanBytes = 0;
         ulong vulkanCap = 0;
-        if (config.Backend is "vulkan" or "auto")
+        string gpuName = "";
+        ulong gpuBytes = 0;
+        ulong gpuCap = 0;
+        bool metalOnAppleSilicon = config.Backend == "auto"
+            && OperatingSystem.IsMacOS()
+            && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
+
+        if (config.Backend == "metal" || metalOnAppleSilicon)
+        {
+            string hosted = OcrRuntimeConfig.BackendForHost(config.Backend == "metal" ? "metal" : "auto");
+            if (config.Backend == "metal" && hosted == "cpu")
+            {
+                logger.LogWarning("ocr.backend=metal is only supported on macOS; using CPU");
+            }
+            else if (OcrMetal.TryProbe() is { } metal)
+            {
+                backend = config.Backend == "metal" ? OcrBackend.Metal : OcrBackend.Auto;
+                effective = "metal";
+                gpuName = metal.Name;
+                gpuBytes = metal.RecommendedMaxWorkingSetBytes;
+                gpuCap = metal.BufferByteCap;
+                int capped = OcrRuntimeConfig.VulkanEngineCount(gpuBytes, pageWorkers);
+                if (capped != pageWorkers)
+                {
+                    logger.LogWarning(
+                        "Metal device {Name} reports {WorkingSetMb} MB recommended working set; engine count {Requested} -> {Capped}",
+                        metal.Name,
+                        gpuBytes / (1024 * 1024),
+                        pageWorkers,
+                        capped);
+                    pageWorkers = capped;
+                    config = config.With(engineCount: capped);
+                }
+                logger.LogInformation(
+                    "Metal device {Name} recommendedWorkingSetMb={WorkingSetMb} bufferCapMb={BufferCapMb}",
+                    metal.Name,
+                    gpuBytes / (1024 * 1024),
+                    gpuCap / (1024 * 1024));
+            }
+            else if (config.Backend == "metal")
+            {
+                logger.LogWarning("ocr.backend=metal but no Metal device was found; using CPU");
+            }
+        }
+
+        if (effective != "metal" && config.Backend is "vulkan" or "auto")
         {
             if (!string.IsNullOrWhiteSpace(config.VulkanDevice))
                 OcrVulkan.DeviceSelector = config.VulkanDevice;
-            OcrVulkan.OnWarning ??= message => logger.LogWarning("{Message}", message);
-            OcrVulkan.OnDebug ??= message => logger.LogDebug("{Message}", message);
+            backend = config.Backend == "vulkan" ? OcrBackend.Vulkan : OcrBackend.Auto;
             if (OcrVulkan.TryProbe() is { } gpu)
             {
                 vulkanName = gpu.Name;
                 vulkanBytes = gpu.DeviceLocalBytes;
                 vulkanCap = gpu.BufferByteCap;
+                effective = "vulkan";
+                gpuName = gpu.Name;
+                gpuBytes = gpu.DeviceLocalBytes;
+                gpuCap = gpu.BufferByteCap;
                 int capped = OcrRuntimeConfig.VulkanEngineCount(gpu.DeviceLocalBytes, pageWorkers);
                 if (capped != pageWorkers)
                 {
@@ -95,12 +150,18 @@ public sealed class OcrEngine : IAsyncDisposable
                     gpu.DeviceLocalBytes / (1024 * 1024),
                     gpu.BufferByteCap / (1024 * 1024));
             }
+            else if (config.Backend == "vulkan")
+            {
+                // The library still accepts OcrBackend.Vulkan and serves each
+                // image from CPU when the device is missing.
+                effective = "cpu";
+            }
         }
         // One detector session and one recognizer session per line worker.
         // The library default (ProcessorCount) would keep a full-size arena
         // on every pooled session, which is how a 2 GB card runs out on the
         // second document.
-        bool tightGpuPools = config.Backend == "vulkan" || vulkanName.Length > 0;
+        bool tightGpuPools = effective is "vulkan" or "metal";
         int recPool = Math.Max(1, config.LineWorkerCount);
         var options = new PaddleOcrOptions
         {
@@ -141,9 +202,10 @@ public sealed class OcrEngine : IAsyncDisposable
         }
 
         logger.LogInformation(
-            "Loading ChineseV6Tiny × {Engines} (backend={Backend}, LineWorkerCount={LineWorkers}, DetIntraOpThreads={DetThreads}, RecIntraOpThreads={RecIntra}, RecBatchLines={RecBatch}, UseCls={UseCls}, DpiDefault={Dpi})",
+            "Loading ChineseV6Tiny × {Engines} (backend={Backend}, effective={Effective}, LineWorkerCount={LineWorkers}, DetIntraOpThreads={DetThreads}, RecIntraOpThreads={RecIntra}, RecBatchLines={RecBatch}, UseCls={UseCls}, DpiDefault={Dpi})",
             pageWorkers,
             config.Backend,
+            effective,
             options.LineWorkerCount,
             options.DetIntraOpThreads,
             options.RecIntraOpThreads,
@@ -177,6 +239,10 @@ public sealed class OcrEngine : IAsyncDisposable
             VulkanDeviceName = vulkanName,
             VulkanDeviceLocalBytes = vulkanBytes,
             VulkanBufferCapBytes = vulkanCap,
+            EffectiveBackend = effective,
+            GpuDeviceName = gpuName,
+            GpuMemoryBytes = gpuBytes,
+            GpuBufferCapBytes = gpuCap,
         };
         return created;
     }

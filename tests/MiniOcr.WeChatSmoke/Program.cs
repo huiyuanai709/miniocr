@@ -273,6 +273,12 @@ try
     AssertEqual("1", cfg.With().RecIntraOpThreads.ToString(), "With copies rec intra-op threads");
     AssertEqual("cpu", OcrRuntimeConfig.CanonicalBackend("gpu"), "unknown backend stays cpu");
     AssertEqual("vulkan", OcrRuntimeConfig.CanonicalBackend("Vulkan"), "vulkan backend name");
+    AssertEqual("metal", OcrRuntimeConfig.CanonicalBackend("Metal"), "metal backend name");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_BACKEND", "metal");
+    AssertEqual("metal", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).Backend, "env metal backend");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_BACKEND", null);
+    AssertEqual(OperatingSystem.IsMacOS() ? "metal" : "cpu", OcrRuntimeConfig.BackendForHost("metal"), "metal runs only on macOS");
+    AssertEqual("vulkan", OcrRuntimeConfig.BackendForHost("vulkan"), "vulkan is unchanged by the host check");
     Environment.SetEnvironmentVariable("MINIOCR_OCR_BACKEND", "auto");
     Environment.SetEnvironmentVariable("MINIOCR_REC_INTRA_OP_THREADS", "0");
     OcrRuntimeConfig tuned = OcrRuntimeConfig.FromAppConfig(new AppConfigFile());
