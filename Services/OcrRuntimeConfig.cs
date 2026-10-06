@@ -72,8 +72,9 @@ public sealed class OcrRuntimeConfig
             fixedFallback: scaled.Engines);
         engines = Math.Clamp(engines, 1, 16);
 
-        // Recompute line/det defaults against the *resolved* engine count so
-        // engines*(line+det) stays near 1–1.5× cores even when engines is overridden.
+        // Recompute line/det defaults against the *resolved* engine count.
+        // Detection and recognition do not overlap inside one Run, so det is
+        // sized to fill the cores on its own (see ComputeWorkersForEngines).
         AutoScaleDefaults forEngines = ComputeWorkersForEngines(cores, engines);
 
         int line = ResolveInt(
@@ -215,7 +216,9 @@ public sealed class OcrRuntimeConfig
     /// <summary>
     /// New curve (2–64 cores): engines = Clamp(cores/2, 1, min(16, cores)).
     /// Old awkward default forced min 4 engines even on 2-core boxes.
-    /// Workers chosen so engines*(line+det) ≈ 1.0–1.5× cores.
+    /// Line workers stay on the old 1.0–1.5× shared budget (typically 2).
+    /// Detection runs before recognition, so det threads are
+    /// Clamp(ceil(cores/engines), 1, 8) and are not subtracted from that budget.
     /// raster = Clamp(min(engines, cores/2), 1, 8).
     /// </summary>
     public static AutoScaleDefaults ComputeAutoScale(int cores)
@@ -230,17 +233,20 @@ public sealed class OcrRuntimeConfig
         cores = Math.Max(1, cores);
         engines = Math.Clamp(engines, 1, 16);
 
-        // Target total OCR threads ≈ 1.25× cores (band 1.0–1.5×).
+        // Line-worker budget ≈ 1.25× cores (band 1.0–1.5×), counted with a
+        // placeholder det share. Real detection threads are assigned below.
         int target = Math.Max(engines * 2, (int)Math.Round(cores * 1.25));
         int maxBudget = Math.Max(engines * 2, (int)Math.Floor(cores * 1.5));
         target = Math.Min(target, maxBudget);
 
         int perEngine = Math.Max(2, (target + engines - 1) / engines);
-        // Prefer slightly more line workers than det (CLS/REC parallel vs DET intra-op).
+        // Prefer slightly more line workers than the placeholder det share.
         int line = Math.Clamp((perEngine + 1) / 2, 1, 8);
         int det = Math.Clamp(perEngine - line, 1, 8);
 
-        // Shrink if still oversubscribed.
+        // Shrink line workers if the old shared budget is still oversubscribed.
+        // The det value in this loop is only that placeholder; the real detection
+        // thread count is assigned after, because DET and REC do not run together.
         while (engines * (line + det) > maxBudget && (line > 1 || det > 1))
         {
             if (line >= det && line > 1)
@@ -250,6 +256,8 @@ public sealed class OcrRuntimeConfig
             else
                 break;
         }
+
+        det = Math.Clamp((cores + engines - 1) / engines, 1, 8);
 
         int raster = Math.Clamp(Math.Min(engines, Math.Max(1, cores / 2)), 1, 8);
 
