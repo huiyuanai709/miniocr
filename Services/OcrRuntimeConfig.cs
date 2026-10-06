@@ -28,6 +28,10 @@ public sealed class OcrRuntimeConfig
     public double TextLayerImageCoverage { get; init; } = 0.55;
     public int TextLayerImageMinChars { get; init; } = 200;
     public int RecBatchLines { get; init; }
+    /// <summary><c>cpu</c> (default), <c>auto</c>, or <c>vulkan</c>.</summary>
+    public string Backend { get; init; } = "cpu";
+    /// <summary>Recognizer intra-op threads per engine. <c>0</c> lets the library choose.</summary>
+    public int RecIntraOpThreads { get; init; } = 1;
     public int DetLimitSideLength { get; init; }
     public bool AutoScaleFromCpu { get; init; }
     public int ProcessorCount { get; init; }
@@ -139,6 +143,14 @@ public sealed class OcrRuntimeConfig
 
         int recBatch = Math.Clamp(ReadInt("MINIOCR_REC_BATCH", 8), 1, 64);
         int detLimit = Math.Clamp(ReadInt("MINIOCR_DET_LIMIT_SIDE", 960), 64, 4096);
+        // 1 keeps a pool of engines from each claiming the whole CPU. 0 is the library's auto budget.
+        int recIntra = Math.Clamp(
+            ReadInt("MINIOCR_REC_INTRA_OP_THREADS", ocr.RecIntraOpThreads ?? 1),
+            0,
+            16);
+        string backend = CanonicalBackend(FirstSet(
+            Environment.GetEnvironmentVariable("MINIOCR_OCR_BACKEND"),
+            ocr.Backend));
 
         // One WeChatOCR process is single-threaded. Default is a few processes, not one per core:
         // a 12-thread laptop gets 3. Cap the auto default at 3; explicit values may go up to 8.
@@ -186,6 +198,8 @@ public sealed class OcrRuntimeConfig
             TextLayerImageCoverage = textImage,
             TextLayerImageMinChars = textImageChars,
             RecBatchLines = recBatch,
+            Backend = backend,
+            RecIntraOpThreads = recIntra,
             DetLimitSideLength = detLimit,
             AutoScaleFromCpu = autoScale,
             ProcessorCount = cores,
@@ -293,6 +307,8 @@ public sealed class OcrRuntimeConfig
         TextLayerImageCoverage = TextLayerImageCoverage,
         TextLayerImageMinChars = TextLayerImageMinChars,
         RecBatchLines = RecBatchLines,
+        Backend = Backend,
+        RecIntraOpThreads = RecIntraOpThreads,
         DetLimitSideLength = DetLimitSideLength,
         AutoScaleFromCpu = AutoScaleFromCpu,
         ProcessorCount = ProcessorCount,
@@ -354,6 +370,19 @@ public sealed class OcrRuntimeConfig
         string? env = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
         string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "auto");
         return CanonicalTextLayer(raw);
+    }
+
+    /// <summary>
+    /// <c>cpu</c> (default), <c>auto</c>, or <c>vulkan</c>. Anything else stays on CPU
+    /// so an unknown value cannot switch the text to a GPU fp16 path.
+    /// </summary>
+    public static string CanonicalBackend(string? raw)
+    {
+        if (string.Equals(raw, "auto", StringComparison.OrdinalIgnoreCase))
+            return "auto";
+        if (string.Equals(raw, "vulkan", StringComparison.OrdinalIgnoreCase))
+            return "vulkan";
+        return "cpu";
     }
 
     public static string CanonicalTextLayer(string? raw)

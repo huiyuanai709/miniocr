@@ -45,17 +45,17 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Pinned fork master @ 8dfa9a5 (PDFtoImage 6.0.0-preview plus PdfSession Gray8,
-         page text/content stats, PDFtoImage.Parallel ShareSourceFile/RetainDocuments/NativeGrayscale,
-         and net11.0 runtime-async). Native PDFium / SkiaSharp assets flow as runtime
-         assets of the core project (runtimes/<rid>/native); .NET copies them on
-         publish the same way a PackageReference to the PDFtoImage nupkg did.
-         Parallel re-launches this executable as a worker (CoreCLR startup hook,
-         Native AOT module initializer). -->
+    <!-- Pinned fork master @ 68e30fe (PDFtoImage Gray8 PdfPixels, PrewarmAsync,
+         ShareSourceFile/RetainDocuments/NativeGrayscale, net11.0 runtime-async).
+         Native PDFium / SkiaSharp assets flow as runtime assets of the core project
+         (runtimes/<rid>/native); .NET copies them on publish the same way a
+         PackageReference to the PDFtoImage nupkg did. Parallel re-launches this
+         executable as a worker (CoreCLR startup hook, Native AOT module initializer). -->
     <ProjectReference Include="external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
     <ProjectReference Include="external/PDFtoImage/src/Parallel/Parallel.csproj" />
-    <!-- Pinned fork main @ 6aae0ad (PR #2 merged), not NuGet 1.4.2.
-         ChineseV6Tiny models come from the same tree so the bundle types match. -->
+    <!-- Pinned fork main @ 27bf7cc (upstream 2.0 plus Gray8 and RecIntraOpThreads).
+         ChineseV6Tiny models come from the same tree so the bundle types match.
+         Vulkan/Metal shaders are embedded in the net11 assembly; miniocr pins Backend=Cpu. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
     <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny.csproj" />
   </ItemGroup>

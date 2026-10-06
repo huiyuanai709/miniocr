@@ -19,6 +19,8 @@ internal static class PdfParallelOptions
         ReuseFileStream = true,
         ShareSourceFile = true,
         RetainDocuments = true,
+        // Spawn the worker processes at startup. The first lease then only renders.
+        PrewarmWorkers = true,
     };
 
     public static RenderOptions CreateRenderOptions(int dpi) =>
@@ -29,8 +31,8 @@ internal static class PdfParallelOptions
             AntiAliasing: PdfAntiAliasing.None,
             Grayscale: true)
         {
-            // PDFium renders Gray8 directly. Parallel expands those samples to BGRA8888 for OCR.
-            // Conversion.ToImages ignores NativeGrayscale, so the in-process fallback keeps its pixels.
+            // PDFium renders Gray8. The parallel path reads those bytes with no BGRA expand.
+            // Conversion.ToImages ignores NativeGrayscale, so the in-process fallback stays a bitmap.
             NativeGrayscale = true,
         };
 }

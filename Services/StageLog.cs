@@ -31,9 +31,6 @@ internal static partial class StageLog
     [LoggerMessage(Level = LogLevel.Debug, Message = "LLM NER group pages={Pages} requestMs={RequestMs}")]
     public static partial void NerGroup(ILogger logger, string pages, double requestMs);
 
-    [LoggerMessage(Level = LogLevel.Debug, Message = "Parallel PDF render pool cold start ms={Ms}")]
-    public static partial void RenderColdStart(ILogger logger, double ms);
-
     [LoggerMessage(Level = LogLevel.Debug, Message = "Parallel PDF render pool first lease ms={Ms}")]
     public static partial void RenderFirstLease(ILogger logger, double ms);
 

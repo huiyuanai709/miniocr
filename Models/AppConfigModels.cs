@@ -76,6 +76,10 @@ public sealed class OcrFileConfig
     /// <summary>Non-whitespace characters required on an image-heavy page or a hidden OCR layer. Null = 200.</summary>
     public int? TextLayerImageMinChars { get; set; }
     public bool? UseCls { get; set; }
+    /// <summary><c>cpu</c> (default), <c>auto</c>, or <c>vulkan</c>. <c>cpu</c> keeps the current text.</summary>
+    public string Backend { get; set; } = "cpu";
+    /// <summary>Recognizer intra-op threads per engine. Null = 1. <c>0</c> lets the library pick.</summary>
+    public int? RecIntraOpThreads { get; set; }
     public bool AutoScaleFromCpu { get; set; } = true;
 
     /// <summary>Full path to WeChatOCR.exe (3.9) or wxocr.dll (4.x). Empty = auto-detect.</summary>

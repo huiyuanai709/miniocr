@@ -70,6 +70,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Local parallel OCR reads Gray8 from the worker pool. Vision, WeChat, and the
+    /// in-process fallback still receive bitmaps.
+    /// </summary>
+    private bool UseNativeGrayPixels =>
+        _engine is not null && _config.IsParallelRender && !_config.IsLlmMode && !_config.IsWeChatMode;
+
     public Task<OcrResponse> ProcessAsync(
         RentedBuffer pdf,
         double downloadMs,
@@ -137,7 +144,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct,
                 modeLabel: "wechat",
                 workers: _wechat.InstanceCount,
-                recognize: (bitmap, token) => _wechat.RecognizeBitmapAsync(bitmap, token))
+                recognize: (image, token) => _wechat.RecognizeBitmapAsync(image.RequireBitmap(), token))
                 .ConfigureAwait(false);
         }
 
@@ -174,8 +181,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
         // Overlap raster→encode→vision (same idea as local Channel pipeline).
         // Do NOT wait for all pages before first RecognizePageAsync.
-        Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
-            Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(_pageWindow)
+        Channel<(int Index, PageImage Image, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, PageImage, double)>(new BoundedChannelOptions(_pageWindow)
             {
                 SingleWriter = false,
                 SingleReader = false,
@@ -230,7 +237,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 {
                     int width = bitmap.Width;
                     int height = bitmap.Height;
-                    byte[] jpeg = LlmVisionOcr.EncodeJpeg(bitmap, jpegQuality);
+                    byte[] jpeg = LlmVisionOcr.EncodeJpeg(bitmap.RequireBitmap(), jpegQuality);
                     PageJpeg item = new(index, width, height, jpeg, rasterMs);
                     lock (timingLock)
                         rasterTotal += rasterMs;
@@ -342,31 +349,55 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         return response;
     }
 
-    private async Task<string> RecognizeLocalAsync(SKBitmap bitmap, CancellationToken ct)
+    private async Task<string> RecognizeLocalAsync(PageImage image, CancellationToken ct)
     {
+        if (image.Pixels is { } pixels)
+        {
+            ImagePixelFormat format = pixels.ColorType == SKColorType.Gray8
+                ? ImagePixelFormat.Gray8
+                : ImagePixelFormat.Bgra32;
+            int width = pixels.Width;
+            int height = pixels.Height;
+            int stride = pixels.RowBytes;
+            ReadOnlyMemory<byte> memory = pixels.Pixels;
+            PaddleOcrResult result = await _engine!.UseAsync(
+                ocr => ocr.Run(memory.Span, width, height, stride, format),
+                ct).ConfigureAwait(false);
+            return result.Text?.Replace("\r", "").Trim() ?? "";
+        }
+
+        SKBitmap bitmap = image.RequireBitmap();
+        if (bitmap.ColorType == SKColorType.Gray8)
+            return await RunBitmapAsync(bitmap, ImagePixelFormat.Gray8, ct).ConfigureAwait(false);
+
         EnsureBgra8888(bitmap, out SKBitmap working, out bool ownedWorking);
         try
         {
-            int width = working.Width;
-            int height = working.Height;
-            int stride = working.RowBytes;
-            IntPtr pixels = working.GetPixels();
-            int byteCount = stride * height;
-            PaddleOcrResult result = await _engine!.UseAsync(ocr =>
-            {
-                unsafe
-                {
-                    ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
-                    return ocr.Run(span, width, height, stride, ImagePixelFormat.Bgra32);
-                }
-            }, ct).ConfigureAwait(false);
-            return result.Text?.Replace("\r", "").Trim() ?? "";
+            return await RunBitmapAsync(working, ImagePixelFormat.Bgra32, ct).ConfigureAwait(false);
         }
         finally
         {
             if (ownedWorking)
                 working.Dispose();
         }
+    }
+
+    private async Task<string> RunBitmapAsync(SKBitmap bitmap, ImagePixelFormat format, CancellationToken ct)
+    {
+        int width = bitmap.Width;
+        int height = bitmap.Height;
+        int stride = bitmap.RowBytes;
+        IntPtr pixels = bitmap.GetPixels();
+        int byteCount = stride * height;
+        PaddleOcrResult result = await _engine!.UseAsync(ocr =>
+        {
+            unsafe
+            {
+                ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
+                return ocr.Run(span, width, height, stride, format);
+            }
+        }, ct).ConfigureAwait(false);
+        return result.Text?.Replace("\r", "").Trim() ?? "";
     }
 
     private async Task<OcrResponse> ProcessWithTextEngineAsync(
@@ -380,14 +411,14 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         CancellationToken ct,
         string modeLabel,
         int workers,
-        Func<SKBitmap, CancellationToken, Task<string>> recognize)
+        Func<PageImage, CancellationToken, Task<string>> recognize)
     {
         RenderOptions renderOptions = CreateRenderOptions(dpi);
 
         OcrPageResult[] pages = new OcrPageResult[pageCount];
 
-        Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
-            Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(_pageWindow)
+        Channel<(int Index, PageImage Image, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, PageImage, double)>(new BoundedChannelOptions(_pageWindow)
             {
                 SingleWriter = false,
                 SingleReader = false,
@@ -738,13 +769,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
 
         int workers;
-        Func<SKBitmap, CancellationToken, Task<string>> recognize;
+        Func<PageImage, CancellationToken, Task<string>> recognize;
         if (_config.IsWeChatMode)
         {
             if (_wechat is null || !_wechat.IsReady)
                 throw new InvalidOperationException("ocr.mode=wechat requires a connected WeChat OCR engine.");
             workers = Math.Max(1, _wechat.InstanceCount);
-            recognize = (bitmap, token) => _wechat.RecognizeBitmapAsync(bitmap, token);
+            recognize = (image, token) => _wechat.RecognizeBitmapAsync(image.RequireBitmap(), token);
         }
         else
         {
@@ -756,8 +787,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
         RenderOptions renderOptions = CreateRenderOptions(dpi);
         int[] indices = pageIndices as int[] ?? pageIndices.ToArray();
-        Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
-            Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(Math.Max(4, workers * 2))
+        Channel<(int Index, PageImage Image, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, PageImage, double)>(new BoundedChannelOptions(Math.Max(4, workers * 2))
             {
                 SingleWriter = false,
                 SingleReader = false,
@@ -841,13 +872,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
 
         int workers;
-        Func<SKBitmap, CancellationToken, Task<string>> recognize;
+        Func<PageImage, CancellationToken, Task<string>> recognize;
         if (_config.IsWeChatMode)
         {
             if (_wechat is null || !_wechat.IsReady)
                 throw new InvalidOperationException("ocr.mode=wechat requires a connected WeChat OCR engine.");
             workers = Math.Max(1, _wechat.InstanceCount);
-            recognize = (bitmap, token) => _wechat.RecognizeBitmapAsync(bitmap, token);
+            recognize = (image, token) => _wechat.RecognizeBitmapAsync(image.RequireBitmap(), token);
         }
         else
         {
@@ -858,8 +889,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
 
         RenderOptions renderOptions = CreateRenderOptions(dpi);
-        Channel<(int Index, string BatchId, SKBitmap Bitmap, double RasterMs)> rasterized =
-            Channel.CreateBounded<(int, string, SKBitmap, double)>(new BoundedChannelOptions(Math.Max(4, workers * 2))
+        Channel<(int Index, string BatchId, PageImage Image, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, string, PageImage, double)>(new BoundedChannelOptions(Math.Max(4, workers * 2))
             {
                 SingleWriter = true,
                 SingleReader = false,
@@ -940,7 +971,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int pdfLength,
         ChannelReader<(string BatchId, int Page)> pages,
         RenderOptions renderOptions,
-        ChannelWriter<(int Index, string BatchId, SKBitmap Bitmap, double RasterMs)> writer,
+        ChannelWriter<(int Index, string BatchId, PageImage Image, double RasterMs)> writer,
         CancellationToken ct)
     {
         try
@@ -966,8 +997,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 if (indices.Count == 0)
                     continue;
 
-                Channel<(int, SKBitmap, double)> chunk =
-                    Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(Math.Max(4, indices.Count))
+                Channel<(int, PageImage, double)> chunk =
+                    Channel.CreateBounded<(int, PageImage, double)>(new BoundedChannelOptions(Math.Max(4, indices.Count))
                     {
                         SingleWriter = false,
                         SingleReader = true,
@@ -1060,8 +1091,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         RenderOptions renderOptions = CreateRenderOptions(dpi);
         int[] indices = pageIndices as int[] ?? pageIndices.ToArray();
         int jpegQuality = _vision.OcrJpegQuality;
-        Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
-            Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(Math.Max(4, _pageWindow))
+        Channel<(int Index, PageImage Image, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, PageImage, double)>(new BoundedChannelOptions(Math.Max(4, _pageWindow))
             {
                 SingleWriter = false,
                 SingleReader = false,
@@ -1077,7 +1108,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             {
                 using (bitmap)
                 {
-                    byte[] jpeg = LlmVisionOcr.EncodeJpeg(bitmap, jpegQuality);
+                    byte[] jpeg = LlmVisionOcr.EncodeJpeg(bitmap.RequireBitmap(), jpegQuality);
                     OcrPageResult page = await _vision
                         .RecognizePageAsync(index + 1, bitmap.Width, bitmap.Height, jpeg, rasterMs, ct)
                         .ConfigureAwait(false);
@@ -1117,7 +1148,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int pdfLength,
         int[] pageIndices,
         RenderOptions renderOptions,
-        ChannelWriter<(int, SKBitmap, double)> writer,
+        ChannelWriter<(int, PageImage, double)> writer,
         CancellationToken ct) =>
         DispatchRenderAsync(pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct);
 
@@ -1546,7 +1577,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int pdfLength,
         int pageCount,
         RenderOptions renderOptions,
-        ChannelWriter<(int, SKBitmap, double)> writer,
+        ChannelWriter<(int, PageImage, double)> writer,
         CancellationToken ct)
     {
         int[] pageIndices = new int[pageCount];
@@ -1568,7 +1599,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int pdfLength,
         int[] pageIndices,
         RenderOptions renderOptions,
-        ChannelWriter<(int, SKBitmap, double)> writer,
+        ChannelWriter<(int, PageImage, double)> writer,
         CancellationToken ct,
         bool completeWriter = true)
     {
@@ -1632,7 +1663,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int pdfLength,
         int[] pageIndices,
         RenderOptions renderOptions,
-        ChannelWriter<(int, SKBitmap, double)> writer,
+        ChannelWriter<(int, PageImage, double)> writer,
         HashSet<int> written,
         CancellationToken ct)
     {
@@ -1657,14 +1688,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             ParallelPdfProcessor processor = GetOrCreateParallel();
             Stopwatch sw = Stopwatch.StartNew();
             int idx = 0;
-            await foreach (SKBitmap bitmap in processor.ToImagesAsync(
-                stream, pageIndices, leaveOpen: true, options: renderOptions, cancellationToken: ct)
-                .ConfigureAwait(false))
+
+            async Task PublishAsync(PageImage image)
             {
                 sw.Stop();
                 if (idx >= pageIndices.Length)
                 {
-                    bitmap.Dispose();
+                    image.Dispose();
                     throw new InvalidOperationException(
                         $"PDFtoImage.Parallel yielded more than {pageIndices.Length} pages.");
                 }
@@ -1672,17 +1702,36 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 int pageIndex = pageIndices[idx++];
                 try
                 {
-                    await writer.WriteAsync((pageIndex, bitmap, sw.Elapsed.TotalMilliseconds), ct)
+                    await writer.WriteAsync((pageIndex, image, sw.Elapsed.TotalMilliseconds), ct)
                         .ConfigureAwait(false);
                     written.Add(pageIndex);
                 }
                 catch
                 {
-                    bitmap.Dispose();
+                    image.Dispose();
                     throw;
                 }
 
                 sw.Restart();
+            }
+
+            if (UseNativeGrayPixels)
+            {
+                await foreach (PdfPixels pixels in processor.ToImagesPixelsAsync(
+                    stream, pageIndices, leaveOpen: true, options: renderOptions, cancellationToken: ct)
+                    .ConfigureAwait(false))
+                {
+                    await PublishAsync(PageImage.FromPixels(pixels)).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                await foreach (SKBitmap bitmap in processor.ToImagesAsync(
+                    stream, pageIndices, leaveOpen: true, options: renderOptions, cancellationToken: ct)
+                    .ConfigureAwait(false))
+                {
+                    await PublishAsync(PageImage.FromBitmap(bitmap)).ConfigureAwait(false);
+                }
             }
 
             if (idx != pageIndices.Length)
@@ -1704,7 +1753,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int pdfLength,
         int[] pageIndices,
         RenderOptions renderOptions,
-        ChannelWriter<(int, SKBitmap, double)> writer,
+        ChannelWriter<(int, PageImage, double)> writer,
         CancellationToken ct)
     {
         if (pageIndices.Length == 0)
@@ -1744,14 +1793,15 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         SKBitmap bitmap = enumerator.Current;
                         sw.Stop();
                         int pageIndex = mine[idx++];
+                        PageImage image = PageImage.FromBitmap(bitmap);
                         try
                         {
-                            await writer.WriteAsync((pageIndex, bitmap, sw.Elapsed.TotalMilliseconds), ct)
+                            await writer.WriteAsync((pageIndex, image, sw.Elapsed.TotalMilliseconds), ct)
                                 .ConfigureAwait(false);
                         }
                         catch
                         {
-                            bitmap.Dispose();
+                            image.Dispose();
                             while (enumerator.MoveNext())
                                 enumerator.Current.Dispose();
                             throw;

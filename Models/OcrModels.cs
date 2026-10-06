@@ -147,6 +147,10 @@ public sealed class HealthResponse
     /// <summary><c>auto</c>, <c>off</c>, or <c>force</c>.</summary>
     public string TextLayer { get; set; } = "auto";
     public int RecBatchLines { get; set; }
+    /// <summary><c>cpu</c> (default), <c>auto</c>, or <c>vulkan</c>.</summary>
+    public string OcrBackend { get; set; } = "cpu";
+    /// <summary>Recognizer intra-op threads on each pooled engine. <c>0</c> is the library default.</summary>
+    public int RecIntraOpThreads { get; set; } = 1;
     public int DetLimitSideLength { get; set; }
     public bool AutoScaleFromCpu { get; set; }
     public string ConfigPath { get; set; } = "";

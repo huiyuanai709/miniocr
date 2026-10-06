@@ -418,6 +418,8 @@ public static class AppConfigStore
             "renderProcesses": null,
             "textLayer": "auto",
             "useCls": false,
+            "backend": "cpu",
+            "recIntraOpThreads": 1,
             "autoScaleFromCpu": true,
             "wechatOcrPath": "",
             "wechatDir": "",
