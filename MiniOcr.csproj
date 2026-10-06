@@ -53,9 +53,9 @@
          executable as a worker (CoreCLR startup hook, Native AOT module initializer). -->
     <ProjectReference Include="external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
     <ProjectReference Include="external/PDFtoImage/src/Parallel/Parallel.csproj" />
-    <!-- Pinned fork branch cursor/vulkan-vram-cap-08b9 (Vulkan arena cap plus Metal
-         working-set cap and AOT-preserved .metal shaders). ChineseV6Tiny models come
-         from the same tree so the bundle types match. Default backend stays CPU. -->
+    <!-- Pinned fork branch cursor/metal-ocr-backend-08b9 @ f574915 (merged Vulkan
+         arena cap, plus Metal working-set cap and AOT-preserved .metal shaders).
+         ChineseV6Tiny models come from the same tree. Default backend stays CPU. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
     <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny.csproj" />
   </ItemGroup>
