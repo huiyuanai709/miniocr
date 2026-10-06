@@ -75,7 +75,7 @@ jobs:
             -c Release \
             -r osx-arm64 \
             --self-contained true \
-            -p:PublishAot=true \
+            -p:MetalSmokeAot=true \
             -o artifacts/metal-smoke
 
       - name: Compare CPU and Metal text

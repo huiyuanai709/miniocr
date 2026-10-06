@@ -5,7 +5,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <PublishAot>false</PublishAot>
+    <!-- Set only here. -p:PublishAot=true is global and makes netstandard2.0
+         references fail with NETSDK1207. -->
+    <PublishAot Condition="'$(MetalSmokeAot)' == 'true'">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <IsPackable>false</IsPackable>
     <NoWarn>$(NoWarn);CA1416;IL2026;IL3050</NoWarn>
