@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Set only here. -p:PublishAot=true is global and makes netstandard2.0
+         references fail with NETSDK1207. -->
+    <PublishAot Condition="'$(MetalSmokeAot)' == 'true'">true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+    <NoWarn>$(NoWarn);CA1416;IL2026;IL3050</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
+    <ProjectReference Include="../../external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny.csproj" />
+    <ProjectReference Include="../../external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
+    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR" />
+    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny" />
+    <TrimmerRootAssembly Include="PDFtoImage" />
+    <TrimmerRootAssembly Include="SkiaSharp" />
+  </ItemGroup>
+</Project>

@@ -1,6 +1,6 @@
 # MiniOCR
 
-基于 [huiyuanai709/SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)，子模块跟踪 `main`，当前钉在 `6aae0ad`）的 **Native AOT** PDF OCR HTTP API（**.NET 11 RC / `net11.0`**）。
+基于 [huiyuanai709/SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)，子模块跟踪 `main`，本分支钉在 `f574915`）的 **Native AOT** PDF OCR HTTP API（**.NET 11 RC / `net11.0`**）。
 
 从 URL 并发下载 PDF（≤300 MB），按页流式栅格化 + OCR（最多约 2000 页），返回每页文本、耗时，以及 **公司名 / 人名** JSON。
 
@@ -378,8 +378,8 @@ cd artifacts/linux-x64-singlefile
 | `MINIOCR_DPI` | `ocr.dpi` | **96**（local）/ **72**（llm，未显式设置时） | 栅格化 DPI（也可在 JSON/`?dpi=` 覆盖） |
 | `MINIOCR_LINE_WORKERS` | `ocr.lineWorkers` | 自动 | 页内 CLS/REC 并行 |
 | `MINIOCR_DET_THREADS` | `ocr.detThreads` | 自动 | 检测图内卷积线程 |
-| `MINIOCR_OCR_BACKEND` | `ocr.backend` | **cpu** | `cpu` / `auto` / `vulkan`。未知值留在 `cpu`。库的默认 `Auto` 可能选 Vulkan，GPU fp16 会改字，所以默认钉死 CPU |
-| `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空（第一块独显） | 序号（`0`）或名称子串（`MX450`）。独显优先于核显。设备显存低于 4 GB 时引擎数收成 1，单块 arena 不超过 256 MB；分配失败的那一页回落到 CPU 并打 Warning |
+| `MINIOCR_OCR_BACKEND` | `ocr.backend` | **cpu** | `cpu` / `auto` / `vulkan` / `metal`。`metal` 只在 macOS 上走 Metal；其它系统打 Warning 并回落 CPU。`auto` 在 Apple Silicon 上优先 Metal。未知值留在 `cpu`。GPU fp16 可能和 CPU 差几个字，所以默认钉死 CPU |
+| `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空（第一块独显） | 序号（`0`）或名称子串（`MX450`）。独显优先于核显。Vulkan 设备显存或 Metal `recommendedMaxWorkingSetSize` 低于 4 GB 时引擎数收成 1，单块 arena 不超过 256 MB；分配失败的那一页回落到 CPU 并打 Warning |
 | `MINIOCR_REC_INTRA_OP_THREADS` | `ocr.recIntraOpThreads` | **1** | 每个引擎里识别卷积的线程。`0` 交给库自己分配（多引擎时每个都会去占满 CPU） |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | **false** | 是否启用方向分类 |
 | `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm：`min(8,cores)`） | 进程内 PDF 栅格生产者（封顶 8）。`renderMode=parallel` 时只在回退路径使用 |
@@ -678,7 +678,7 @@ The current CPU is missing one or more of the required instruction sets.
 
 | 包 | 说明 |
 | --- | --- |
-| `external/SimdPaddleOCR` @ `27bf7cc` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`：上游 2.0 的 CPU/Vulkan/Metal，以及 Gray8 输入和 `RecIntraOpThreads`）。miniocr 默认 `Backend=Cpu`。不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
+| `external/SimdPaddleOCR` @ `f574915` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) 分支 `cursor/metal-ocr-backend-08b9` 的 `ProjectReference`（已合并的 Vulkan 显存上限，加上 Metal 工作集上限和 AOT 保留的 `.metal`）。miniocr 默认 `Backend=Cpu`。不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
 | 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
 | `external/PDFtoImage` @ `68e30fe` | [fork](https://github.com/huiyuanai709/PDFtoImage) `master` 的 `ProjectReference`（`.gitmodules` 里 `branch = master`：6.0.0-preview，net11.0 / PDFium 156 / SkiaSharp 4.152，含 `PdfPixels` / `ToImagesPixelsAsync`、`PrewarmAsync`、`AnalyzePage`、`ShareSourceFile` / `RetainDocuments` / `NativeGrayscale`，以及 net11.0 的 `runtime-async`）。核心项目与 `PDFtoImage.Parallel` 都引用。MIT |
 

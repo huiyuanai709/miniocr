@@ -193,7 +193,13 @@ else
         runtimeConfig);
     if (engine.EngineCount != runtimeConfig.EngineCount)
         runtimeConfig = runtimeConfig.With(engineCount: engine.EngineCount);
-    if (!string.IsNullOrEmpty(engine.VulkanDeviceName))
+    Console.WriteLine($"OCR backend requested={runtimeConfig.Backend} effective={engine.EffectiveBackend}");
+    if (engine.EffectiveBackend == "metal" && !string.IsNullOrEmpty(engine.GpuDeviceName))
+    {
+        Console.WriteLine(
+            $"Metal device: {engine.GpuDeviceName} recommendedWorkingSetMB={engine.GpuMemoryBytes / (1024 * 1024)} bufferCapMB={engine.GpuBufferCapBytes / (1024 * 1024)} engines={engine.EngineCount}");
+    }
+    else if (!string.IsNullOrEmpty(engine.VulkanDeviceName))
     {
         Console.WriteLine(
             $"Vulkan device: {engine.VulkanDeviceName} deviceLocalMB={engine.VulkanDeviceLocalBytes / (1024 * 1024)} bufferCapMB={engine.VulkanBufferCapBytes / (1024 * 1024)} engines={engine.EngineCount}");
@@ -395,10 +401,12 @@ app.MapGet("/health", (IServiceProvider sp) =>
             RenderProcessCount = cfg.RenderProcessCount,
             TextLayer = cfg.TextLayer,
             RecBatchLines = cfg.RecBatchLines,
-            OcrBackend = cfg.Backend,
+            OcrBackend = ocr?.EffectiveBackend ?? cfg.Backend,
             RecIntraOpThreads = cfg.RecIntraOpThreads,
             VulkanDevice = ocr?.VulkanDeviceName ?? "",
             VulkanDeviceLocalBytes = ocr?.VulkanDeviceLocalBytes ?? 0,
+            GpuDevice = ocr?.GpuDeviceName ?? "",
+            GpuMemoryBytes = ocr?.GpuMemoryBytes ?? 0,
             DetLimitSideLength = cfg.DetLimitSideLength,
             AutoScaleFromCpu = cfg.AutoScaleFromCpu,
             ConfigPath = configPath,
