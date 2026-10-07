@@ -144,7 +144,6 @@ public sealed class OcrRuntimeConfig
             ResolveInt("MINIOCR_TEXT_LAYER_IMAGE_MIN_CHARS", ocr.TextLayerImageMinChars, 200, autoScale: true, fixedFallback: 200),
             1, 100_000);
 
-        int recBatch = Math.Clamp(ReadInt("MINIOCR_REC_BATCH", 8), 1, 64);
         int detLimit = Math.Clamp(ReadInt("MINIOCR_DET_LIMIT_SIDE", 960), 64, 4096);
         // 1 keeps a pool of engines from each claiming the whole CPU. 0 is the library's auto budget.
         int recIntra = Math.Clamp(
@@ -154,6 +153,16 @@ public sealed class OcrRuntimeConfig
         string backend = CanonicalBackend(FirstSet(
             Environment.GetEnvironmentVariable("MINIOCR_OCR_BACKEND"),
             ocr.Backend));
+        // A GPU graph does not use a CPU intra-op team, and recognition is one
+        // queued submission. Leave the explicit file/env values alone.
+        bool gpuBudget = BackendForHost(backend) is "vulkan" or "metal";
+        ApplyGpuThreadBudget(
+            gpuBudget,
+            lineExplicit: Environment.GetEnvironmentVariable("MINIOCR_LINE_WORKERS") is not null || ocr.LineWorkers is not null,
+            detExplicit: Environment.GetEnvironmentVariable("MINIOCR_DET_THREADS") is not null || ocr.DetThreads is not null,
+            ref line,
+            ref det);
+        int recBatch = ResolveRecBatch(gpuBudget);
         string vulkanDevice = FirstSet(
             Environment.GetEnvironmentVariable("MINIOCR_OCR_VULKAN_DEVICE"),
             ocr.VulkanDevice) ?? "";
@@ -439,6 +448,29 @@ public sealed class OcrRuntimeConfig
     /// Device memory under 4 GB runs one engine. Pass the Vulkan device-local
     /// heap, or Metal <c>recommendedMaxWorkingSetSize</c>.
     /// </summary>
+    /// <summary>
+    /// GPU auto budget: detection preprocess and line workers stay at 2 unless
+    /// the operator set them. The CPU curve is unchanged.
+    /// </summary>
+    public static void ApplyGpuThreadBudget(bool gpu, bool lineExplicit, bool detExplicit, ref int line, ref int det)
+    {
+        if (!gpu) return;
+        if (!lineExplicit) line = Math.Clamp(Math.Min(line, 2), 1, 16);
+        if (!detExplicit) det = Math.Clamp(Math.Min(det, 2), 1, 16);
+    }
+
+    /// <summary>
+    /// Recognizer lines per GPU submission. CPU stays at 8. <c>MINIOCR_REC_BATCH</c> wins.
+    /// Same-width lines stay exact-width, so a larger batch does not pad logits.
+    /// </summary>
+    public static int ResolveRecBatch(bool gpu)
+    {
+        string? raw = Environment.GetEnvironmentVariable("MINIOCR_REC_BATCH");
+        if (int.TryParse(raw, out int fromEnv))
+            return Math.Clamp(fromEnv, 1, 64);
+        return gpu ? 32 : 8;
+    }
+
     public static int VulkanEngineCount(ulong deviceLocalBytes, int requested)
     {
         requested = Math.Clamp(requested, 1, 16);

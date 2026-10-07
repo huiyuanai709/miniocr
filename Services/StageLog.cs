@@ -10,7 +10,7 @@ internal static partial class StageLog
 {
     [LoggerMessage(
         Level = LogLevel.Information,
-        Message = "OCR stages: downloadMs={DownloadMs} rasterizeMs={RasterizeMs} ocrMs={OcrMs} analyzeMs={AnalyzeMs} nerWallMs={NerWallMs} nerRequestMs={NerRequestMs} nerGroups={NerGroups} nerPeak={NerPeak} totalMs={TotalMs}")]
+        Message = "OCR stages: downloadMs={DownloadMs} rasterizeMs={RasterizeMs} ocrMs={OcrMs} analyzeMs={AnalyzeMs} nerWallMs={NerWallMs} nerRequestMs={NerRequestMs} nerGroups={NerGroups} nerPeak={NerPeak} totalMs={TotalMs} gpuSubmitMs={GpuSubmitMs} gpuWaitMs={GpuWaitMs} cpuPreMs={CpuPreMs} cpuPostMs={CpuPostMs} gpuPages={GpuPages} fallbackPages={FallbackPages} gpuDevice={GpuDevice} initMs={InitMs} fence={Fence}")]
     public static partial void OcrStages(
         ILogger logger,
         double downloadMs,
@@ -21,7 +21,16 @@ internal static partial class StageLog
         double nerRequestMs,
         int nerGroups,
         int nerPeak,
-        double totalMs);
+        double totalMs,
+        double gpuSubmitMs,
+        double gpuWaitMs,
+        double cpuPreMs,
+        double cpuPostMs,
+        int gpuPages,
+        int fallbackPages,
+        string gpuDevice,
+        double initMs,
+        string fence);
 
     [LoggerMessage(
         Level = LogLevel.Information,

@@ -96,6 +96,24 @@ public sealed class OcrTimings
 
     /// <summary>Most local NER requests in flight at once.</summary>
     public int NerPeak { get; set; }
+
+    /// <summary>Time spent in vkQueueSubmit during this job, summed across engines.</summary>
+    public double GpuSubmitMs { get; set; }
+    /// <summary>Time spent blocked on the GPU fence during this job.</summary>
+    public double GpuWaitMs { get; set; }
+    /// <summary>CPU upload and command-buffer record during this job.</summary>
+    public double CpuPreMs { get; set; }
+    /// <summary>CPU readback and CTC decode while the GPU result is in hand.</summary>
+    public double CpuPostMs { get; set; }
+    /// <summary>Pages whose detection and recognition both stayed on the GPU.</summary>
+    public int GpuPages { get; set; }
+    /// <summary>Pages where at least one session fell back to CPU.</summary>
+    public int FallbackPages { get; set; }
+    public string GpuDevice { get; set; } = "";
+    /// <summary>One-time device creation plus startup warmup. Repeated on every job line.</summary>
+    public double InitMs { get; set; }
+    /// <summary><c>win32</c>, <c>syncfd</c>, or <c>blocking</c> (vkWaitForFences).</summary>
+    public string Fence { get; set; } = "";
 }
 
 public sealed class EntityHit

@@ -234,6 +234,29 @@ public sealed class OcrEngine : IAsyncDisposable
             throw;
         }
 
+        if (effective is "vulkan" or "metal")
+        {
+            foreach (PaddleOcrAll loaded in engines)
+                loaded.Warmup();
+            OcrVulkan.GpuTimingSnapshot warm = OcrVulkan.ReadTimings();
+            long cacheBytes = 0;
+            try
+            {
+                if (File.Exists(OcrVulkan.PipelineCachePath))
+                    cacheBytes = new FileInfo(OcrVulkan.PipelineCachePath).Length;
+            }
+            catch (IOException) { }
+            logger.LogInformation(
+                "GPU warmup initMs={InitMs:F0} fence={Fence} device={Device} pipelineCache={Cache} restored={Restored} cacheBytes={CacheBytes} gpuRuns={GpuRuns}",
+                warm.InitMs,
+                warm.FenceWait,
+                string.IsNullOrEmpty(gpuName) ? warm.DeviceName : gpuName,
+                string.IsNullOrEmpty(OcrVulkan.PipelineCachePath) ? "(memory)" : OcrVulkan.PipelineCachePath,
+                OcrVulkan.PipelineCacheRestored,
+                cacheBytes,
+                warm.GpuRuns);
+        }
+
         var created = new OcrEngine(engines, config, logger)
         {
             VulkanDeviceName = vulkanName,
