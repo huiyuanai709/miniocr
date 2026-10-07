@@ -361,7 +361,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             int stride = pixels.RowBytes;
             ReadOnlyMemory<byte> memory = pixels.Pixels;
             PaddleOcrResult result = await _engine!.UseAsync(
-                ocr => ocr.Run(memory.Span, width, height, stride, format),
+                ocr => TrackGpu(ocr, () => ocr.Run(memory.Span, width, height, stride, format)),
                 ct).ConfigureAwait(false);
             return result.Text?.Replace("\r", "").Trim() ?? "";
         }
@@ -394,7 +394,10 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             unsafe
             {
                 ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
-                return ocr.Run(span, width, height, stride, format);
+                using OcrVulkan.GpuCallScope scope = OcrVulkan.GpuCallScope.Begin();
+                PaddleOcrResult value = ocr.Run(span, width, height, stride, format);
+                s_gpuJob.Value?.Add(scope);
+                return value;
             }
         }, ct).ConfigureAwait(false);
         return result.Text?.Replace("\r", "").Trim() ?? "";
@@ -413,6 +416,9 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int workers,
         Func<PageImage, CancellationToken, Task<string>> recognize)
     {
+        s_gpuJob.Value = new GpuJob();
+        try
+        {
         RenderOptions renderOptions = CreateRenderOptions(dpi);
 
         OcrPageResult[] pages = new OcrPageResult[pageCount];
@@ -580,6 +586,11 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         StampSources(response, pages);
         LogOcrStages(response.Timings);
         return response;
+        }
+        finally
+        {
+            s_gpuJob.Value = null;
+        }
     }
 
     /// <summary>
@@ -1220,7 +1231,24 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             NerPeak = ner.Peak,
         };
 
-    private void LogOcrStages(OcrTimings timings) =>
+    private void LogOcrStages(OcrTimings timings)
+    {
+        GpuJob? job = s_gpuJob.Value;
+        if (job is not null)
+        {
+            timings.GpuSubmitMs = Math.Round(GpuJob.Ms(job.Submit), 1);
+            timings.GpuWaitMs = Math.Round(GpuJob.Ms(job.Wait), 1);
+            timings.CpuPreMs = Math.Round(GpuJob.Ms(job.Pre), 1);
+            timings.CpuPostMs = Math.Round(GpuJob.Ms(job.Post), 1);
+            timings.GpuPages = Volatile.Read(ref job.GpuPages);
+            timings.FallbackPages = Volatile.Read(ref job.FallbackPages);
+        }
+        OcrVulkan.GpuTimingSnapshot snap = OcrVulkan.ReadTimings();
+        timings.GpuDevice = !string.IsNullOrEmpty(snap.DeviceName)
+            ? snap.DeviceName
+            : _engine?.GpuDeviceName ?? "";
+        timings.InitMs = Math.Round(snap.InitMs, 1);
+        timings.Fence = string.IsNullOrEmpty(snap.FenceWait) ? "none" : snap.FenceWait;
         StageLog.OcrStages(
             _logger,
             timings.DownloadMs,
@@ -1231,7 +1259,53 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             timings.NerRequestMs,
             timings.NerGroups,
             timings.NerPeak,
-            timings.TotalMs);
+            timings.TotalMs,
+            timings.GpuSubmitMs,
+            timings.GpuWaitMs,
+            timings.CpuPreMs,
+            timings.CpuPostMs,
+            timings.GpuPages,
+            timings.FallbackPages,
+            timings.GpuDevice,
+            timings.InitMs,
+            timings.Fence);
+    }
+
+    private static PaddleOcrResult TrackGpu(PaddleOcrAll ocr, Func<PaddleOcrResult> run)
+    {
+        using OcrVulkan.GpuCallScope scope = OcrVulkan.GpuCallScope.Begin();
+        PaddleOcrResult result = run();
+        s_gpuJob.Value?.Add(scope);
+        _ = ocr;
+        return result;
+    }
+
+    private sealed class GpuJob
+    {
+        public int GpuPages;
+        public int FallbackPages;
+        public long Submit;
+        public long Wait;
+        public long Pre;
+        public long Post;
+
+        public void Add(OcrVulkan.GpuCallScope scope)
+        {
+            if (scope.UsedFallback)
+                Interlocked.Increment(ref FallbackPages);
+            else if (scope.UsedGpu)
+                Interlocked.Increment(ref GpuPages);
+            Interlocked.Add(ref Submit, scope.SubmitTicks);
+            Interlocked.Add(ref Wait, scope.WaitTicks);
+            Interlocked.Add(ref Pre, scope.PreTicks);
+            Interlocked.Add(ref Post, scope.PostTicks);
+        }
+
+        public static double Ms(long ticks) =>
+            ticks <= 0 ? 0 : ticks * 1000.0 / Stopwatch.Frequency;
+    }
+
+    private static readonly AsyncLocal<GpuJob?> s_gpuJob = new();
 
     private static OcrEntities EntitiesFromVisionPages(OcrPageResult[] pages)
     {

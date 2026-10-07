@@ -301,6 +301,20 @@ try
     AssertEqual("2", twelveThread.DetThreads.ToString(), "12 logical CPUs fill detection with 2 threads per engine");
     AssertEqual("1", OcrRuntimeConfig.ComputeWorkersForEngines(1, 1).DetThreads.ToString(), "1 core stays at 1 detection thread");
     AssertEqual("6", OcrRuntimeConfig.ComputeAutoScale(12).Engines.ToString(), "12 logical CPUs use 6 engines");
+    int gpuLine = 4, gpuDet = 6;
+    OcrRuntimeConfig.ApplyGpuThreadBudget(gpu: true, lineExplicit: false, detExplicit: false, ref gpuLine, ref gpuDet);
+    AssertEqual("2", gpuLine.ToString(), "vulkan auto line workers cap at 2");
+    AssertEqual("2", gpuDet.ToString(), "vulkan auto det threads cap at 2");
+    int keptLine = 4, keptDet = 6;
+    OcrRuntimeConfig.ApplyGpuThreadBudget(gpu: true, lineExplicit: true, detExplicit: true, ref keptLine, ref keptDet);
+    AssertEqual("4", keptLine.ToString(), "explicit line workers stay");
+    AssertEqual("6", keptDet.ToString(), "explicit det threads stay");
+    int cpuLine = 4, cpuDet = 6;
+    OcrRuntimeConfig.ApplyGpuThreadBudget(gpu: false, lineExplicit: false, detExplicit: false, ref cpuLine, ref cpuDet);
+    AssertEqual("4", cpuLine.ToString(), "cpu line workers stay on the cpu curve");
+    Environment.SetEnvironmentVariable("MINIOCR_REC_BATCH", null);
+    AssertEqual("32", OcrRuntimeConfig.ResolveRecBatch(gpu: true).ToString(), "vulkan rec batch default is 32");
+    AssertEqual("8", OcrRuntimeConfig.ResolveRecBatch(gpu: false).ToString(), "cpu rec batch default stays 8");
 
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_MODE", "parallel");
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", "4");

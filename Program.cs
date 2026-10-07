@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using MiniOcr;
+using Sdcb.SimdPaddleOCR;
 using PDFtoImage.Parallel;
 using MiniOcr.Models;
 using MiniOcr.Services;
@@ -162,7 +163,7 @@ Console.WriteLine(
 Console.WriteLine(
     $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"backend={runtimeConfig.Backend}, lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
-    $"recIntraOpThreads={runtimeConfig.RecIntraOpThreads}, " +
+    $"recIntraOpThreads={runtimeConfig.RecIntraOpThreads}, recBatch={runtimeConfig.RecBatchLines}, " +
     $"useCls={runtimeConfig.UseDirectionClassification}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
     $"renderMode={runtimeConfig.RenderMode}, renderProcesses={runtimeConfig.RenderProcessCount}, " +
     $"textLayer={runtimeConfig.TextLayer}, " +
@@ -202,7 +203,19 @@ else
     else if (!string.IsNullOrEmpty(engine.VulkanDeviceName))
     {
         Console.WriteLine(
-            $"Vulkan device: {engine.VulkanDeviceName} deviceLocalMB={engine.VulkanDeviceLocalBytes / (1024 * 1024)} bufferCapMB={engine.VulkanBufferCapBytes / (1024 * 1024)} engines={engine.EngineCount}");
+            $"Vulkan device: {engine.VulkanDeviceName} deviceLocalMB={engine.VulkanDeviceLocalBytes / (1024 * 1024)} bufferCapMB={engine.VulkanBufferCapBytes / (1024 * 1024)} engines={engine.EngineCount} fence={OcrVulkan.FenceWait} initMs={OcrVulkan.InitMs:F0}");
+        if (!string.IsNullOrEmpty(OcrVulkan.PipelineCachePath))
+        {
+            long cacheBytes = 0;
+            try
+            {
+                if (File.Exists(OcrVulkan.PipelineCachePath))
+                    cacheBytes = new FileInfo(OcrVulkan.PipelineCachePath).Length;
+            }
+            catch (IOException) { }
+            Console.WriteLine(
+                $"Vulkan pipeline cache: {OcrVulkan.PipelineCachePath} restored={OcrVulkan.PipelineCacheRestored} bytes={cacheBytes}");
+        }
     }
 }
 
