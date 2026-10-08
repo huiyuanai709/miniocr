@@ -1,0 +1,129 @@
+diff --git a/Models/OcrModels.cs b/Models/OcrModels.cs
+index 8bfc282..c6f92ab 100644
+--- a/Models/OcrModels.cs
++++ b/Models/OcrModels.cs
+@@ -109,6 +109,8 @@ public sealed class OcrTimings
+     public int GpuPages { get; set; }
+     /// <summary>Pages where at least one session fell back to CPU.</summary>
+     public int FallbackPages { get; set; }
++    /// <summary>VK_ERROR_DEVICE_LOST count for this process, including startup.</summary>
++    public int DeviceLost { get; set; }
+     public string GpuDevice { get; set; } = "";
+     /// <summary>One-time device creation plus startup warmup. Repeated on every job line.</summary>
+     public double InitMs { get; set; }
+diff --git a/Services/OcrEngine.cs b/Services/OcrEngine.cs
+index b522860..94940ff 100644
+--- a/Services/OcrEngine.cs
++++ b/Services/OcrEngine.cs
+@@ -143,12 +143,28 @@ public sealed class OcrEngine : IAsyncDisposable
+                     config = config.With(engineCount: capped);
+                 }
+                 logger.LogInformation(
+-                    "Vulkan device {Name} kind={Kind} index={Index} deviceLocalMb={DeviceLocalMb} bufferCapMb={BufferCapMb}",
++                    "Vulkan device {Name} kind={Kind} index={Index} deviceLocalMb={DeviceLocalMb} bufferCapMb={BufferCapMb} coopGemm={Coop}",
+                     gpu.Name,
+                     gpu.Kind,
+                     gpu.Index,
+                     gpu.DeviceLocalBytes / (1024 * 1024),
+-                    gpu.BufferByteCap / (1024 * 1024));
++                    gpu.BufferByteCap / (1024 * 1024),
++                    OcrVulkan.CoopGemm);
++                if (Environment.GetEnvironmentVariable("MINIOCR_REC_BATCH") is null)
++                {
++                    int limited = OcrVulkan.LimitRecBatch(config.RecBatchLines, vulkanBytes, OcrVulkan.CoopGemm);
++                    if (limited != config.RecBatchLines)
++                    {
++                        logger.LogWarning(
++                            "Vulkan device {Name} deviceLocalMb={Mb} coopGemm={Coop}; rec batch {From} -> {To}",
++                            gpu.Name,
++                            vulkanBytes / (1024 * 1024),
++                            OcrVulkan.CoopGemm,
++                            config.RecBatchLines,
++                            limited);
++                        config = config.With(recBatchLines: limited);
++                    }
++                }
+             }
+             else if (config.Backend == "vulkan")
+             {
+@@ -247,14 +263,15 @@ public sealed class OcrEngine : IAsyncDisposable
+             }
+             catch (IOException) { }
+             logger.LogInformation(
+-                "GPU warmup initMs={InitMs:F0} fence={Fence} device={Device} pipelineCache={Cache} restored={Restored} cacheBytes={CacheBytes} gpuRuns={GpuRuns}",
++                "GPU warmup initMs={InitMs:F0} fence={Fence} device={Device} pipelineCache={Cache} restored={Restored} cacheBytes={CacheBytes} gpuRuns={GpuRuns} deviceLost={DeviceLost}",
+                 warm.InitMs,
+                 warm.FenceWait,
+                 string.IsNullOrEmpty(gpuName) ? warm.DeviceName : gpuName,
+                 string.IsNullOrEmpty(OcrVulkan.PipelineCachePath) ? "(memory)" : OcrVulkan.PipelineCachePath,
+                 OcrVulkan.PipelineCacheRestored,
+                 cacheBytes,
+-                warm.GpuRuns);
++                warm.GpuRuns,
++                OcrVulkan.DeviceLostCount);
+         }
+ 
+         var created = new OcrEngine(engines, config, logger)
+diff --git a/Services/OcrRuntimeConfig.cs b/Services/OcrRuntimeConfig.cs
+index f857a0e..8515f3d 100644
+--- a/Services/OcrRuntimeConfig.cs
++++ b/Services/OcrRuntimeConfig.cs
+@@ -313,7 +313,7 @@ public sealed class OcrRuntimeConfig
+     public OcrRuntimeConfig WithRenderMode(string renderMode) =>
+         With(renderMode: CanonicalRenderMode(renderMode));
+ 
+-    public OcrRuntimeConfig With(string? mode = null, int? engineCount = null, int? wechatInstances = null, string? renderMode = null) => new()
++    public OcrRuntimeConfig With(string? mode = null, int? engineCount = null, int? wechatInstances = null, string? renderMode = null, int? recBatchLines = null) => new()
+     {
+         Mode = mode is null ? Mode : CanonicalMode(mode),
+         EngineCount = engineCount ?? EngineCount,
+@@ -329,7 +329,7 @@ public sealed class OcrRuntimeConfig
+         TextLayerMaxUnknownRatio = TextLayerMaxUnknownRatio,
+         TextLayerImageCoverage = TextLayerImageCoverage,
+         TextLayerImageMinChars = TextLayerImageMinChars,
+-        RecBatchLines = RecBatchLines,
++        RecBatchLines = recBatchLines ?? RecBatchLines,
+         Backend = Backend,
+         RecIntraOpThreads = RecIntraOpThreads,
+         VulkanDevice = VulkanDevice,
+diff --git a/Services/PdfOcrPipeline.cs b/Services/PdfOcrPipeline.cs
+index 2201787..99f59d5 100644
+--- a/Services/PdfOcrPipeline.cs
++++ b/Services/PdfOcrPipeline.cs
+@@ -1243,6 +1243,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
+             timings.GpuPages = Volatile.Read(ref job.GpuPages);
+             timings.FallbackPages = Volatile.Read(ref job.FallbackPages);
+         }
++        timings.DeviceLost = OcrVulkan.DeviceLostCount;
+         OcrVulkan.GpuTimingSnapshot snap = OcrVulkan.ReadTimings();
+         timings.GpuDevice = !string.IsNullOrEmpty(snap.DeviceName)
+             ? snap.DeviceName
+@@ -1266,6 +1267,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
+             timings.CpuPostMs,
+             timings.GpuPages,
+             timings.FallbackPages,
++            timings.DeviceLost,
+             timings.GpuDevice,
+             timings.InitMs,
+             timings.Fence);
+diff --git a/Services/StageLog.cs b/Services/StageLog.cs
+index 099d40c..8951e76 100644
+--- a/Services/StageLog.cs
++++ b/Services/StageLog.cs
+@@ -10,7 +10,7 @@ internal static partial class StageLog
+ {
+     [LoggerMessage(
+         Level = LogLevel.Information,
+-        Message = "OCR stages: downloadMs={DownloadMs} rasterizeMs={RasterizeMs} ocrMs={OcrMs} analyzeMs={AnalyzeMs} nerWallMs={NerWallMs} nerRequestMs={NerRequestMs} nerGroups={NerGroups} nerPeak={NerPeak} totalMs={TotalMs} gpuSubmitMs={GpuSubmitMs} gpuWaitMs={GpuWaitMs} cpuPreMs={CpuPreMs} cpuPostMs={CpuPostMs} gpuPages={GpuPages} fallbackPages={FallbackPages} gpuDevice={GpuDevice} initMs={InitMs} fence={Fence}")]
++        Message = "OCR stages: downloadMs={DownloadMs} rasterizeMs={RasterizeMs} ocrMs={OcrMs} analyzeMs={AnalyzeMs} nerWallMs={NerWallMs} nerRequestMs={NerRequestMs} nerGroups={NerGroups} nerPeak={NerPeak} totalMs={TotalMs} gpuSubmitMs={GpuSubmitMs} gpuWaitMs={GpuWaitMs} cpuPreMs={CpuPreMs} cpuPostMs={CpuPostMs} gpuPages={GpuPages} fallbackPages={FallbackPages} deviceLost={DeviceLost} gpuDevice={GpuDevice} initMs={InitMs} fence={Fence}")]
+     public static partial void OcrStages(
+         ILogger logger,
+         double downloadMs,
+@@ -28,6 +28,7 @@ internal static partial class StageLog
+         double cpuPostMs,
+         int gpuPages,
+         int fallbackPages,
++        int deviceLost,
+         string gpuDevice,
+         double initMs,
+         string fence);
