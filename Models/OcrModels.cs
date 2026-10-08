@@ -109,6 +109,8 @@ public sealed class OcrTimings
     public int GpuPages { get; set; }
     /// <summary>Pages where at least one session fell back to CPU.</summary>
     public int FallbackPages { get; set; }
+    /// <summary>VK_ERROR_DEVICE_LOST count for this process, including startup.</summary>
+    public int DeviceLost { get; set; }
     public string GpuDevice { get; set; } = "";
     /// <summary>One-time device creation plus startup warmup. Repeated on every job line.</summary>
     public double InitMs { get; set; }

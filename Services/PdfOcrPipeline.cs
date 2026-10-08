@@ -1243,6 +1243,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             timings.GpuPages = Volatile.Read(ref job.GpuPages);
             timings.FallbackPages = Volatile.Read(ref job.FallbackPages);
         }
+        timings.DeviceLost = OcrVulkan.DeviceLostCount;
         OcrVulkan.GpuTimingSnapshot snap = OcrVulkan.ReadTimings();
         timings.GpuDevice = !string.IsNullOrEmpty(snap.DeviceName)
             ? snap.DeviceName
@@ -1266,6 +1267,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             timings.CpuPostMs,
             timings.GpuPages,
             timings.FallbackPages,
+            timings.DeviceLost,
             timings.GpuDevice,
             timings.InitMs,
             timings.Fence);
