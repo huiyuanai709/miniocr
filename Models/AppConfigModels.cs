@@ -65,6 +65,12 @@ public sealed class OcrFileConfig
     public string RenderMode { get; set; } = "parallel";
     /// <summary>Worker processes when <see cref="RenderMode"/> is <c>parallel</c>. Null = auto from cores and engine count.</summary>
     public int? RenderProcesses { get; set; }
+    /// <summary>
+    /// <c>agg</c> (default) or <c>skia</c>. Experimental PDFium CPU renderer.
+    /// Skia needs a PDFium build that exports <c>FPDF_RenderPageSkia</c>; otherwise the process stays on AGG.
+    /// This is not a GPU surface.
+    /// </summary>
+    public string PdfRenderer { get; set; } = "agg";
     /// <summary><c>auto</c> (default), <c>off</c>, or <c>force</c>. <c>auto</c> skips raster and OCR when the PDF text layer looks usable.</summary>
     public string TextLayer { get; set; } = "auto";
     /// <summary>Non-whitespace characters required on a normal text page. Null = 40.</summary>

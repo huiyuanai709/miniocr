@@ -21,6 +21,8 @@ public sealed class OcrRuntimeConfig
     public string RenderMode { get; init; } = "parallel";
     /// <summary>Worker processes used when <see cref="RenderMode"/> is <c>parallel</c>.</summary>
     public int RenderProcessCount { get; init; } = 1;
+    /// <summary><c>agg</c> (default) or <c>skia</c>. Experimental PDFium CPU bitmap renderer.</summary>
+    public string PdfRenderer { get; init; } = "agg";
     /// <summary><c>auto</c> (default), <c>off</c>, or <c>force</c>.</summary>
     public string TextLayer { get; init; } = "auto";
     public int TextLayerMinChars { get; init; } = 40;
@@ -121,6 +123,7 @@ public sealed class OcrRuntimeConfig
         raster = Math.Clamp(raster, 1, 8);
 
         string renderMode = ResolveRenderMode(ocr.RenderMode);
+        string pdfRenderer = ResolvePdfRenderer(ocr.PdfRenderer);
         int renderAuto = ComputeRenderProcesses(cores, engines);
         int renderProcesses = ResolveInt(
             "MINIOCR_RENDER_PROCESSES",
@@ -207,6 +210,7 @@ public sealed class OcrRuntimeConfig
             RasterWorkerCount = raster,
             RenderMode = renderMode,
             RenderProcessCount = renderProcesses,
+            PdfRenderer = pdfRenderer,
             TextLayer = textLayer,
             TextLayerMinChars = textMinChars,
             TextLayerMaxUnknownRatio = textUnknown,
@@ -324,6 +328,7 @@ public sealed class OcrRuntimeConfig
         RasterWorkerCount = RasterWorkerCount,
         RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),
         RenderProcessCount = RenderProcessCount,
+        PdfRenderer = PdfRenderer,
         TextLayer = TextLayer,
         TextLayerMinChars = TextLayerMinChars,
         TextLayerMaxUnknownRatio = TextLayerMaxUnknownRatio,
@@ -384,6 +389,20 @@ public sealed class OcrRuntimeConfig
             return "inprocess";
         return "parallel";
     }
+
+    /// <summary>
+    /// Env MINIOCR_PDF_RENDERER overrides file. <c>skia</c> selects PDFium's Skia CPU renderer.
+    /// Anything else, including empty, stays on AGG.
+    /// </summary>
+    public static string ResolvePdfRenderer(string? fileValue)
+    {
+        string? env = Environment.GetEnvironmentVariable("MINIOCR_PDF_RENDERER");
+        string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileValue ?? "agg");
+        return CanonicalPdfRenderer(raw);
+    }
+
+    public static string CanonicalPdfRenderer(string? raw) =>
+        string.Equals(raw?.Trim(), "skia", StringComparison.OrdinalIgnoreCase) ? "skia" : "agg";
 
     /// <summary>
     /// Env MINIOCR_OCR_TEXT_LAYER overrides file. Accepts auto|off|force (case-insensitive).

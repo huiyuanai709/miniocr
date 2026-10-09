@@ -116,6 +116,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
     "renderMode": "parallel",
     "textLayer": "auto",
     "renderProcesses": null,
+    "pdfRenderer": "agg",
     "useCls": false,
     "backend": "cpu",
     "vulkanDevice": "",
@@ -153,6 +154,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 按核数 | 进程内栅格线程。`parallel` 时用于回退 |
 | `MINIOCR_RENDER_MODE` | `ocr.renderMode` | `parallel` | `parallel` 或 `inprocess` |
 | `MINIOCR_RENDER_PROCESSES` | `ocr.renderProcesses` | 1–4 | 并行渲染进程数 |
+| `MINIOCR_PDF_RENDERER` | `ocr.pdfRenderer` | `agg` | 实验：`skia` 让 PDFium 用 Skia 填同一块 CPU 位图（BGRA / Gray8）。当前发布包的 pdfium 没有 `FPDF_RenderPageSkia`，会留在 AGG。不是 GPU 渲染。进程内和并行渲染进程都读这个值，启动后不能再换 |
 | `MINIOCR_OCR_TEXT_LAYER` | `ocr.textLayer` | `auto` | `auto` / `off` / `force`。有可用文本层时跳过识别 |
 | `MINIOCR_TEXT_LAYER_MIN_CHARS` | `ocr.textLayerMinChars` | 40 | 文本层最短非空白字符 |
 | `MINIOCR_TEXT_LAYER_MAX_UNKNOWN_RATIO` | `ocr.textLayerMaxUnknownRatio` | 0.02 | 未知字符比例上限 |
