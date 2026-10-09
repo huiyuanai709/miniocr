@@ -64,6 +64,8 @@ public sealed class ClusterJob
     public int Dpi { get; }
     /// <summary>Original http(s) URL the coordinator downloaded, when the job came from a link.</summary>
     public string SourceUrl { get; }
+    /// <summary>Absolute path of the PDF in the shared directory. Empty when workers must download.</summary>
+    public string SharedPath { get; set; } = "";
     public DateTimeOffset Started { get; }
     public bool ExpectRemote { get; set; }
     public ConcurrentDictionary<string, byte> Joined { get; } = new(StringComparer.Ordinal);

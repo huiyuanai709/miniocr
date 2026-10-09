@@ -27,6 +27,7 @@
     "joinGraceMs": 500,
     "pipelineOcr": true,
     "renderAheadPages": 4,
-    "distributedNer": true
+    "distributedNer": true,
+    "sharedDir": "/var/lib/miniocr/jobs"
   }
 }

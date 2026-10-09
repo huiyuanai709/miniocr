@@ -181,7 +181,9 @@ public sealed class ClusterWorkerHost : IHostedService
             req.CoordinatorUrl.Trim().TrimEnd('/'),
             req.Dpi,
             req.PageCount,
-            req.SourceUrl);
+            req.SourceUrl,
+            req.LocalPath,
+            req.PdfLength);
         return true;
     }
 
@@ -216,7 +218,9 @@ public sealed class ClusterWorkerHost : IHostedService
                             _config.CoordinatorUrl,
                             dispatch.Dpi,
                             dispatch.PageCount,
-                            dispatch.SourceUrl);
+                            dispatch.SourceUrl,
+                            dispatch.LocalPath,
+                            dispatch.PdfLength);
                     }
                     else
                         ClusterJobLog.DispatchWait(_logger, _config.VerboseDispatch, _self.NodeId);
@@ -246,7 +250,14 @@ public sealed class ClusterWorkerHost : IHostedService
         }
     }
 
-    private void StartSession(string jobId, string coordinatorUrl, int dpi, int pageCount, string? sourceUrl)
+    private void StartSession(
+        string jobId,
+        string coordinatorUrl,
+        int dpi,
+        int pageCount,
+        string? sourceUrl,
+        string? localPath,
+        int pdfLength)
     {
         if (_sessions.Count >= ClusterDispatchRules.MaxWorkerSessions && !_sessions.ContainsKey(jobId))
         {
@@ -266,7 +277,7 @@ public sealed class ClusterWorkerHost : IHostedService
 
         _recentlyLeft.TryRemove(jobId, out _);
         _ = Task.Run(
-            () => SessionAsync(jobId, coordinatorUrl, dpi, pageCount, sourceUrl, sessionCts),
+            () => SessionAsync(jobId, coordinatorUrl, dpi, pageCount, sourceUrl, localPath, pdfLength, sessionCts),
             CancellationToken.None);
     }
 
@@ -276,6 +287,8 @@ public sealed class ClusterWorkerHost : IHostedService
         int dpi,
         int pageCount,
         string? sourceUrl,
+        string? localPath,
+        int pdfLength,
         CancellationTokenSource sessionCts)
     {
         CancellationToken ct = sessionCts.Token;
@@ -285,9 +298,12 @@ public sealed class ClusterWorkerHost : IHostedService
         DateTimeOffset progressAt = started;
         Task? nerTask = null;
         byte[]? renderPdf = null;
+        string? sharedPdfPath = null;
         var stages = new WorkerStageTotals();
         try
         {
+            if (ClusterSharedPdf.TryResolve(_config.SharedDir, localPath, pdfLength, out string resolvedShared))
+                sharedPdfPath = resolvedShared;
             _logger.LogInformation(
                 "Cluster worker {NodeId} joining job {JobId} via {Coordinator} dpi={Dpi} pages={Pages} pdf={Source}",
                 _self.NodeId,
@@ -295,28 +311,42 @@ public sealed class ClusterWorkerHost : IHostedService
                 coordinatorUrl,
                 dpi,
                 pageCount,
-                DescribePdfSource(sourceUrl));
-            bool cached = TryGetCachedPdf(jobId, out byte[]? pdf);
+                sharedPdfPath is not null ? "shared-file" : DescribePdfSource(sourceUrl));
+            bool cached = false;
+            byte[]? pdf = null;
             Task<byte[]>? shared = null;
-            if (!cached && !string.IsNullOrWhiteSpace(sourceUrl))
+            if (sharedPdfPath is null)
             {
-                Task<byte[]> fetch = GetOrStartUrlFetch(sourceUrl.Trim());
-                if (fetch.IsCompletedSuccessfully)
+                cached = TryGetCachedPdf(jobId, out pdf);
+                if (!cached && !string.IsNullOrWhiteSpace(sourceUrl))
                 {
-                    pdf = await fetch.ConfigureAwait(false);
-                    RememberPdf(jobId, pdf);
-                    cached = true;
+                    Task<byte[]> fetch = GetOrStartUrlFetch(sourceUrl.Trim());
+                    if (fetch.IsCompletedSuccessfully)
+                    {
+                        pdf = await fetch.ConfigureAwait(false);
+                        RememberPdf(jobId, pdf);
+                        cached = true;
+                    }
+                    else if (!fetch.IsCompleted)
+                        shared = fetch;
                 }
-                else if (!fetch.IsCompleted)
-                    shared = fetch;
             }
 
-            if (!await JoinWithRetryAsync(coordinatorUrl, jobId, downloading: !cached, ct).ConfigureAwait(false))
+            if (!await JoinWithRetryAsync(coordinatorUrl, jobId, downloading: sharedPdfPath is null && !cached, ct).ConfigureAwait(false))
                 return;
             nerTask = RunsDistributedNer
                 ? RunNerConsumersAsync(coordinatorUrl, jobId, () => Interlocked.Increment(ref nerGroups), ct)
                 : null;
-            if (!cached)
+            if (sharedPdfPath is not null)
+            {
+                _logger.LogInformation(
+                    "Cluster worker {NodeId} job {JobId} opened shared PDF bytes={Bytes} path={Path}",
+                    _self.NodeId,
+                    jobId,
+                    pdfLength,
+                    sharedPdfPath);
+            }
+            else if (!cached)
             {
                 Stopwatch download = Stopwatch.StartNew();
                 if (shared is not null)
@@ -363,12 +393,25 @@ public sealed class ClusterWorkerHost : IHostedService
                     pdf!.Length);
             }
 
-            byte[] pdfBytes = pdf ?? throw new InvalidOperationException("PDF was not downloaded.");
-            renderPdf = pdfBytes;
+            byte[] pdfBytes;
+            int renderLength;
+            if (sharedPdfPath is not null)
+            {
+                pdfBytes = [];
+                renderLength = pdfLength;
+            }
+            else
+            {
+                pdfBytes = pdf ?? throw new InvalidOperationException("PDF was not downloaded.");
+                renderLength = pdfBytes.Length;
+                renderPdf = pdfBytes;
+            }
+
             if (_config.PipelineOcr)
             {
                 localDone += await RunPipelinedOcrAsync(
-                    coordinatorUrl, jobId, dpi, pageCount, pdfBytes, started, progressAt, stages, ct).ConfigureAwait(false);
+                    coordinatorUrl, jobId, dpi, pageCount, pdfBytes, renderLength, sharedPdfPath,
+                    started, progressAt, stages, ct).ConfigureAwait(false);
             }
             else
             while (!ct.IsCancellationRequested)
@@ -412,11 +455,12 @@ public sealed class ClusterWorkerHost : IHostedService
                     List<OcrPageResult> results = [];
                     await _pipeline.RecognizeIndicesAsync(
                         pdfBytes,
-                        pdfBytes.Length,
+                        renderLength,
                         zeroBased,
                         dpi,
                         results.Add,
-                        ct).ConfigureAwait(false);
+                        ct,
+                        sharedPdfPath).ConfigureAwait(false);
                     foreach (OcrPageResult page in results)
                         stages.AddPage(page.RasterizeMs, page.OcrMs);
                     long postStart = StageClock.Stamp();
@@ -467,7 +511,9 @@ public sealed class ClusterWorkerHost : IHostedService
         }
         finally
         {
-            if (renderPdf is not null)
+            if (sharedPdfPath is not null)
+                await _pipeline.ReleaseSharedPdfAsync(sharedPdfPath).ConfigureAwait(false);
+            else if (renderPdf is not null)
                 await _pipeline.ReleaseMappedPdfAsync(renderPdf).ConfigureAwait(false);
             if (nerTask is not null && !nerTask.IsCompleted)
             {
@@ -551,6 +597,8 @@ public sealed class ClusterWorkerHost : IHostedService
         int dpi,
         int pageCount,
         byte[] pdfBytes,
+        int pdfLength,
+        string? sharedPdfPath,
         DateTimeOffset started,
         DateTimeOffset progressAt,
         WorkerStageTotals stages,
@@ -635,11 +683,12 @@ public sealed class ClusterWorkerHost : IHostedService
             {
                 await _pipeline.RecognizeFeedAsync(
                     pdfBytes,
-                    pdfBytes.Length,
+                    pdfLength,
                     feed.Reader,
                     dpi,
                     (page, batchId, token) => new ValueTask(posts.Writer.WriteAsync((batchId, page), token).AsTask()),
-                    pipeCts.Token).ConfigureAwait(false);
+                    pipeCts.Token,
+                    sharedPdfPath).ConfigureAwait(false);
             }
             finally
             {

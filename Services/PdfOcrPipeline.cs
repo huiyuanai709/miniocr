@@ -677,7 +677,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         zeroBased,
                         dpi,
                         page => job.TryAccept(batchId, page),
-                        token).ConfigureAwait(false);
+                        token,
+                        string.IsNullOrEmpty(job.SharedPath) ? null : job.SharedPath).ConfigureAwait(false);
                 },
                 Accept,
                 distributeNer,
@@ -694,7 +695,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         job.TryAccept(batchId, page);
                         return ValueTask.CompletedTask;
                     },
-                    token)).ConfigureAwait(false);
+                    token,
+                    string.IsNullOrEmpty(job.SharedPath) ? null : job.SharedPath)).ConfigureAwait(false);
             jobId = outcome.JobId;
             distributedEntities = outcome.UsedDistributedNer ? outcome.Entities ?? new OcrEntities() : null;
             clusterOcrDoneMs = outcome.OcrDoneMs;
@@ -769,7 +771,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         IReadOnlyList<int> pageIndices,
         int dpi,
         Action<OcrPageResult> onPage,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? sharedPdfPath = null)
     {
         if (pageIndices.Count == 0)
             return;
@@ -808,7 +811,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
-        Task producer = ProduceIndicesAsync(pdfBytes, pdfLength, indices, renderOptions, rasterized.Writer, ct);
+        Task producer = ProduceIndicesAsync(
+            pdfBytes, pdfLength, indices, renderOptions, rasterized.Writer, ct, sharedPdfPath);
 
         async Task ConsumerAsync()
         {
@@ -875,7 +879,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         ChannelReader<(string BatchId, int Page)> pages,
         int dpi,
         Func<OcrPageResult, string, CancellationToken, ValueTask> onPage,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? sharedPdfPath = null)
     {
         dpi = Math.Clamp(dpi, 36, 300);
         if (_config.IsLlmMode)
@@ -910,7 +915,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
-        Task producer = ProduceFeedAsync(pdfBytes, pdfLength, pages, renderOptions, rasterized.Writer, ct);
+        Task producer = ProduceFeedAsync(
+            pdfBytes, pdfLength, pages, renderOptions, rasterized.Writer, ct, sharedPdfPath);
 
         async Task ConsumerAsync()
         {
@@ -985,7 +991,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         ChannelReader<(string BatchId, int Page)> pages,
         RenderOptions renderOptions,
         ChannelWriter<(int Index, string BatchId, PageImage Image, double RasterMs)> writer,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? sharedPdfPath = null)
     {
         try
         {
@@ -1018,7 +1025,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         FullMode = BoundedChannelFullMode.Wait,
                     });
                 Task rendering = DispatchRenderAsync(
-                    pdfBytes, pdfLength, indices.ToArray(), renderOptions, chunk.Writer, ct, completeWriter: true);
+                    pdfBytes, pdfLength, indices.ToArray(), renderOptions, chunk.Writer, ct,
+                    completeWriter: true, sharedPdfPath: sharedPdfPath);
                 await foreach (var (index, bitmap, rasterMs) in chunk.Reader.ReadAllAsync(ct).ConfigureAwait(false))
                 {
                     string id = batchOf.TryGetValue(index, out string? found) ? found : "";
@@ -1162,8 +1170,9 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int[] pageIndices,
         RenderOptions renderOptions,
         ChannelWriter<(int, PageImage, double)> writer,
-        CancellationToken ct) =>
-        DispatchRenderAsync(pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct);
+        CancellationToken ct,
+        string? sharedPdfPath = null) =>
+        DispatchRenderAsync(pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct, sharedPdfPath: sharedPdfPath);
 
     private string LogTextHash(OcrPageResult?[] pages)
     {
@@ -1679,7 +1688,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         RenderOptions renderOptions,
         ChannelWriter<(int, PageImage, double)> writer,
         CancellationToken ct,
-        bool completeWriter = true)
+        bool completeWriter = true,
+        string? sharedPdfPath = null)
     {
         Stopwatch wall = Stopwatch.StartNew();
         string mode = _config.IsParallelRender ? "parallel" : "inprocess";
@@ -1694,7 +1704,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 try
                 {
                     await ProduceWithParallelAsync(
-                        pdfBytes, pdfLength, pageIndices, renderOptions, writer, written, ct)
+                        pdfBytes, pdfLength, pageIndices, renderOptions, writer, written, ct, sharedPdfPath)
                         .ConfigureAwait(false);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1709,16 +1719,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     workers = Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, remaining.Length)), 1, 8);
                     if (remaining.Length > 0)
                     {
+                        byte[] fallback = BytesForInProcess(pdfBytes, pdfLength, sharedPdfPath);
                         await ProduceInProcessAsync(
-                            pdfBytes, pdfLength, remaining, renderOptions, writer, ct)
+                            fallback, pdfLength, remaining, renderOptions, writer, ct)
                             .ConfigureAwait(false);
                     }
                 }
             }
             else
             {
+                byte[] fallback = BytesForInProcess(pdfBytes, pdfLength, sharedPdfPath);
                 await ProduceInProcessAsync(
-                    pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct)
+                    fallback, pdfLength, pageIndices, renderOptions, writer, ct)
                     .ConfigureAwait(false);
             }
         }
@@ -1743,13 +1755,16 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         RenderOptions renderOptions,
         ChannelWriter<(int, PageImage, double)> writer,
         HashSet<int> written,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? sharedPdfPath = null)
     {
         // One temp file per PDF per process. The same ParallelPdfProcessor reopens that
         // path for every batch (ReuseFileStream) and keeps the parsed document
         // (RetainDocuments). leaveOpen keeps our handle. Job end calls
         // ReleaseRetainedFileAsync before deleting the file. Do not construct a new processor here.
-        MappedPdf mapped = await RetainMappedAsync(pdfBytes, pdfLength, ct).ConfigureAwait(false);
+        MappedPdf mapped = string.IsNullOrEmpty(sharedPdfPath)
+            ? await RetainMappedAsync(pdfBytes, pdfLength, ct).ConfigureAwait(false)
+            : await RetainSharedAsync(sharedPdfPath, pdfBytes, pdfLength, ct).ConfigureAwait(false);
         // Once per process. Later batches only read the flag; the stamp is taken only when Debug is on.
         bool timeFirstLease = false;
         long firstLease = 0;
@@ -2063,7 +2078,10 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             }
         }
 
-        DeleteTempOrRetry(path);
+        if (mapped.DeleteOnRelease)
+            DeleteTempOrRetry(path);
+        else
+            _logger.LogDebug("Left shared PDF for job-end delete {Path}", path);
     }
 
     private async Task ReleaseWorkersAsync(string path)
@@ -2268,5 +2286,85 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         public FileStream? Stream;
         public int Uses;
         public bool ReleaseRequested;
+        /// <summary>False for a shared-directory PDF. The coordinator deletes that file when the job ends.</summary>
+        public bool DeleteOnRelease = true;
+    }
+
+    private static byte[] BytesForInProcess(byte[] pdfBytes, int pdfLength, string? sharedPdfPath)
+    {
+        if (pdfLength > 0 && pdfBytes.Length >= pdfLength)
+            return pdfBytes;
+        if (!string.IsNullOrEmpty(sharedPdfPath))
+            return File.ReadAllBytes(sharedPdfPath);
+        return pdfBytes;
+    }
+
+    /// <summary>
+    /// Open a PDF that already lives in the shared directory. Does not copy it and does not delete it.
+    /// </summary>
+    private async Task<MappedPdf> RetainSharedAsync(string path, byte[] pdfBytes, int pdfLength, CancellationToken ct)
+    {
+        string full = Path.GetFullPath(path);
+        await _mapGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            for (int i = 0; i < _mapped.Count; i++)
+            {
+                MappedPdf existing = _mapped[i];
+                if (!string.Equals(existing.Path, full, StringComparison.Ordinal) || existing.Stream is null)
+                    continue;
+                existing.Uses++;
+                _logger.LogDebug("Parallel render reusing shared PDF {Path} uses={Uses}", full, existing.Uses);
+                return existing;
+            }
+
+            var stream = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            var created = new MappedPdf
+            {
+                Bytes = pdfBytes,
+                Length = pdfLength,
+                Path = full,
+                Stream = stream,
+                Uses = 1,
+                DeleteOnRelease = false,
+            };
+            _mapped.Add(created);
+            _logger.LogInformation("Parallel render opened shared PDF {Path} bytes={Bytes}", full, pdfLength);
+            return created;
+        }
+        finally
+        {
+            _mapGate.Release();
+        }
+    }
+
+    /// <summary>Close retained renderers for a shared PDF without deleting the file.</summary>
+    public async ValueTask ReleaseSharedPdfAsync(string path)
+    {
+        string full = Path.GetFullPath(path);
+        List<MappedPdf> closing = [];
+        await _mapGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            for (int i = _mapped.Count - 1; i >= 0; i--)
+            {
+                MappedPdf mapped = _mapped[i];
+                if (!string.Equals(mapped.Path, full, StringComparison.Ordinal))
+                    continue;
+                mapped.ReleaseRequested = true;
+                if (mapped.Uses == 0)
+                {
+                    _mapped.RemoveAt(i);
+                    closing.Add(mapped);
+                }
+            }
+        }
+        finally
+        {
+            _mapGate.Release();
+        }
+
+        foreach (MappedPdf mapped in closing)
+            await FinishMappedAsync(mapped).ConfigureAwait(false);
     }
 }

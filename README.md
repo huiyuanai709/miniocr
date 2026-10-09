@@ -244,6 +244,8 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 `llm.timeoutSeconds`、`maxCharsPerRequest`、`fallbackToHeuristics` 没有对应环境变量，写在 `config.docker.json`。OCR 为 Vulkan、4 个引擎、DPI 96、关闭方向分类。识别批大小不设 `MINIOCR_REC_BATCH`，24GB 显卡会保持较大的批。8 个进程各自的 `maxConcurrency` 是 16；出口压力大时用 `MINIOCR_LLM_MAX_CONCURRENCY` 调低。
 
+上传的 PDF 没有可再次下载的地址时，协调进程把它写到 `MINIOCR_CLUSTER_SHARED_DIR`（compose 里是卷 `miniocr-jobs`，挂到 `/var/lib/miniocr/jobs`）。同机的工作进程直接打开这个文件。路径不存在或长度对不上时，仍向协调进程下载。任务结束后删除该文件；渲染进程先放开对它的映射。别的机器上看不到这个路径，所以还是走下载。
+
 ```bash
 cp .env.example .env
 # 编辑 .env，填入上面两个变量，不要把 .env 提交进仓库

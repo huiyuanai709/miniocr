@@ -45,6 +45,8 @@ public sealed class ClusterRuntimeConfig
     /// Default true. <c>MINIOCR_CLUSTER_DISTRIBUTED_NER=0</c> keeps NER on the coordinator.
     /// </summary>
     public bool DistributedNer { get; init; } = true;
+    /// <summary>Shared upload directory. Empty means workers always download.</summary>
+    public string SharedDir { get; init; } = "";
     public IReadOnlyList<ClusterWorkerEndpoint> Workers { get; init; } = [];
     /// <summary>Set when a request to enable clustering was ignored (empty token).</summary>
     public string? DisabledReason { get; init; }
@@ -148,6 +150,9 @@ public sealed class ClusterRuntimeConfig
         if (!string.IsNullOrWhiteSpace(envNer))
             distributedNer = ParseBool(envNer, distributedNer);
 
+        string sharedDir = FirstNonEmpty(env("MINIOCR_CLUSTER_SHARED_DIR"), section.SharedDir) ?? "";
+        sharedDir = sharedDir.Trim();
+
         // ---- Nacos ----
         NacosFileConfig? nacos = null;
         if (enabled)
@@ -201,6 +206,7 @@ public sealed class ClusterRuntimeConfig
             PipelineOcr = pipelineOcr,
             VerboseDispatch = verboseDispatch,
             DistributedNer = distributedNer,
+            SharedDir = sharedDir,
             Workers = workers,
             DisabledReason = disabledReason,
             Nacos = nacos,
