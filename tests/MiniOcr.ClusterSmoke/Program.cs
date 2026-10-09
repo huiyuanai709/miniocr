@@ -1332,6 +1332,54 @@ largeJob.MarkGraceElapsed();
 AssertTrue(!largeJob.ShouldHoldLocal(holdNow), "48 pages open the local window after grace");
 AssertTrue(largeJob.PageCount >= ClusterJob.DownloadHoldPageLimit, "the hold limit is the large-job cutoff");
 
+Console.WriteLine("=== shared PDF path ===");
+string sharedRoot = Path.Combine(Path.GetTempPath(), "miniocr-shared-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(sharedRoot);
+try
+{
+    string jobId = Guid.NewGuid().ToString("N");
+    byte[] body = "pdf-bytes"u8.ToArray();
+    string? written = ClusterSharedPdf.TryWrite(sharedRoot, jobId, body, logger: null);
+    AssertTrue(written is not null && File.Exists(written), "coordinator publishes the PDF into the shared directory");
+    AssertTrue(ClusterSharedPdf.TryResolve(sharedRoot, written, body.Length, out string opened) && opened == written,
+        "a worker on the same directory opens the file");
+    string fileUri = new Uri(written!).AbsoluteUri;
+    AssertTrue(ClusterSharedPdf.TryResolve(sharedRoot, fileUri, body.Length, out _), "file:// URL is accepted");
+    AssertTrue(!ClusterSharedPdf.TryResolve(sharedRoot, written, body.Length + 1, out _), "length mismatch falls back");
+    AssertTrue(!ClusterSharedPdf.TryResolve(sharedRoot, Path.Combine(sharedRoot, "other.pdf"), body.Length, out _),
+        "a name that is not a job id is rejected");
+    string outside = Path.Combine(Path.GetTempPath(), jobId + ".pdf");
+    File.WriteAllBytes(outside, body);
+    try
+    {
+        AssertTrue(!ClusterSharedPdf.TryResolve(sharedRoot, outside, body.Length, out _),
+            "a path outside the shared directory is rejected");
+    }
+    finally
+    {
+        File.Delete(outside);
+    }
+
+    ClusterSharedPdf.DeleteWhenDone(written, logger: null);
+    AssertTrue(!File.Exists(written), "job end deletes the shared PDF");
+    AssertTrue(!ClusterSharedPdf.TryResolve(sharedRoot, written, body.Length, out _), "a missing file falls back to download");
+
+    ClusterRuntimeConfig sharedCfg = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile
+        {
+            Cluster = new ClusterFileConfig { Enabled = true, Token = "t", SharedDir = "/tmp/from-file" },
+        },
+        name => name == "MINIOCR_CLUSTER_SHARED_DIR" ? "/var/lib/miniocr/jobs" : null);
+    AssertTrue(sharedCfg.SharedDir == "/var/lib/miniocr/jobs", "MINIOCR_CLUSTER_SHARED_DIR overrides the file");
+    AssertTrue(!ClusterSharedPdf.IsRemoteUrl(null), "an upload has no remote URL");
+    AssertTrue(ClusterSharedPdf.IsRemoteUrl("https://example.test/a.pdf"), "http(s) source stays a download");
+}
+finally
+{
+    try { Directory.Delete(sharedRoot, recursive: true); }
+    catch (IOException) { }
+}
+
 if (failed > 0)
 {
     Console.WriteLine($"FAILED {failed}");

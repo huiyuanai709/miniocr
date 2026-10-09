@@ -100,6 +100,7 @@ public sealed class ClusterCoordinator : IHostedService
     {
         if (!_config.Enabled || !_config.IsCoordinator)
             return;
+        ClusterSharedPdf.SweepExpired(_config.SharedDir, _logger);
         _healthLoop = Task.Run(() => HealthLoopAsync(_cts.Token), CancellationToken.None);
         await Task.CompletedTask;
     }
@@ -242,6 +243,8 @@ public sealed class ClusterCoordinator : IHostedService
                 PageCount = job.PageCount,
                 PdfPath = "/cluster/jobs/" + job.Id + "/pdf",
                 SourceUrl = string.IsNullOrWhiteSpace(job.SourceUrl) ? null : job.SourceUrl,
+                LocalPath = string.IsNullOrEmpty(job.SharedPath) ? null : job.SharedPath,
+                PdfLength = job.PdfLength,
                 RetryAfterMs = 200,
             };
         }
@@ -434,9 +437,22 @@ public sealed class ClusterCoordinator : IHostedService
         bool expectRemote = remotes.Count > 0;
         scheduler.SetHoldLocalWindow(expectRemote && _config.JoinGraceMs > 0);
 
+        string sharedPath = "";
+        try
+        {
+        if (!ClusterSharedPdf.IsRemoteUrl(sourceUrl))
+        {
+            sharedPath = ClusterSharedPdf.TryWrite(
+                _config.SharedDir,
+                id,
+                pdf.AsMemory(0, pdfLength),
+                _logger) ?? "";
+        }
+
         var job = new ClusterJob(id, scheduler, pdf, pdfLength, pageCount, dpi, sourceUrl)
         {
             ExpectRemote = expectRemote,
+            SharedPath = sharedPath,
         };
         ClusterNerScheduler? ner = null;
         int localNerCap = 0;
@@ -486,19 +502,20 @@ public sealed class ClusterCoordinator : IHostedService
         if (streamClassify)
         {
             _logger.LogInformation(
-                "Cluster job {JobId} start: pages={Pages}, textLayer=streaming, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}",
+                "Cluster job {JobId} start: pages={Pages}, textLayer=streaming, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}, shared={Shared}",
                 id,
                 pageCount,
                 pdfLength,
                 dpi,
                 remotes.Count,
                 localCap,
-                string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator");
+                string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator",
+                string.IsNullOrEmpty(sharedPath) ? "off" : "file");
         }
         else
         {
             _logger.LogInformation(
-                "Cluster job {JobId} start: pages={Pages}, textLayer={TextLayer}, ocr={Ocr}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}",
+                "Cluster job {JobId} start: pages={Pages}, textLayer={TextLayer}, ocr={Ocr}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges, source={Source}, shared={Shared}",
                 id,
                 pageCount,
                 precompleted.Length,
@@ -507,7 +524,8 @@ public sealed class ClusterCoordinator : IHostedService
                 dpi,
                 remotes.Count,
                 localCap,
-                string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator");
+                string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator",
+                string.IsNullOrEmpty(sharedPath) ? "off" : "file");
         }
 
         using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -836,9 +854,15 @@ public sealed class ClusterCoordinator : IHostedService
                 _jobs.TryRemove(id, out _);
                 _lastJob = last;
             }
+
         }
 
         return new ClusterRunResult(id, usedDistributed, distributedEntities, ocrDoneMs, nerDoneMs, ner is null ? 0 : ner.Snapshot().Formed);
+        }
+        finally
+        {
+            ClusterSharedPdf.DeleteWhenDone(sharedPath, _logger);
+        }
     }
 
     public readonly record struct ClusterRunResult(
@@ -1208,6 +1232,8 @@ public sealed class ClusterCoordinator : IHostedService
             Dpi = job.Dpi,
             PageCount = job.PageCount,
             SourceUrl = string.IsNullOrWhiteSpace(job.SourceUrl) ? null : job.SourceUrl,
+            LocalPath = string.IsNullOrEmpty(job.SharedPath) ? null : job.SharedPath,
+            PdfLength = job.PdfLength,
         };
 
         await Task.WhenAll(remotes.Select(remote => NotifyOneAsync(http, remote, body, ct)))

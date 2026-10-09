@@ -19,6 +19,7 @@
     <Compile Include="..\..\Services\ClusterJobLog.cs" Link="ClusterJobLog.cs" />
     <Compile Include="..\..\Services\ClusterNodeRegistry.cs" Link="ClusterNodeRegistry.cs" />
     <Compile Include="..\..\Services\ClusterRuntimeConfig.cs" Link="ClusterRuntimeConfig.cs" />
+    <Compile Include="..\..\Services\ClusterSharedPdf.cs" Link="ClusterSharedPdf.cs" />
     <Compile Include="..\..\Services\ClusterAuth.cs" Link="ClusterAuth.cs" />
     <Compile Include="..\..\Services\LlmPageGrouper.cs" Link="LlmPageGrouper.cs" />
     <Compile Include="..\..\Services\ClusterNerScheduler.cs" Link="ClusterNerScheduler.cs" />

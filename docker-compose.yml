@@ -25,7 +25,10 @@ x-miniocr: &miniocr
     MINIOCR_CLUSTER_ENABLED: "1"
     MINIOCR_CLUSTER_CAPACITY: "0"
     MINIOCR_CLUSTER_COORDINATOR_URL: http://gpu0:5080
+    MINIOCR_CLUSTER_SHARED_DIR: /var/lib/miniocr/jobs
     NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+  volumes:
+    - miniocr-jobs:/var/lib/miniocr/jobs
 
 services:
   gpu0:
@@ -242,3 +245,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 180s
+
+volumes:
+  miniocr-jobs:

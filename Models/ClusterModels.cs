@@ -63,6 +63,11 @@ public sealed class ClusterFileConfig
     /// Set false to keep text NER on the coordinator only.
     /// </summary>
     public bool? DistributedNer { get; set; }
+    /// <summary>
+    /// Directory visible to every process on this machine. Empty disables shared files
+    /// and workers download the PDF. <c>MINIOCR_CLUSTER_SHARED_DIR</c> overrides this.
+    /// </summary>
+    public string? SharedDir { get; set; }
     public List<ClusterWorkerFileConfig>? Workers { get; set; }
 }
 
@@ -193,6 +198,13 @@ public sealed class ClusterNotifyRequest
     /// <summary>Original PDF URL. Workers prefer this over the coordinator copy when it is set.</summary>
     public string? SourceUrl { get; set; }
     /// <summary>
+    /// Absolute path or <c>file://</c> URL of the PDF on a shared directory.
+    /// A worker that cannot see the file downloads the coordinator copy instead.
+    /// </summary>
+    public string? LocalPath { get; set; }
+    /// <summary>Byte length of the PDF. Required to trust <see cref="LocalPath"/>.</summary>
+    public int PdfLength { get; set; }
+    /// <summary>
     /// Download <see cref="SourceUrl"/> into the worker cache only. No session and no page lease.
     /// Sent as soon as the coordinator knows the link, before its own download finishes.
     /// </summary>
@@ -226,6 +238,10 @@ public sealed class ClusterDispatchResponse
     public string? PdfPath { get; set; }
     /// <summary>Original PDF URL when the coordinator still has it. Empty when the job was a local file.</summary>
     public string? SourceUrl { get; set; }
+    /// <summary>Shared-directory path for a same-machine worker. Empty when the job has an http(s) source.</summary>
+    public string? LocalPath { get; set; }
+    /// <summary>Byte length of the PDF. Workers refuse a shared path whose file length differs.</summary>
+    public int PdfLength { get; set; }
 }
 
 public sealed class ClusterJoinRequest
