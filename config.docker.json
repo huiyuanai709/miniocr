@@ -1,0 +1,32 @@
+{
+  "llm": {
+    "thinking": false,
+    "enabled": true,
+    "baseUrl": "https://tianqu.yzw.cn",
+    "apiKey": "",
+    "model": "deepseek-flash",
+    "timeoutSeconds": 120,
+    "pagesPerRequest": 20,
+    "maxCharsPerRequest": 700000,
+    "maxConcurrency": 16,
+    "fallbackToHeuristics": false
+  },
+  "ocr": {
+    "mode": "local",
+    "dpi": 96,
+    "engines": 4,
+    "useCls": false,
+    "autoScaleFromCpu": true,
+    "backend": "vulkan",
+    "vulkanDevice": "0"
+  },
+  "cluster": {
+    "enabled": true,
+    "token": "",
+    "capacity": 0,
+    "joinGraceMs": 500,
+    "pipelineOcr": true,
+    "renderAheadPages": 4,
+    "distributedNer": true
+  }
+}

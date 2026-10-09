@@ -44,3 +44,6 @@ samples/sample-2000.pdf
 samples/sample-50.pdf
 bench-2000.md
 samples/sample-200.pdf
+
+# local docker secrets (see .env.example)
+.env
