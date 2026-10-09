@@ -53,6 +53,23 @@ dotnet publish -c Release -r linux-x64 --self-contained true \
 
 缺原生库时，栅格化会失败。`PublishSingleFile` 与 `PublishAot=true` 不能同时得到真正的单文件；需要单文件时用下面的非 AOT 模式。
 
+### 带 Skia 的 libpdfium
+
+竞赛服务器是 Linux。Chrome 现成的 PDF 接口接不上 Native AOT、现有并行渲染进程池，也给不出 PDFium DPI 的 Gray8：
+
+- `RenderPDFPageToBitmap`（PdfiumEngineExports）是浏览器内部 C++，不是 COM。2015 年 PDF 插件并进主程序之后，不再提供可以 `LoadLibrary` 的稳定 `pdf.dll`。
+- 没有公开的 Chrome COM 页面位图接口。`Windows.Data.Pdf` 是 Windows 自己的 WinRT PDFium，Linux 上没有。
+- Edge WebView2 只有 Windows。`CapturePreview` 截的是查看器，不是指定 DPI 的 Gray8。
+- headless Chrome 的 `Page.captureScreenshot` 是视口 PNG 或 JPEG，带界面，不是 Gray8。`printToPDF` 得到的是另一份 PDF。一个 Chrome 进程是几百 MB，对不上现在的 `PDFtoImage.Parallel` worker。
+
+NuGet 上的 bblanchon.PDFium 也不带 `PDF_USE_SKIA`。要让 `MINIOCR_PDF_RENDERER=skia` 真正切过去，在内存更大的机器上跑子模块里的 `external/PDFtoImage/etc/pdfium-skia/build-linux-x64.sh`。脚本钉在 PDFium `chromium/8066`（和当前包 156.0.8066 同一修订），`pdf_use_skia` 和 `pdf_use_agg` 都打开，产物是一份 `libpdfium.so`。
+
+用它替换发布目录里的 `libpdfium.so`，和 `MiniOcr` 放在一起。不要把这个 `.so` 提交进 git。体积会明显大于现在的大约 7.5MB，因为 Skia 链在里面。单文件非 AOT 会把原生库解压到 `$HOME/.net/MiniOcr/<hash>/`；竞赛用的是 AOT 目录。
+
+然后设 `MINIOCR_PDF_RENDERER=skia`。`/health` 里 `pdfSkiaBuild` 应为 true，`pdfRenderer` 应为 `skia`。并行 worker 是同一个二进制，加载同一份 `.so`，并继承这个环境变量。像素仍然是 `FPDF_RenderPageBitmap` 的 BGRA 或 Gray8。不要把 SkiaSharp 的画布传进去。这还不是 GPU。
+
+这台起草用的机器大约只剩 4GB 内存，链接这一步放不下，所以仓库里是脚本和说明，不是编好的 `.so`。
+
 ```bash
 cd artifacts/linux-x64
 ./MiniOcr --urls http://0.0.0.0:5080
