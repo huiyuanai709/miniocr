@@ -235,7 +235,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 主机上的卡号由 compose 里的 `device_ids` / `NVIDIA_VISIBLE_DEVICES` 决定。容器里只能看到这一张卡，所以每个进程的 `MINIOCR_OCR_VULKAN_DEVICE` 都是 `0`，不要写成 `1`–`7`。
 
-默认镜像基于 Ubuntu 24.04（发布包需要 glibc 2.38 和 `libicu74`），下载已发布的 `v0.0.16` `miniocr-linux-x64`（AVX2）zip，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。密钥只从环境变量进入进程，不写进镜像：
+默认镜像基于 Ubuntu 24.04（发布包需要 glibc 2.38 和 `libicu74`），下载已发布的 `v0.0.17` `miniocr-linux-x64`（AVX2）zip，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。密钥只从环境变量进入进程，不写进镜像：
 
 | 变量 | 作用 |
 | --- | --- |

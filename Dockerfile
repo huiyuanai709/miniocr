@@ -3,7 +3,7 @@
 #   docker compose build --build-arg MINIOCR_ASSET=miniocr-linux-x64-avx512v2.zip
 FROM ubuntu:24.04
 
-ARG MINIOCR_VERSION=v0.0.16
+ARG MINIOCR_VERSION=v0.0.17
 ARG MINIOCR_ASSET=miniocr-linux-x64.zip
 
 ENV DEBIAN_FRONTEND=noninteractive
