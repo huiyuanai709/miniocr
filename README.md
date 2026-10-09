@@ -227,6 +227,49 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 | `external/SimdPaddleOCR` | fork 的 `ProjectReference`，含 ChineseV6Tiny。Apache-2.0 |
 | `external/PDFtoImage` | fork 的 `ProjectReference`（含 `PDFtoImage.Parallel`）。MIT |
 
+## Docker / 8×GPU
+
+一台机器上跑 8 个进程，每个进程绑一张 NVIDIA GPU。需要已安装 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) 的 Linux，以及 Docker Compose v2。
+
+`gpu0` 是协调进程，同时自己也做识别，监听 `5080`。`gpu1`–`gpu7` 是工作进程，端口 `5081`–`5087`。容器之间用服务名互相访问（`http://gpu0:5080` 等）。
+
+主机上的卡号由 compose 里的 `device_ids` / `NVIDIA_VISIBLE_DEVICES` 决定。容器里只能看到这一张卡，所以每个进程的 `MINIOCR_OCR_VULKAN_DEVICE` 都是 `0`，不要写成 `1`–`7`。
+
+默认镜像基于 Ubuntu 24.04（发布包需要 glibc 2.38 和 `libicu74`），下载已发布的 `v0.0.16` `miniocr-linux-x64`（AVX2）zip，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。密钥只从环境变量进入进程，不写进镜像：
+
+| 变量 | 作用 |
+| --- | --- |
+| `MINIOCR_LLM_API_KEY` | 覆盖 `config.docker.json` 里空的 `llm.apiKey` |
+| `MINIOCR_CLUSTER_TOKEN` | 覆盖空的 `cluster.token`。为空时集群保持关闭 |
+
+`llm.timeoutSeconds`、`maxCharsPerRequest`、`fallbackToHeuristics` 没有对应环境变量，写在 `config.docker.json`。OCR 为 Vulkan、4 个引擎、DPI 96、关闭方向分类。识别批大小不设 `MINIOCR_REC_BATCH`，24GB 显卡会保持较大的批。8 个进程各自的 `maxConcurrency` 是 16；出口压力大时用 `MINIOCR_LLM_MAX_CONCURRENCY` 调低。
+
+```bash
+cp .env.example .env
+# 编辑 .env，填入上面两个变量，不要把 .env 提交进仓库
+
+docker compose build
+docker compose up
+```
+
+健康检查：`curl -sS http://127.0.0.1:5080/health`（工作进程把端口换成 `5081`–`5087`）。GPU 预热较慢，compose 的 `start_period` 是 180 秒。
+
+CPU 支持 AVX-512 时可以换包：
+
+```bash
+docker compose build --build-arg MINIOCR_ASSET=miniocr-linux-x64-avx512v2.zip
+```
+
+指令集不匹配时进程会直接退出，改回默认 zip。要用当前仓库源码（含子模块）而不是 Release zip 时：
+
+```bash
+tar -czf - --exclude-vcs --exclude tests --exclude artifacts . \
+  | docker build -f Dockerfile.publish -t miniocr:local -
+docker compose up
+```
+
+`.dockerignore` 排除了 `external/`，所以 `docker compose build` 不会把子模块打进上下文。上面的 `tar` 会带上子模块工作区，并且不使用这份忽略列表。
+
 ## 许可证
 
 示例与本仓库代码以仓库为准。SimdPaddleOCR 及其模型遵循上游 Apache-2.0。PDFtoImage 遵循其 MIT 许可证。

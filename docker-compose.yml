@@ -1,0 +1,244 @@
+# Eight processes, one host GPU each.
+# NVIDIA_VISIBLE_DEVICES hides the other cards, so Vulkan index 0 inside
+# every container is that service's host card. Do not set vulkanDevice to 1–7.
+name: miniocr
+
+x-miniocr: &miniocr
+  image: miniocr:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - path: .env
+      required: true
+  restart: unless-stopped
+  shm_size: 1gb
+  environment: &common
+    MINIOCR_LLM_API_KEY: ${MINIOCR_LLM_API_KEY:?set MINIOCR_LLM_API_KEY in .env}
+    MINIOCR_CLUSTER_TOKEN: ${MINIOCR_CLUSTER_TOKEN:?set MINIOCR_CLUSTER_TOKEN in .env}
+    MINIOCR_OCR_MODE: local
+    MINIOCR_OCR_BACKEND: vulkan
+    MINIOCR_OCR_VULKAN_DEVICE: "0"
+    MINIOCR_ENGINES: "4"
+    MINIOCR_DPI: "96"
+    MINIOCR_USE_CLS: "0"
+    MINIOCR_CLUSTER_ENABLED: "1"
+    MINIOCR_CLUSTER_CAPACITY: "0"
+    MINIOCR_CLUSTER_COORDINATOR_URL: http://gpu0:5080
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+
+services:
+  gpu0:
+    <<: *miniocr
+    ports:
+      - "5080:5080"
+    environment:
+      <<: *common
+      MINIOCR_PORT: "5080"
+      NVIDIA_VISIBLE_DEVICES: "0"
+      MINIOCR_CLUSTER_ROLE: coordinator
+      MINIOCR_CLUSTER_NODE_ID: gpu0
+      MINIOCR_CLUSTER_ADVERTISE_URL: http://gpu0:5080
+      MINIOCR_CLUSTER_WORKERS: http://gpu1:5081,http://gpu2:5082,http://gpu3:5083,http://gpu4:5084,http://gpu5:5085,http://gpu6:5086,http://gpu7:5087
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  gpu1:
+    <<: *miniocr
+    ports:
+      - "5081:5081"
+    depends_on:
+      - gpu0
+    environment:
+      <<: *common
+      MINIOCR_PORT: "5081"
+      NVIDIA_VISIBLE_DEVICES: "1"
+      MINIOCR_CLUSTER_ROLE: worker
+      MINIOCR_CLUSTER_NODE_ID: gpu1
+      MINIOCR_CLUSTER_ADVERTISE_URL: http://gpu1:5081
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  gpu2:
+    <<: *miniocr
+    ports:
+      - "5082:5082"
+    depends_on:
+      - gpu0
+    environment:
+      <<: *common
+      MINIOCR_PORT: "5082"
+      NVIDIA_VISIBLE_DEVICES: "2"
+      MINIOCR_CLUSTER_ROLE: worker
+      MINIOCR_CLUSTER_NODE_ID: gpu2
+      MINIOCR_CLUSTER_ADVERTISE_URL: http://gpu2:5082
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5082/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  gpu3:
+    <<: *miniocr
+    ports:
+      - "5083:5083"
+    depends_on:
+      - gpu0
+    environment:
+      <<: *common
+      MINIOCR_PORT: "5083"
+      NVIDIA_VISIBLE_DEVICES: "3"
+      MINIOCR_CLUSTER_ROLE: worker
+      MINIOCR_CLUSTER_NODE_ID: gpu3
+      MINIOCR_CLUSTER_ADVERTISE_URL: http://gpu3:5083
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5083/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  gpu4:
+    <<: *miniocr
+    ports:
+      - "5084:5084"
+    depends_on:
+      - gpu0
+    environment:
+      <<: *common
+      MINIOCR_PORT: "5084"
+      NVIDIA_VISIBLE_DEVICES: "4"
+      MINIOCR_CLUSTER_ROLE: worker
+      MINIOCR_CLUSTER_NODE_ID: gpu4
+      MINIOCR_CLUSTER_ADVERTISE_URL: http://gpu4:5084
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["4"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5084/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  gpu5:
+    <<: *miniocr
+    ports:
+      - "5085:5085"
+    depends_on:
+      - gpu0
+    environment:
+      <<: *common
+      MINIOCR_PORT: "5085"
+      NVIDIA_VISIBLE_DEVICES: "5"
+      MINIOCR_CLUSTER_ROLE: worker
+      MINIOCR_CLUSTER_NODE_ID: gpu5
+      MINIOCR_CLUSTER_ADVERTISE_URL: http://gpu5:5085
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["5"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5085/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  gpu6:
+    <<: *miniocr
+    ports:
+      - "5086:5086"
+    depends_on:
+      - gpu0
+    environment:
+      <<: *common
+      MINIOCR_PORT: "5086"
+      NVIDIA_VISIBLE_DEVICES: "6"
+      MINIOCR_CLUSTER_ROLE: worker
+      MINIOCR_CLUSTER_NODE_ID: gpu6
+      MINIOCR_CLUSTER_ADVERTISE_URL: http://gpu6:5086
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["6"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5086/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  gpu7:
+    <<: *miniocr
+    ports:
+      - "5087:5087"
+    depends_on:
+      - gpu0
+    environment:
+      <<: *common
+      MINIOCR_PORT: "5087"
+      NVIDIA_VISIBLE_DEVICES: "7"
+      MINIOCR_CLUSTER_ROLE: worker
+      MINIOCR_CLUSTER_NODE_ID: gpu7
+      MINIOCR_CLUSTER_ADVERTISE_URL: http://gpu7:5087
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["7"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5087/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
