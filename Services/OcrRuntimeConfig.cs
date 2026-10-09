@@ -313,7 +313,7 @@ public sealed class OcrRuntimeConfig
     public OcrRuntimeConfig WithRenderMode(string renderMode) =>
         With(renderMode: CanonicalRenderMode(renderMode));
 
-    public OcrRuntimeConfig With(string? mode = null, int? engineCount = null, int? wechatInstances = null, string? renderMode = null) => new()
+    public OcrRuntimeConfig With(string? mode = null, int? engineCount = null, int? wechatInstances = null, string? renderMode = null, int? recBatchLines = null) => new()
     {
         Mode = mode is null ? Mode : CanonicalMode(mode),
         EngineCount = engineCount ?? EngineCount,
@@ -329,7 +329,7 @@ public sealed class OcrRuntimeConfig
         TextLayerMaxUnknownRatio = TextLayerMaxUnknownRatio,
         TextLayerImageCoverage = TextLayerImageCoverage,
         TextLayerImageMinChars = TextLayerImageMinChars,
-        RecBatchLines = RecBatchLines,
+        RecBatchLines = recBatchLines ?? RecBatchLines,
         Backend = Backend,
         RecIntraOpThreads = RecIntraOpThreads,
         VulkanDevice = VulkanDevice,
