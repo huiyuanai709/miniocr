@@ -10,7 +10,7 @@ internal static partial class StageLog
 {
     [LoggerMessage(
         Level = LogLevel.Information,
-        Message = "OCR stages: downloadMs={DownloadMs} rasterizeMs={RasterizeMs} ocrMs={OcrMs} analyzeMs={AnalyzeMs} nerWallMs={NerWallMs} nerRequestMs={NerRequestMs} nerGroups={NerGroups} nerPeak={NerPeak} totalMs={TotalMs} gpuSubmitMs={GpuSubmitMs} gpuWaitMs={GpuWaitMs} cpuPreMs={CpuPreMs} cpuPostMs={CpuPostMs} gpuPages={GpuPages} fallbackPages={FallbackPages} gpuDevice={GpuDevice} initMs={InitMs} fence={Fence}")]
+        Message = "OCR stages: downloadMs={DownloadMs} rasterizeMs={RasterizeMs} ocrMs={OcrMs} analyzeMs={AnalyzeMs} nerWallMs={NerWallMs} nerRequestMs={NerRequestMs} nerGroups={NerGroups} nerPeak={NerPeak} totalMs={TotalMs} gpuSubmitMs={GpuSubmitMs} gpuWaitMs={GpuWaitMs} cpuPreMs={CpuPreMs} cpuPostMs={CpuPostMs} gpuPages={GpuPages} fallbackPages={FallbackPages} deviceLost={DeviceLost} gpuDevice={GpuDevice} initMs={InitMs} fence={Fence}")]
     public static partial void OcrStages(
         ILogger logger,
         double downloadMs,
@@ -28,6 +28,7 @@ internal static partial class StageLog
         double cpuPostMs,
         int gpuPages,
         int fallbackPages,
+        int deviceLost,
         string gpuDevice,
         double initMs,
         string fence);

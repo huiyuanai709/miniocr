@@ -468,7 +468,7 @@ public sealed class ClusterWorkerHost : IHostedService
         finally
         {
             if (renderPdf is not null)
-                _pipeline.ReleaseMappedPdf(renderPdf);
+                await _pipeline.ReleaseMappedPdfAsync(renderPdf).ConfigureAwait(false);
             if (nerTask is not null && !nerTask.IsCompleted)
             {
                 try

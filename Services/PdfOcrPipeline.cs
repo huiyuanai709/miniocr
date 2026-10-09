@@ -68,6 +68,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 throw new InvalidOperationException("ocr.mode=local requires OcrEngine.");
             _pageWindow = Math.Max(4, engine.EngineCount * 2);
         }
+
+        SweepExpiredRenderTemps();
     }
 
     /// <summary>
@@ -161,7 +163,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
         finally
         {
-            ReleaseMappedPdf(pdfBytes);
+            await ReleaseMappedPdfAsync(pdfBytes).ConfigureAwait(false);
         }
     }
 
@@ -1243,6 +1245,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             timings.GpuPages = Volatile.Read(ref job.GpuPages);
             timings.FallbackPages = Volatile.Read(ref job.FallbackPages);
         }
+        timings.DeviceLost = OcrVulkan.DeviceLostCount;
         OcrVulkan.GpuTimingSnapshot snap = OcrVulkan.ReadTimings();
         timings.GpuDevice = !string.IsNullOrEmpty(snap.DeviceName)
             ? snap.DeviceName
@@ -1266,6 +1269,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             timings.CpuPostMs,
             timings.GpuPages,
             timings.FallbackPages,
+            timings.DeviceLost,
             timings.GpuDevice,
             timings.InitMs,
             timings.Fence);
@@ -1743,7 +1747,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     {
         // One temp file per PDF per process. The same ParallelPdfProcessor reopens that
         // path for every batch (ReuseFileStream) and keeps the parsed document
-        // (RetainDocuments). leaveOpen keeps our handle. Do not construct a new processor here.
+        // (RetainDocuments). leaveOpen keeps our handle. Job end calls
+        // ReleaseRetainedFileAsync before deleting the file. Do not construct a new processor here.
         MappedPdf mapped = await RetainMappedAsync(pdfBytes, pdfLength, ct).ConfigureAwait(false);
         // Once per process. Later batches only read the flag; the stamp is taken only when Debug is on.
         bool timeFirstLease = false;
@@ -1926,11 +1931,12 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     /// <summary>
     /// Drop the temp PDF kept for <paramref name="pdf"/>. Called when the job or worker
     /// session that owns this buffer is finished. In-flight batches keep the file until
-    /// they return it.
+    /// they return it. Workers close the retained document before the file is deleted.
     /// </summary>
-    public void ReleaseMappedPdf(byte[] pdf)
+    public async ValueTask ReleaseMappedPdfAsync(byte[] pdf)
     {
-        _mapGate.Wait();
+        List<MappedPdf> closing = [];
+        await _mapGate.WaitAsync().ConfigureAwait(false);
         try
         {
             for (int i = _mapped.Count - 1; i >= 0; i--)
@@ -1940,13 +1946,19 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     continue;
                 mapped.ReleaseRequested = true;
                 if (mapped.Uses == 0)
-                    CloseMapped(mapped);
+                {
+                    _mapped.RemoveAt(i);
+                    closing.Add(mapped);
+                }
             }
         }
         finally
         {
             _mapGate.Release();
         }
+
+        foreach (MappedPdf mapped in closing)
+            await FinishMappedAsync(mapped).ConfigureAwait(false);
     }
 
     private async Task<MappedPdf> RetainMappedAsync(byte[] pdfBytes, int pdfLength, CancellationToken ct)
@@ -1990,7 +2002,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     }
                 }
 
-                TryDeleteTemp(path);
+                DeleteTempOrRetry(path);
                 throw;
             }
 
@@ -2014,27 +2026,31 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
     private async Task EndMappedUseAsync(MappedPdf mapped)
     {
+        MappedPdf? closing = null;
         await _mapGate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (mapped.Uses > 0)
                 mapped.Uses--;
-            if (mapped.Uses == 0 && mapped.ReleaseRequested)
-                CloseMapped(mapped);
+            if (mapped.Uses == 0 && mapped.ReleaseRequested && _mapped.Remove(mapped))
+                closing = mapped;
         }
         finally
         {
             _mapGate.Release();
         }
+
+        if (closing is not null)
+            await FinishMappedAsync(closing).ConfigureAwait(false);
     }
 
-    private void CloseMapped(MappedPdf mapped)
+    private async Task FinishMappedAsync(MappedPdf mapped)
     {
         FileStream? stream = mapped.Stream;
         string path = mapped.Path;
         mapped.Stream = null;
         mapped.Bytes = [];
-        _mapped.Remove(mapped);
+        await ReleaseWorkersAsync(path).ConfigureAwait(false);
         if (stream is not null)
         {
             try
@@ -2043,29 +2059,51 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to close mapped PDF {Path}", path);
+                _logger.LogDebug("Failed to close mapped PDF {Path}: {Reason}", path, ex.Message);
             }
         }
 
-        TryDeleteTemp(path);
+        DeleteTempOrRetry(path);
     }
 
-    private void ReleaseAllMapped()
+    private async Task ReleaseWorkersAsync(string path)
     {
-        _mapGate.Wait();
+        ParallelPdfProcessor? processor;
+        lock (_parallelGate)
+            processor = _parallel;
+        if (processor is null)
+            return;
+
         try
         {
-            for (int i = _mapped.Count - 1; i >= 0; i--)
-            {
-                MappedPdf mapped = _mapped[i];
-                mapped.ReleaseRequested = true;
-                mapped.Uses = 0;
-                CloseMapped(mapped);
-            }
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(15));
+            await processor.ReleaseRetainedFileAsync(path, timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Render workers did not confirm close of {Path}: {Reason}", path, ex.Message);
+        }
+    }
+
+    private async Task ReleaseAllMappedAsync()
+    {
+        List<MappedPdf> closing = [];
+        await _mapGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            closing.AddRange(_mapped);
+            _mapped.Clear();
         }
         finally
         {
             _mapGate.Release();
+        }
+
+        foreach (MappedPdf mapped in closing)
+        {
+            mapped.ReleaseRequested = true;
+            mapped.Uses = 0;
+            await FinishMappedAsync(mapped).ConfigureAwait(false);
         }
     }
 
@@ -2074,7 +2112,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         if (Interlocked.Exchange(ref _parallelDisposed, 1) != 0)
             return;
 
-        ReleaseAllMapped();
+        await ReleaseAllMappedAsync().ConfigureAwait(false);
 
         ParallelPdfProcessor? processor;
         lock (_parallelGate)
@@ -2129,32 +2167,76 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         await output.WriteAsync(pdfBytes.AsMemory(0, pdfLength), ct).ConfigureAwait(false);
     }
 
-    private void TryDeleteTemp(string path)
+    private void DeleteTempOrRetry(string path)
     {
-        for (int attempt = 0; attempt < 5; attempt++)
+        if (TryDeleteTemp(path, out string? reason))
+            return;
+
+        _logger.LogDebug("Temporary PDF still in use {Path}: {Reason}", path, reason);
+        _ = Task.Run(async () =>
         {
-            try
+            int[] delaysMs = [200, 500, 1000, 2000, 5000, 10000];
+            foreach (int delay in delaysMs)
             {
-                File.Delete(path);
-                return;
+                await Task.Delay(delay).ConfigureAwait(false);
+                if (TryDeleteTemp(path, out string? retryReason))
+                    return;
+                _logger.LogDebug("Temporary PDF delete retry failed {Path}: {Reason}", path, retryReason);
             }
-            catch (FileNotFoundException)
+
+            _logger.LogWarning("Failed to delete temporary PDF {Path}", path);
+        });
+    }
+
+    private static bool TryDeleteTemp(string path, out string? reason)
+    {
+        try
+        {
+            File.Delete(path);
+            reason = null;
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            reason = null;
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            reason = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    private void SweepExpiredRenderTemps()
+    {
+        try
+        {
+            DateTime cutoff = DateTime.UtcNow.AddHours(-1);
+            foreach (string path in Directory.EnumerateFiles(Path.GetTempPath(), "miniocr-render-*.pdf"))
             {
-                return;
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(path) > cutoff)
+                        continue;
+                    if (TryDeleteTemp(path, out string? reason))
+                        continue;
+                    _logger.LogDebug("Expired temporary PDF remains {Path}: {Reason}", path, reason);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug("Expired temporary PDF remains {Path}: {Reason}", path, ex.Message);
+                }
             }
-            catch (DirectoryNotFoundException)
-            {
-                return;
-            }
-            catch (IOException) when (attempt < 4)
-            {
-                Thread.Sleep(20 * (attempt + 1));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to delete temporary PDF {Path}", path);
-                return;
-            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Could not scan expired temporary PDFs: {Reason}", ex.Message);
         }
     }
 

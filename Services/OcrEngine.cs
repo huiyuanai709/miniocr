@@ -143,12 +143,28 @@ public sealed class OcrEngine : IAsyncDisposable
                     config = config.With(engineCount: capped);
                 }
                 logger.LogInformation(
-                    "Vulkan device {Name} kind={Kind} index={Index} deviceLocalMb={DeviceLocalMb} bufferCapMb={BufferCapMb}",
+                    "Vulkan device {Name} kind={Kind} index={Index} deviceLocalMb={DeviceLocalMb} bufferCapMb={BufferCapMb} coopGemm={Coop}",
                     gpu.Name,
                     gpu.Kind,
                     gpu.Index,
                     gpu.DeviceLocalBytes / (1024 * 1024),
-                    gpu.BufferByteCap / (1024 * 1024));
+                    gpu.BufferByteCap / (1024 * 1024),
+                    OcrVulkan.CoopGemm);
+                if (Environment.GetEnvironmentVariable("MINIOCR_REC_BATCH") is null)
+                {
+                    int limited = OcrVulkan.LimitRecBatch(config.RecBatchLines, vulkanBytes, OcrVulkan.CoopGemm);
+                    if (limited != config.RecBatchLines)
+                    {
+                        logger.LogWarning(
+                            "Vulkan device {Name} deviceLocalMb={Mb} coopGemm={Coop}; rec batch {From} -> {To}",
+                            gpu.Name,
+                            vulkanBytes / (1024 * 1024),
+                            OcrVulkan.CoopGemm,
+                            config.RecBatchLines,
+                            limited);
+                        config = config.With(recBatchLines: limited);
+                    }
+                }
             }
             else if (config.Backend == "vulkan")
             {
@@ -247,14 +263,15 @@ public sealed class OcrEngine : IAsyncDisposable
             }
             catch (IOException) { }
             logger.LogInformation(
-                "GPU warmup initMs={InitMs:F0} fence={Fence} device={Device} pipelineCache={Cache} restored={Restored} cacheBytes={CacheBytes} gpuRuns={GpuRuns}",
+                "GPU warmup initMs={InitMs:F0} fence={Fence} device={Device} pipelineCache={Cache} restored={Restored} cacheBytes={CacheBytes} gpuRuns={GpuRuns} deviceLost={DeviceLost}",
                 warm.InitMs,
                 warm.FenceWait,
                 string.IsNullOrEmpty(gpuName) ? warm.DeviceName : gpuName,
                 string.IsNullOrEmpty(OcrVulkan.PipelineCachePath) ? "(memory)" : OcrVulkan.PipelineCachePath,
                 OcrVulkan.PipelineCacheRestored,
                 cacheBytes,
-                warm.GpuRuns);
+                warm.GpuRuns,
+                OcrVulkan.DeviceLostCount);
         }
 
         var created = new OcrEngine(engines, config, logger)
