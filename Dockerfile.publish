@@ -1,8 +1,9 @@
-# Optional source build. Needs the git submodules in the build context.
-# The default Dockerfile (release zip) is what docker-compose.yml uses.
-#
+# Same source publish as Dockerfile, for:
 #   docker build -f Dockerfile.publish -t miniocr:local .
 # AVX-512: --build-arg ILC_INSTRUCTION_SET=avx512v2
+#
+# Submodules must be in the build context:
+#   git submodule update --init --recursive
 FROM ubuntu:24.04 AS build
 
 ARG DOTNET_VERSION=11.0.100-rc.1.26425.128
@@ -52,6 +53,8 @@ RUN chmod 755 /opt/miniocr/MiniOcr /opt/miniocr/entrypoint.sh \
     && test -f /opt/miniocr/libSkiaSharp.so \
     && test -f /opt/miniocr/libpdfium.so
 
+# NVIDIA_VISIBLE_DEVICES is set per service. Inside the container the only
+# visible card is Vulkan device 0; do not pass the host index here.
 ENV MINIOCR_CONFIG_PATH=/opt/miniocr/config.docker.json \
     MINIOCR_PORT=5080 \
     HOME=/opt/miniocr \

@@ -237,7 +237,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 主机上的卡号由 compose 里的 `device_ids` / `NVIDIA_VISIBLE_DEVICES` 决定。容器里只能看到这一张卡，所以每个进程的 `MINIOCR_OCR_VULKAN_DEVICE` 都是 `0`，不要写成 `1`–`7`。
 
-默认镜像基于 Ubuntu 24.04（发布包需要 glibc 2.38 和 `libicu74`），下载已发布的 `v0.0.17` `miniocr-linux-x64`（AVX2）zip，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。密钥只从环境变量进入进程，不写进镜像：
+默认镜像基于 Ubuntu 24.04（运行时需要 glibc 2.38 和 `libicu74`）。`Dockerfile` 在构建阶段用仓库源码做 `linux-x64` Native AOT 发布（默认 AVX2），再把产物放进运行镜像，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。构建前要初始化子模块，否则缺少 `external/SimdPaddleOCR` 和 `external/PDFtoImage`。密钥只从环境变量进入进程，不写进镜像：
 
 | 变量 | 作用 |
 | --- | --- |
@@ -249,6 +249,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 上传的 PDF 没有可再次下载的地址时，协调进程把它写到 `MINIOCR_CLUSTER_SHARED_DIR`（compose 里是卷 `miniocr-jobs`，挂到 `/var/lib/miniocr/jobs`）。同机的工作进程直接打开这个文件。路径不存在或长度对不上时，仍向协调进程下载。任务结束后删除该文件；渲染进程先放开对它的映射。别的机器上看不到这个路径，所以还是走下载。
 
 ```bash
+git submodule update --init --recursive
 cp .env.example .env
 # 编辑 .env，填入上面两个变量，不要把 .env 提交进仓库
 
@@ -258,21 +259,17 @@ docker compose up
 
 健康检查：`curl -sS http://127.0.0.1:5080/health`（工作进程把端口换成 `5081`–`5087`）。GPU 预热较慢，compose 的 `start_period` 是 180 秒。
 
-CPU 支持 AVX-512 时可以换包：
+CPU 支持 AVX-512 时在编译期换指令集：
 
 ```bash
-docker compose build --build-arg MINIOCR_ASSET=miniocr-linux-x64-avx512v2.zip
+docker compose build --build-arg ILC_INSTRUCTION_SET=avx512v2
 ```
 
-指令集不匹配时进程会直接退出，改回默认 zip。要用当前仓库源码（含子模块）而不是 Release zip 时：
+指令集不匹配时进程会直接退出，改回默认的 `avx2`。`Dockerfile.publish` 与 `Dockerfile` 是同一套源码发布：
 
 ```bash
-tar -czf - --exclude-vcs --exclude tests --exclude artifacts . \
-  | docker build -f Dockerfile.publish -t miniocr:local -
-docker compose up
+docker build -f Dockerfile.publish -t miniocr:local .
 ```
-
-`.dockerignore` 排除了 `external/`，所以 `docker compose build` 不会把子模块打进上下文。上面的 `tar` 会带上子模块工作区，并且不使用这份忽略列表。
 
 ## 许可证
 
