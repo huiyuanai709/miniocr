@@ -872,7 +872,7 @@ app.MapGet("/", () => Results.Text(
     "POST /ocr        debug sync OCR (competition shapes; response = callback body)\n" +
     "  {\"teamId\":0,\"key\":\"debug\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
     "  or legacy {\"url\":\"https://.../file.pdf\"} or {\"path\":\"C:\\\\...\\\\file.pdf\"} / ?dpi=96\n" +
-    "  ?verbose=1 (or ?text=1) returns per-page text and ms/page instead of the callback shape\n" +
+    "  ?verbose=1 (or ?text=1) returns text, ms/page, and ruleList for pages that have rules\n" +
     "POST /ocr/upload multipart file field, or form field path= (local PDF, Unicode paths ok)\n" +
     "GET  /health\n" +
     "CLI  MiniOcr --compare <pdf> [--pages N] [--dpi N]   wechat vs local → wechat-vs-local.txt\n" +

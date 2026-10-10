@@ -45,7 +45,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Pinned fork master @ 68e30fe (PDFtoImage Gray8 PdfPixels, PrewarmAsync,
+    <!-- Pinned fork master @ b577ca9. Same tree as d47fbc3 (retained PDF close);
+         that tree already includes 68e30fe (Gray8 PdfPixels, PrewarmAsync,
          ShareSourceFile/RetainDocuments/NativeGrayscale, net11.0 runtime-async).
          Native PDFium / SkiaSharp assets flow as runtime assets of the core project
          (runtimes/<rid>/native); .NET copies them on publish the same way a
@@ -53,9 +54,9 @@
          executable as a worker (CoreCLR startup hook, Native AOT module initializer). -->
     <ProjectReference Include="external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
     <ProjectReference Include="external/PDFtoImage/src/Parallel/Parallel.csproj" />
-    <!-- Pinned fork branch cursor/metal-ocr-backend-08b9 @ f574915 (merged Vulkan
-         arena cap, plus Metal working-set cap and AOT-preserved .metal shaders).
-         ChineseV6Small models come from the same tree. Default backend stays CPU. -->
+    <!-- Pinned fork main @ bf6bfcc (upstream sdcb/SimdPaddleOCR main, plus the
+         medium-model GPU Transpose FAQ). ChineseV6Small models come from the same
+         tree. Default backend stays CPU. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
     <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Small/Sdcb.SimdPaddleOCR.Models.ChineseV6Small.csproj" />
   </ItemGroup>
