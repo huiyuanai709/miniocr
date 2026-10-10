@@ -77,7 +77,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     /// in-process fallback still receive bitmaps.
     /// </summary>
     private bool UseNativeGrayPixels =>
-        _engine is not null && _config.IsParallelRender && !_config.IsLlmMode && !_config.IsWeChatMode;
+        _engine is not null && _config.IsParallelRender && !_config.IsLlmMode && !_config.IsWeChatMode
+        && !_config.RemoveRedSeal;
 
     public Task<OcrResponse> ProcessAsync(
         RentedBuffer pdf,
@@ -1219,8 +1220,22 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         return visible;
     }
 
-    private static RenderOptions CreateRenderOptions(int dpi) =>
-        PdfParallelOptions.CreateRenderOptions(dpi);
+    private RenderOptions CreateRenderOptions(int dpi) =>
+        PdfParallelOptions.CreateRenderOptions(dpi, _config.RemoveRedSeal);
+
+    /// <summary>
+    /// After raster, before the page is queued for detection (and for vision JPEG).
+    /// Gray8 pages have no red channel and are left unchanged.
+    /// </summary>
+    private void SuppressRedSeal(PageImage image)
+    {
+        if (!_config.RemoveRedSeal)
+            return;
+        // Parallel Gray8 arrives as read-only pixels. That path is off while this switch is on.
+        if (image.Pixels is not null)
+            return;
+        RedSealFilter.Apply(image.RequireBitmap());
+    }
 
     private static OcrTimings MakeTimings(
         double downloadMs,
@@ -1796,6 +1811,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 int pageIndex = pageIndices[idx++];
                 try
                 {
+                    SuppressRedSeal(image);
                     await writer.WriteAsync((pageIndex, image, sw.Elapsed.TotalMilliseconds), ct)
                         .ConfigureAwait(false);
                     written.Add(pageIndex);
@@ -1890,6 +1906,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         PageImage image = PageImage.FromBitmap(bitmap);
                         try
                         {
+                            SuppressRedSeal(image);
                             await writer.WriteAsync((pageIndex, image, sw.Elapsed.TotalMilliseconds), ct)
                                 .ConfigureAwait(false);
                         }

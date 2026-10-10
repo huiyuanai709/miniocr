@@ -418,6 +418,7 @@ public static class AppConfigStore
             "renderProcesses": null,
             "textLayer": "auto",
             "useCls": false,
+            "removeRedSeal": true,
             "backend": "cpu",
             "vulkanDevice": "",
             "recIntraOpThreads": 1,

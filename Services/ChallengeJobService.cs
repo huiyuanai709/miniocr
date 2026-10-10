@@ -200,7 +200,7 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
             try
             {
                 byte[] json = JsonSerializer.SerializeToUtf8Bytes(
-                    body, AppJsonContext.Default.ChallengeCallbackBody);
+                    body, AppJsonContext.Relaxed.ChallengeCallbackBody);
                 using ByteArrayContent content = new(json);
                 content.Headers.ContentType = new MediaTypeHeaderValue("application/json")
                 {

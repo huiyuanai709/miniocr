@@ -117,6 +117,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
     "textLayer": "auto",
     "renderProcesses": null,
     "useCls": false,
+    "removeRedSeal": true,
     "backend": "cpu",
     "vulkanDevice": "",
     "recIntraOpThreads": 1,
@@ -148,6 +149,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_REC_BATCH` | — | 8 | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | — | 960 | 检测边长上限 |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | false | 方向分类 |
+| `MINIOCR_REMOVE_RED_SEAL` | `ocr.removeRedSeal` | true | 彩色页在检测前去掉高饱和红章，换成页角纸色或白。灰度页跳过。`0` / `false` / `off` 关闭，并回到 Gray8 渲染 |
 | `MINIOCR_OCR_BACKEND` | `ocr.backend` | `cpu` | `cpu` / `auto` / `vulkan` / `metal`。`metal` 仅 macOS |
 | `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空 | 设备序号或名称子串 |
 | `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 按核数 | 进程内栅格线程。`parallel` 时用于回退 |

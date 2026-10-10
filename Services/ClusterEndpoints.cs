@@ -16,7 +16,7 @@ public static partial class ClusterEndpoints
         {
             if (!Authorize(http, cfg, out IResult? deny))
                 return deny!;
-            return Results.Json(worker.Info(), AppJsonContext.Default.ClusterInfoResponse);
+            return Results.Json(worker.Info(), AppJsonContext.Relaxed.ClusterInfoResponse);
         });
 
         app.MapPost("/cluster/register", async Task<IResult> (
@@ -33,7 +33,7 @@ public static partial class ClusterEndpoints
             ClusterRegisterRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterRegisterRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterRegisterRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -63,7 +63,7 @@ public static partial class ClusterEndpoints
                     Model = coordinator.BuildHealth().Model,
                     Dpi = coordinator.BuildHealth().Dpi,
                 },
-                AppJsonContext.Default.ClusterRegisterResponse);
+                AppJsonContext.Relaxed.ClusterRegisterResponse);
         });
 
         app.MapPost("/cluster/heartbeat", async Task<IResult> (
@@ -79,7 +79,7 @@ public static partial class ClusterEndpoints
             ClusterHeartbeatRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterHeartbeatRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterHeartbeatRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -106,7 +106,7 @@ public static partial class ClusterEndpoints
             ClusterDispatchRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterDispatchRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterDispatchRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -120,7 +120,7 @@ public static partial class ClusterEndpoints
                 body.Capacity,
                 body.ActiveJobs,
                 body.ActiveSessions);
-            return Results.Json(response, AppJsonContext.Default.ClusterDispatchResponse);
+            return Results.Json(response, AppJsonContext.Relaxed.ClusterDispatchResponse);
         });
 
         app.MapPost("/cluster/notify", async Task<IResult> (
@@ -134,7 +134,7 @@ public static partial class ClusterEndpoints
             ClusterNotifyRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterNotifyRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterNotifyRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -205,7 +205,7 @@ public static partial class ClusterEndpoints
             ClusterJoinRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterJoinRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterJoinRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -234,7 +234,7 @@ public static partial class ClusterEndpoints
             ClusterClaimRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterClaimRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterClaimRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -245,7 +245,7 @@ public static partial class ClusterEndpoints
             if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
                 return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
             ClusterClaimResponse claim = coordinator.Claim(job!, body.NodeId.Trim(), body.MaxPages);
-            return Results.Json(claim, AppJsonContext.Default.ClusterClaimResponse);
+            return Results.Json(claim, AppJsonContext.Relaxed.ClusterClaimResponse);
         });
 
         app.MapPost("/cluster/jobs/{jobId}/result", async Task<IResult> (
@@ -262,7 +262,7 @@ public static partial class ClusterEndpoints
             ClusterResultRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterResultRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterResultRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -275,7 +275,7 @@ public static partial class ClusterEndpoints
             int accepted = coordinator.AcceptResults(job!, body.BatchId, body.Pages);
             return Results.Json(
                 new ClusterAck { Ok = true, Accepted = accepted },
-                AppJsonContext.Default.ClusterAck);
+                AppJsonContext.Relaxed.ClusterAck);
         });
 
         app.MapPost("/cluster/jobs/{jobId}/fail", async Task<IResult> (
@@ -292,7 +292,7 @@ public static partial class ClusterEndpoints
             ClusterFailRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterFailRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterFailRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -320,7 +320,7 @@ public static partial class ClusterEndpoints
             ClusterNerClaimRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterNerClaimRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterNerClaimRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -337,7 +337,7 @@ public static partial class ClusterEndpoints
                 body.NerConcurrency,
                 body.WaitMs,
                 ct).ConfigureAwait(false);
-            return Results.Json(claim, AppJsonContext.Default.ClusterNerClaimResponse);
+            return Results.Json(claim, AppJsonContext.Relaxed.ClusterNerClaimResponse);
         });
 
         app.MapPost("/cluster/jobs/{jobId}/ner/result", async Task<IResult> (
@@ -354,7 +354,7 @@ public static partial class ClusterEndpoints
             ClusterNerResultRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterNerResultRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterNerResultRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -367,7 +367,7 @@ public static partial class ClusterEndpoints
             int accepted = coordinator.AcceptNer(job!, body);
             return Results.Json(
                 new ClusterAck { Ok = true, Accepted = accepted },
-                AppJsonContext.Default.ClusterAck);
+                AppJsonContext.Relaxed.ClusterAck);
         });
 
         app.MapPost("/cluster/jobs/{jobId}/ner/fail", async Task<IResult> (
@@ -384,7 +384,7 @@ public static partial class ClusterEndpoints
             ClusterFailRequest? body;
             try
             {
-                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterFailRequest, ct)
+                body = await http.ReadFromJsonAsync(AppJsonContext.Relaxed.ClusterFailRequest, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -409,7 +409,7 @@ public static partial class ClusterEndpoints
 
         deny = Results.Json(
             new ClusterAck { Ok = false, Error = "Unauthorized." },
-            AppJsonContext.Default.ClusterAck,
+            AppJsonContext.Relaxed.ClusterAck,
             statusCode: StatusCodes.Status401Unauthorized);
         return false;
     }
@@ -448,7 +448,7 @@ public static partial class ClusterEndpoints
     private static IResult Ack(int status, string? error) =>
         Results.Json(
             new ClusterAck { Ok = status is >= 200 and < 300, Error = error },
-            AppJsonContext.Default.ClusterAck,
+            AppJsonContext.Relaxed.ClusterAck,
             statusCode: status);
 
     /// <summary>

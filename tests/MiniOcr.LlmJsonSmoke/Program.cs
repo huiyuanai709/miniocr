@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using MiniOcr;
 using MiniOcr.Models;
 using MiniOcr.Services;
+using SkiaSharp;
 
 int failed = 0;
 
@@ -38,6 +39,73 @@ string wire = JsonSerializer.Serialize(request, AppJsonContext.Default.ChatCompl
 Assert(wire.Contains("\"response_format\"", StringComparison.Ordinal), "wire field is response_format");
 Assert(wire.Contains("\"json_object\"", StringComparison.Ordinal), "wire type is json_object");
 Assert(!wire.Contains("responseFormat", StringComparison.Ordinal), "camelCase name is not sent");
+
+ChallengeCallbackBody callback = new()
+{
+    TeamId = 7,
+    Key = "k",
+    Result =
+    [
+        new ChallengeFileResult
+        {
+            FileId = "f1",
+            Pages =
+            [
+                new ChallengePageResult
+                {
+                    Page = 1,
+                    RuleList =
+                    [
+                        new ChallengeRule
+                        {
+                            RuleCode = "B06",
+                            RuleName = "公司名称",
+                            RuleItemList =
+                            [
+                                new ChallengeRuleItem
+                                {
+                                    CompanyName = "北京华腾科技有限公司",
+                                    Count = 1,
+                                    OriginText = ["甲方：北京华腾科技有限公司"],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+};
+string callbackJson = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+    callback, AppJsonContext.Relaxed.ChallengeCallbackBody));
+Assert(callbackJson.Contains("北京华腾科技有限公司", StringComparison.Ordinal), "callback writes Chinese as UTF-8");
+Assert(callbackJson.Contains("公司名称", StringComparison.Ordinal), "callback rule name stays UTF-8");
+Assert(callbackJson.Contains("\"ruleName\":\"公司名称\"", StringComparison.Ordinal), "callback keeps camelCase ruleName");
+Assert(callbackJson.Contains("\"companyName\":\"北京华腾科技有限公司\"", StringComparison.Ordinal), "callback keeps camelCase companyName");
+Assert(!callbackJson.Contains("\\u", StringComparison.Ordinal), "callback does not use \\u escapes");
+string defaultJson = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+    callback, AppJsonContext.Default.ChallengeCallbackBody));
+Assert(defaultJson.Contains("\\u", StringComparison.Ordinal), "default context still escapes non-ASCII");
+
+JsonSerializerOptions httpOptions = new()
+{
+    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    TypeInfoResolver = AppJsonContext.Relaxed,
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+};
+string httpJson = JsonSerializer.Serialize(new ChallengeAckResponse { Ok = false, Error = "文件不存在" }, httpOptions);
+Assert(httpJson.Contains("文件不存在", StringComparison.Ordinal), "HTTP JSON options keep Chinese as UTF-8");
+Assert(!httpJson.Contains("\\u", StringComparison.Ordinal), "HTTP JSON options do not use \\u escapes");
+
+Microsoft.AspNetCore.Http.Json.JsonOptions aspNet = new();
+aspNet.SerializerOptions.Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping;
+aspNet.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Relaxed);
+string aspNetJson = JsonSerializer.Serialize(
+    new ChallengeAckResponse { Ok = false, Error = "文件不存在" }, aspNet.SerializerOptions);
+Assert(aspNetJson.Contains("文件不存在", StringComparison.Ordinal), "ASP.NET JsonOptions keep Chinese as UTF-8");
+Assert(!aspNetJson.Contains("\\u", StringComparison.Ordinal), "ASP.NET JsonOptions do not use \\u escapes");
+Assert(aspNetJson.Contains("\"ok\":", StringComparison.Ordinal), "ASP.NET JsonOptions keep camelCase");
 
 Assert(LlmJson.IsFormatRejected(400, "{\"error\":\"unsupported response_format\"}"), "400 mentioning response_format is a rejection");
 Assert(!LlmJson.IsFormatRejected(500, "response_format"), "non-400 is not a format rejection");
@@ -103,6 +171,22 @@ Assert(joined.Contains("甲方北京华", StringComparison.Ordinal) && joined.Co
     "page 1, arriving second, still sees page 2's head");
 await outOfOrder.CompleteAsync();
 Assert(ordered.Count == 2, "both pages are sent once, including the page that arrived early");
+
+AppConfigFile? redOff = JsonSerializer.Deserialize(
+    """{"ocr":{"removeRedSeal":false}}""", AppJsonContext.Default.AppConfigFile);
+Assert(redOff?.Ocr?.RemoveRedSeal == false, "config json removeRedSeal false");
+AppConfigFile? redOmitted = JsonSerializer.Deserialize(
+    """{"ocr":{"mode":"local"}}""", AppJsonContext.Default.AppConfigFile);
+Assert(redOmitted?.Ocr?.RemoveRedSeal == true, "omitted removeRedSeal stays true");
+
+using SKBitmap grayPage = new(4, 4, SKColorType.Gray8, SKAlphaType.Opaque);
+Assert(RedSealFilter.Apply(grayPage) == 0, "Gray8 pages skip red-seal removal");
+using SKBitmap colorPage = new(8, 8, SKColorType.Bgra8888, SKAlphaType.Premul);
+colorPage.Erase(new SKColor(234, 232, 230));
+colorPage.SetPixel(4, 4, new SKColor(220, 40, 30, 255));
+Assert(RedSealFilter.Apply(colorPage) >= 1, "BGRA red seal pixel is replaced before detection");
+SKColor kept = colorPage.GetPixel(4, 4);
+Assert(kept.Red == 234 && kept.Green == 232 && kept.Blue == 230, "BGRA red becomes the page paper color");
 
 if (failed > 0)
 {

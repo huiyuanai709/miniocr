@@ -159,6 +159,8 @@ public sealed class HealthResponse
     public int DetIntraOpThreads { get; set; }
     public int DefaultDpi { get; set; }
     public bool UseDirectionClassification { get; set; }
+    /// <summary>When true, high-saturation red is removed from color pages before detection.</summary>
+    public bool RemoveRedSeal { get; set; } = true;
     public int RasterWorkerCount { get; set; }
     /// <summary><c>parallel</c> (default) or <c>inprocess</c>.</summary>
     public string RenderMode { get; set; } = "parallel";
