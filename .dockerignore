@@ -2,11 +2,9 @@
 **/.git
 .github
 artifacts
-external
 tests
 **/bin
 **/obj
 **/*.user
 .env
 *.md
-samples/*.pdf
