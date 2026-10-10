@@ -164,6 +164,12 @@ public sealed class HealthResponse
     public string RenderMode { get; set; } = "parallel";
     /// <summary>PDFtoImage.Parallel worker processes. Unused while <see cref="RenderMode"/> is <c>inprocess</c>.</summary>
     public int RenderProcessCount { get; set; }
+    /// <summary>PDFium renderer that initialized this process: <c>agg</c> or <c>skia</c>. Skia is a CPU bitmap path.</summary>
+    public string PdfRenderer { get; set; } = "agg";
+    /// <summary>Requested renderer before fallback. <c>agg</c> or <c>skia</c>.</summary>
+    public string PdfRendererRequested { get; set; } = "agg";
+    /// <summary>True when the loaded pdfium exports <c>FPDF_RenderPageSkia</c>.</summary>
+    public bool PdfSkiaBuild { get; set; }
     /// <summary><c>auto</c>, <c>off</c>, or <c>force</c>.</summary>
     public string TextLayer { get; set; } = "auto";
     public int RecBatchLines { get; set; }

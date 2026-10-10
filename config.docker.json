@@ -18,7 +18,8 @@
     "useCls": false,
     "autoScaleFromCpu": true,
     "backend": "vulkan",
-    "vulkanDevice": "0"
+    "vulkanDevice": "0",
+    "pdfRenderer": "agg"
   },
   "cluster": {
     "enabled": true,

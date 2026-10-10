@@ -230,6 +230,7 @@ string? prevInstances = Environment.GetEnvironmentVariable("MINIOCR_WECHAT_INSTA
 string? prevRenderMode = Environment.GetEnvironmentVariable("MINIOCR_RENDER_MODE");
 string? prevRenderProcesses = Environment.GetEnvironmentVariable("MINIOCR_RENDER_PROCESSES");
 string? prevTextLayer = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
+string? prevPdfRenderer = Environment.GetEnvironmentVariable("MINIOCR_PDF_RENDERER");
 try
 {
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "wechat");
@@ -380,6 +381,21 @@ try
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", "80");
     AssertEqual("80", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).TextLayerMinChars.ToString(), "env min chars");
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
+
+    Environment.SetEnvironmentVariable("MINIOCR_PDF_RENDERER", null);
+    AssertEqual("agg", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).PdfRenderer, "default pdf renderer is agg");
+    AssertEqual("skia", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { PdfRenderer = "skia" },
+    }).PdfRenderer, "file pdf renderer skia");
+    AssertEqual("agg", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { PdfRenderer = "gpu" },
+    }).PdfRenderer, "unknown pdf renderer stays agg");
+    Environment.SetEnvironmentVariable("MINIOCR_PDF_RENDERER", "SKIA");
+    AssertEqual("skia", OcrRuntimeConfig.ResolvePdfRenderer("agg"), "env pdf renderer overrides file");
+    AssertEqual("skia", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).With().PdfRenderer, "With copies pdf renderer");
+    Environment.SetEnvironmentVariable("MINIOCR_PDF_RENDERER", null);
 }
 finally
 {
@@ -390,6 +406,7 @@ finally
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", prevRenderProcesses);
     Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", prevTextLayer);
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
+    Environment.SetEnvironmentVariable("MINIOCR_PDF_RENDERER", prevPdfRenderer);
 }
 
 Console.WriteLine("=== non-ASCII PDF path ===");

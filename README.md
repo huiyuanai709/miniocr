@@ -53,6 +53,25 @@ dotnet publish -c Release -r linux-x64 --self-contained true \
 
 缺原生库时，栅格化会失败。`PublishSingleFile` 与 `PublishAot=true` 不能同时得到真正的单文件；需要单文件时用下面的非 AOT 模式。
 
+### 带 Skia 的 libpdfium
+
+竞赛服务器是 Linux。Chrome 现成的 PDF 接口接不上 Native AOT、现有并行渲染进程池，也给不出 PDFium DPI 的 Gray8：
+
+- `RenderPDFPageToBitmap`（PdfiumEngineExports）是浏览器内部 C++，不是 COM。2015 年 PDF 插件并进主程序之后，不再提供可以 `LoadLibrary` 的稳定 `pdf.dll`。
+- 没有公开的 Chrome COM 页面位图接口。`Windows.Data.Pdf` 是 Windows 自己的 WinRT PDFium，Linux 上没有。
+- Edge WebView2 只有 Windows。`CapturePreview` 截的是查看器，不是指定 DPI 的 Gray8。
+- headless Chrome 的 `Page.captureScreenshot` 是视口 PNG 或 JPEG，带界面，不是 Gray8。`printToPDF` 得到的是另一份 PDF。一个 Chrome 进程是几百 MB，对不上现在的 `PDFtoImage.Parallel` worker。
+
+NuGet 上的 bblanchon.PDFium 也不带 `PDF_USE_SKIA`。要让 `MINIOCR_PDF_RENDERER=skia` 真正切过去，用 PDFtoImage 草稿里的 Actions 产物，或在内存更大的机器上跑子模块里的 `external/PDFtoImage/etc/pdfium-skia/build-linux-x64.sh`。两边都钉在 PDFium `chromium/8066`（和当前包 156.0.8066 同一修订），`pdf_use_skia` 和 `pdf_use_agg` 都打开，产物是一份 `libpdfium.so`。
+
+公开仓库的 `ubuntu-24.04`（4 核、16GB）可以编这份库。workflow 是 `PDFium Skia linux-x64`，只在 `etc/pdfium-skia` 或该 workflow 改动时跟着 PR 跑，也可以在文件进入默认分支后手动跑。产物名 `libpdfium-skia-linux-x64`，保留 14 天。手动跑时打开 `publish_release` 会挂到预发布标签 `pdfium-skia-linux-x64-chromium-8066`。Actions 页面的「Run workflow」要等 workflow 在默认分支上才出现。私有仓库的 `ubuntu-latest` 只有 2 核、8GB、大约 14GB 空闲磁盘，不够。更大的 GitHub runner 按分钟计费（8 核约 $0.022/分钟），而且要 Team 或 Enterprise。预计 45–120 分钟，公共标准 runner 不另收费。
+
+用它替换发布目录里的 `libpdfium.so`，和 `MiniOcr` 放在一起。不要把这个 `.so` 提交进 git。体积会明显大于现在的大约 7.5MB，因为 Skia 链在里面。单文件非 AOT 会把原生库解压到 `$HOME/.net/MiniOcr/<hash>/`；竞赛用的是 AOT 目录。
+
+然后设 `MINIOCR_PDF_RENDERER=skia`。`/health` 里 `pdfSkiaBuild` 应为 true，`pdfRenderer` 应为 `skia`。并行 worker 是同一个二进制，加载同一份 `.so`，并继承这个环境变量。像素仍然是 `FPDF_RenderPageBitmap` 的 BGRA 或 Gray8。不要把 SkiaSharp 的画布传进去。这还不是 GPU。
+
+这台起草用的机器大约只剩 4GB 内存，链接这一步放不下，所以仓库里是脚本和说明，不是编好的 `.so`。
+
 ```bash
 cd artifacts/linux-x64
 ./MiniOcr --urls http://0.0.0.0:5080
@@ -116,6 +135,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
     "renderMode": "parallel",
     "textLayer": "auto",
     "renderProcesses": null,
+    "pdfRenderer": "agg",
     "useCls": false,
     "backend": "cpu",
     "vulkanDevice": "",
@@ -153,6 +173,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 按核数 | 进程内栅格线程。`parallel` 时用于回退 |
 | `MINIOCR_RENDER_MODE` | `ocr.renderMode` | `parallel` | `parallel` 或 `inprocess` |
 | `MINIOCR_RENDER_PROCESSES` | `ocr.renderProcesses` | 1–4 | 并行渲染进程数 |
+| `MINIOCR_PDF_RENDERER` | `ocr.pdfRenderer` | `agg` | 实验：`skia` 让 PDFium 用 Skia 填同一块 CPU 位图（BGRA / Gray8）。当前发布包的 pdfium 没有 `FPDF_RenderPageSkia`，会留在 AGG。不是 GPU 渲染。进程内和并行渲染进程都读这个值，启动后不能再换 |
 | `MINIOCR_OCR_TEXT_LAYER` | `ocr.textLayer` | `auto` | `auto` / `off` / `force`。有可用文本层时跳过识别 |
 | `MINIOCR_TEXT_LAYER_MIN_CHARS` | `ocr.textLayerMinChars` | 40 | 文本层最短非空白字符 |
 | `MINIOCR_TEXT_LAYER_MAX_UNKNOWN_RATIO` | `ocr.textLayerMaxUnknownRatio` | 0.02 | 未知字符比例上限 |
