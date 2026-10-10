@@ -180,16 +180,16 @@ Console.WriteLine(
 OcrEngine? engine = null;
 if (llmOcrMode)
 {
-    Console.WriteLine("Skipping ChineseV6Tiny / PaddleOcrAll — ocr.mode=llm (vision OCR).");
+    Console.WriteLine("Skipping ChineseV6Small / PaddleOcrAll — ocr.mode=llm (vision OCR).");
 }
 else if (runtimeConfig.IsWeChatMode)
 {
     Console.WriteLine(
-        $"Skipping ChineseV6Tiny / PaddleOcrAll — ocr.mode=wechat ({wechatEngine?.KindName}, instances={wechatEngine?.InstanceCount ?? 0}).");
+        $"Skipping ChineseV6Small / PaddleOcrAll — ocr.mode=wechat ({wechatEngine?.KindName}, instances={wechatEngine?.InstanceCount ?? 0}).");
 }
 else
 {
-    Console.WriteLine("Loading ChineseV6Tiny OCR models...");
+    Console.WriteLine("Loading ChineseV6Small OCR models...");
     engine = await OcrEngine.CreateAsync(
         bootstrapLogs.CreateLogger<OcrEngine>(),
         runtimeConfig);

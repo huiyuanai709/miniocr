@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using Sdcb.SimdPaddleOCR;
 using Sdcb.SimdPaddleOCR.ModelProvider;
-using Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny;
+using Sdcb.SimdPaddleOCR.Models.ChineseV6Small;
 
 namespace MiniOcr.Services;
 
@@ -204,7 +204,7 @@ public sealed class OcrEngine : IAsyncDisposable
             },
         };
 
-        PaddleOcrModelBundle bundle = ChineseV6TinyModels.Default;
+        PaddleOcrModelBundle bundle = ChineseV6SmallModels.Default;
         if (!config.UseDirectionClassification)
         {
             // Skip loading CLS weights entirely — saves RAM × engine count and avoids CLS compute.
@@ -218,7 +218,7 @@ public sealed class OcrEngine : IAsyncDisposable
         }
 
         logger.LogInformation(
-            "Loading ChineseV6Tiny × {Engines} (backend={Backend}, effective={Effective}, LineWorkerCount={LineWorkers}, DetIntraOpThreads={DetThreads}, RecIntraOpThreads={RecIntra}, RecBatchLines={RecBatch}, UseCls={UseCls}, DpiDefault={Dpi})",
+            "Loading ChineseV6Small × {Engines} (backend={Backend}, effective={Effective}, LineWorkerCount={LineWorkers}, DetIntraOpThreads={DetThreads}, RecIntraOpThreads={RecIntra}, RecBatchLines={RecBatch}, UseCls={UseCls}, DpiDefault={Dpi})",
             pageWorkers,
             config.Backend,
             effective,

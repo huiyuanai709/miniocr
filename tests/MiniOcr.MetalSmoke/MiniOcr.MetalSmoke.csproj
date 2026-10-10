@@ -14,10 +14,10 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
-    <ProjectReference Include="../../external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny.csproj" />
+    <ProjectReference Include="../../external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Small/Sdcb.SimdPaddleOCR.Models.ChineseV6Small.csproj" />
     <ProjectReference Include="../../external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR" />
-    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny" />
+    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Small" />
     <TrimmerRootAssembly Include="PDFtoImage" />
     <TrimmerRootAssembly Include="SkiaSharp" />
   </ItemGroup>

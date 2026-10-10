@@ -2,7 +2,7 @@ using System.Runtime.InteropServices;
 using PDFtoImage;
 using Sdcb.SimdPaddleOCR;
 using Sdcb.SimdPaddleOCR.ModelProvider;
-using Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny;
+using Sdcb.SimdPaddleOCR.Models.ChineseV6Small;
 using SkiaSharp;
 
 // Native AOT smoke for ocr.backend=metal. Prints CPU vs Metal line diffs.
@@ -37,7 +37,7 @@ using SKBitmap bitmap = Conversion.ToImage(pdf, page: 0, options: new RenderOpti
 (byte[] pixels, int width, int height, int stride, ImagePixelFormat format) = CopyPixels(bitmap);
 Console.WriteLine($"page {width}x{height} stride={stride} format={format}");
 
-PaddleOcrModelBundle bundle = ChineseV6TinyModels.Default;
+PaddleOcrModelBundle bundle = ChineseV6SmallModels.Default;
 bundle = new PaddleOcrModelBundle(
     bundle.Name + "-nocls",
     bundle.LanguageCode,
