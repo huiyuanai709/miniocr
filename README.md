@@ -202,7 +202,7 @@ curl -sS -X POST http://127.0.0.1:5080/ocr/upload \
 
 ## SIMD 档位（x64 Native AOT）
 
-指令集在编译期写入二进制。默认 `avx2`（Haswell 及以后）。不设档位时会退回 SSE2，识别会变慢。
+指令集在编译期写入二进制。默认 `avx2`（Haswell 及以后）。不设档位时会退回 SSE2，识别会变慢。linux-x64 的两个档位都在 Ubuntu 20.04（glibc 2.31）上编译。
 
 | 包名后缀 | `IlcInstructionSet` | CPU |
 | --- | --- | --- |
@@ -219,6 +219,8 @@ CPU 不满足档位时进程会退出，并提示缺少指令集，此时改用�
 - `miniocr-win-x64-avx512v2` / `miniocr-linux-x64-avx512v2`：AOT，AVX-512
 - `miniocr-osx-arm64` / `miniocr-linux-arm64`：AOT，NEON
 - `miniocr-win-x64-singlefile` / `miniocr-linux-x64-singlefile`：单文件，非 AOT
+
+`miniocr-linux-x64`、`miniocr-linux-x64-avx512v2` 和 `miniocr-linux-x64-singlefile` 在 Ubuntu 20.04 容器里编译，Native AOT 链接 glibc 2.31。GitHub 已移除 `ubuntu-20.04` runner，`ubuntu-latest` 的 glibc 更新，在那上面做的 AOT 二进制会在 Ubuntu 20.04 上报 GLIBC 版本错误。这些 zip 可在 Ubuntu 20.04 以及 glibc 不低于 2.31 的系统上运行。
 
 AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
@@ -237,7 +239,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 主机上的卡号由 compose 里的 `device_ids` / `NVIDIA_VISIBLE_DEVICES` 决定。容器里只能看到这一张卡，所以每个进程的 `MINIOCR_OCR_VULKAN_DEVICE` 都是 `0`，不要写成 `1`–`7`。
 
-默认镜像基于 Ubuntu 24.04（运行时需要 glibc 2.38 和 `libicu74`）。`Dockerfile` 在构建阶段用仓库源码做 `linux-x64` Native AOT 发布，指令集是 AVX-512（`avx512v2`），再把产物放进运行镜像，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。构建前要初始化子模块，否则缺少 `external/SimdPaddleOCR` 和 `external/PDFtoImage`。密钥只从环境变量进入进程，不写进镜像：
+默认镜像基于 Ubuntu 24.04（运行时需要 glibc 2.38 和 `libicu74`）。GitHub Release 里的 linux-x64 zip 另在 Ubuntu 20.04 容器中构建，链接 glibc 2.31。`Dockerfile` 在构建阶段用仓库源码做 `linux-x64` Native AOT 发布，指令集是 AVX-512（`avx512v2`），再把产物放进运行镜像，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。构建前要初始化子模块，否则缺少 `external/SimdPaddleOCR` 和 `external/PDFtoImage`。密钥只从环境变量进入进程，不写进镜像：
 
 | 变量 | 作用 |
 | --- | --- |
