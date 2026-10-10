@@ -1,14 +1,17 @@
-# Optional source build. Needs the git submodules in the build context.
-# The default Dockerfile (release zip) is what docker-compose.yml uses.
-#
+# Same multi-stage Native AOT image as Dockerfile (linux-x64, from this repo).
 #   docker build -f Dockerfile.publish -t miniocr:local .
 # AVX-512: --build-arg ILC_INSTRUCTION_SET=avx512v2
+#
+# The build context must include external/ (git submodule update --init --recursive).
 FROM ubuntu:24.04 AS build
 
 ARG DOTNET_VERSION=11.0.100-rc.1.26425.128
 ARG ILC_INSTRUCTION_SET=avx2
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    DOTNET_ROOT=/usr/share/dotnet
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -19,13 +22,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
     && bash /tmp/dotnet-install.sh --version "${DOTNET_VERSION}" --install-dir /usr/share/dotnet \
-    && ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet
+    && ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet \
+    && rm -f /tmp/dotnet-install.sh
 
 WORKDIR /src
 COPY . .
-RUN dotnet publish MiniOcr.csproj -c Release -r linux-x64 --self-contained true \
-        -p:IlcInstructionSet="${ILC_INSTRUCTION_SET}" \
+# Same publish line as .github/workflows/publish.yml for linux-x64 (avx2 / avx512v2).
+RUN dotnet publish ./MiniOcr.csproj \
+        -c Release \
+        -r linux-x64 \
+        --self-contained true \
         -o /out \
+        -p:IlcInstructionSet="${ILC_INSTRUCTION_SET}" \
     && find /out -type f \( -name '*.dbg' -o -name '*.pdb' \) -delete
 
 FROM ubuntu:24.04
@@ -52,6 +60,8 @@ RUN chmod 755 /opt/miniocr/MiniOcr /opt/miniocr/entrypoint.sh \
     && test -f /opt/miniocr/libSkiaSharp.so \
     && test -f /opt/miniocr/libpdfium.so
 
+# NVIDIA_VISIBLE_DEVICES is set per service. Inside the container the only
+# visible card is Vulkan device 0; do not pass the host index here.
 ENV MINIOCR_CONFIG_PATH=/opt/miniocr/config.docker.json \
     MINIOCR_PORT=5080 \
     HOME=/opt/miniocr \
