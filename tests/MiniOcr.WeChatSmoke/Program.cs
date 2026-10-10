@@ -230,6 +230,7 @@ string? prevInstances = Environment.GetEnvironmentVariable("MINIOCR_WECHAT_INSTA
 string? prevRenderMode = Environment.GetEnvironmentVariable("MINIOCR_RENDER_MODE");
 string? prevRenderProcesses = Environment.GetEnvironmentVariable("MINIOCR_RENDER_PROCESSES");
 string? prevTextLayer = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
+string? prevRemoveRed = Environment.GetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL");
 try
 {
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "wechat");
@@ -380,6 +381,25 @@ try
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", "80");
     AssertEqual("80", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).TextLayerMinChars.ToString(), "env min chars");
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
+
+    Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", null);
+    AssertEqual("True", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RemoveRedSeal.ToString(), "removeRedSeal defaults on");
+    AssertEqual("False", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { RemoveRedSeal = false },
+    }).RemoveRedSeal.ToString(), "file can turn removeRedSeal off");
+    Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", "0");
+    AssertEqual("False", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RemoveRedSeal.ToString(), "env 0 turns removeRedSeal off");
+    Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", "off");
+    AssertEqual("False", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RemoveRedSeal.ToString(), "env off turns removeRedSeal off");
+    Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", "true");
+    OcrRuntimeConfig forcedOn = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { RemoveRedSeal = false },
+    });
+    AssertEqual("True", forcedOn.RemoveRedSeal.ToString(), "env overrides file removeRedSeal");
+    AssertEqual("True", forcedOn.WithMode("llm").RemoveRedSeal.ToString(), "mode copy keeps removeRedSeal");
+    Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", null);
 }
 finally
 {
@@ -390,6 +410,78 @@ finally
     Environment.SetEnvironmentVariable("MINIOCR_RENDER_PROCESSES", prevRenderProcesses);
     Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", prevTextLayer);
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
+    Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", prevRemoveRed);
+}
+
+Console.WriteLine("=== red seal filter ===");
+{
+    const int side = 40;
+    int stride = side * 4;
+    byte[] page = new byte[side * stride];
+    for (int i = 0; i < page.Length; i += 4)
+    {
+        page[i] = 230;
+        page[i + 1] = 232;
+        page[i + 2] = 234;
+        page[i + 3] = 255;
+    }
+
+    // Center band is outside the 16px corner samples, so probes do not tint the paper color.
+    SetPixel(page, stride, 20, 20, 30, 40, 220);
+    SetPixel(page, stride, 18, 20, 0, 0, 0);
+    SetPixel(page, stride, 19, 20, 220, 30, 20);
+    SetPixel(page, stride, 21, 20, 15, 15, 70);
+    SetPixel(page, stride, 22, 20, 20, 140, 220);
+    SetPixel(page, stride, 23, 20, 170, 180, 200);
+    int replaced = RedSealFilter.ApplyBgra(page, side, side, stride);
+    AssertTrue(replaced >= 1, "red seal pixel is replaced");
+    AssertPixel(page, stride, 20, 20, 230, 232, 234, "red pixel becomes the corner paper color");
+    AssertPixel(page, stride, 18, 20, 0, 0, 0, "black text stays");
+    AssertPixel(page, stride, 19, 20, 220, 30, 20, "blue stays");
+    AssertPixel(page, stride, 21, 20, 15, 15, 70, "dark red under a seal stays");
+    AssertPixel(page, stride, 22, 20, 20, 140, 220, "orange stays");
+    AssertPixel(page, stride, 23, 20, 170, 180, 200, "low saturation stays");
+
+    byte[] padded = new byte[12];
+    padded[0] = 30;
+    padded[1] = 40;
+    padded[2] = 220;
+    padded[3] = 255;
+    padded[4] = 0;
+    padded[5] = 0;
+    padded[6] = 0;
+    padded[7] = 255;
+    padded[8] = 0xAB;
+    padded[9] = 0xAB;
+    padded[10] = 0xAB;
+    padded[11] = 0xAB;
+    RedSealFilter.ApplyBgra(padded, 2, 1, 12);
+    AssertPixel(padded, 12, 0, 0, 255, 255, 255, "red falls back to white when the corner is not paper");
+    AssertPixel(padded, 12, 1, 0, 0, 0, 0, "padded row keeps the black pixel");
+    AssertEqual("AB", padded[8].ToString("X2"), "stride padding is not rewritten");
+
+    byte[] faded = new byte[4];
+    faded[0] = 30;
+    faded[1] = 40;
+    faded[2] = 220;
+    faded[3] = 128;
+    AssertEqual("0", RedSealFilter.ApplyBgra(faded, 1, 1, 4).ToString(), "transparent red is left alone");
+    AssertEqual("128", faded[3].ToString(), "alpha is unchanged");
+
+    static void SetPixel(byte[] buf, int rowStride, int x, int y, byte b, byte g, byte r)
+    {
+        int i = (y * rowStride) + (x * 4);
+        buf[i] = b;
+        buf[i + 1] = g;
+        buf[i + 2] = r;
+        buf[i + 3] = 255;
+    }
+
+    void AssertPixel(byte[] buf, int rowStride, int x, int y, byte b, byte g, byte r, string msg)
+    {
+        int i = (y * rowStride) + (x * 4);
+        AssertTrue(buf[i] == b && buf[i + 1] == g && buf[i + 2] == r && buf[i + 3] == 255, msg);
+    }
 }
 
 Console.WriteLine("=== non-ASCII PDF path ===");

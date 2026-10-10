@@ -76,6 +76,12 @@ public sealed class OcrFileConfig
     /// <summary>Non-whitespace characters required on an image-heavy page or a hidden OCR layer. Null = 200.</summary>
     public int? TextLayerImageMinChars { get; set; }
     public bool? UseCls { get; set; }
+    /// <summary>
+    /// Drop high-saturation red seal ink after raster and before detection.
+    /// Default true. Color pages are rendered so the red channel still exists;
+    /// Gray8 pages are skipped. Set false to keep the Gray8 path.
+    /// </summary>
+    public bool RemoveRedSeal { get; set; } = true;
     /// <summary><c>cpu</c> (default), <c>auto</c>, or <c>vulkan</c>. <c>cpu</c> keeps the current text.</summary>
     public string Backend { get; set; } = "cpu";
     /// <summary>Recognizer intra-op threads per engine. Null = 1. <c>0</c> lets the library pick.</summary>
