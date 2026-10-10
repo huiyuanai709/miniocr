@@ -39,7 +39,8 @@ builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(optio
 
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
-    options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default);
+    options.SerializerOptions.Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping;
+    options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Relaxed);
 });
 
 builder.Services.AddHttpClient<ParallelPdfDownloader>(client =>
@@ -441,7 +442,7 @@ app.MapGet("/health", (IServiceProvider sp) =>
             LlmApiKey = apiKeyStatus,
             Cluster = BuildClusterHealth(sp),
         },
-        AppJsonContext.Default.HealthResponse);
+        AppJsonContext.Relaxed.HealthResponse);
 });
 
 async Task<IResult> HandleChallengeAsync(
@@ -452,7 +453,7 @@ async Task<IResult> HandleChallengeAsync(
     ChallengeRequest? body;
     try
     {
-        body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Default.ChallengeRequest, ct)
+        body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Relaxed.ChallengeRequest, ct)
             .ConfigureAwait(false);
     }
     catch (Exception ex)
@@ -460,7 +461,7 @@ async Task<IResult> HandleChallengeAsync(
         logger.LogWarning(ex, "Challenge JSON parse failed");
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "Invalid JSON body." },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -468,7 +469,7 @@ async Task<IResult> HandleChallengeAsync(
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "Empty body." },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -483,7 +484,7 @@ async Task<IResult> HandleChallengeAsync(
                 Ok = false,
                 Error = "Required: key, callbackUrl, files[] (each with fileId + url).",
             },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -492,7 +493,7 @@ async Task<IResult> HandleChallengeAsync(
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "callbackUrl must be absolute http(s)." },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -511,7 +512,7 @@ async Task<IResult> HandleChallengeAsync(
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "No valid files (need fileId + http(s) url)." },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -541,7 +542,7 @@ async Task<IResult> HandleChallengeAsync(
                 job.Files.Count);
             return Results.Json(
                 new ChallengeAckResponse { Ok = false, Error = "Server busy; retry shortly." },
-                AppJsonContext.Default.ChallengeAckResponse,
+                AppJsonContext.Relaxed.ChallengeAckResponse,
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         }
     }
@@ -554,7 +555,7 @@ async Task<IResult> HandleChallengeAsync(
 
     return Results.Json(
         new ChallengeAckResponse { Ok = true },
-        AppJsonContext.Default.ChallengeAckResponse);
+        AppJsonContext.Relaxed.ChallengeAckResponse);
 }
 
 // Competition primary serviceUrl path (no auth).
@@ -574,7 +575,7 @@ app.MapPost("/ocr", async Task<IResult> (
     OcrDebugRequest? body;
     try
     {
-        body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Default.OcrDebugRequest, ct)
+        body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Relaxed.OcrDebugRequest, ct)
             .ConfigureAwait(false);
     }
     catch (Exception ex)
@@ -582,7 +583,7 @@ app.MapPost("/ocr", async Task<IResult> (
         logger.LogWarning(ex, "Debug /ocr JSON parse failed");
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "Invalid JSON body." },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -590,7 +591,7 @@ app.MapPost("/ocr", async Task<IResult> (
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "Empty body." },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -615,7 +616,7 @@ app.MapPost("/ocr", async Task<IResult> (
         {
             return Results.Json(
                 new ChallengeAckResponse { Ok = false, Error = "url must be absolute http(s)." },
-                AppJsonContext.Default.ChallengeAckResponse,
+                AppJsonContext.Relaxed.ChallengeAckResponse,
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
@@ -648,7 +649,7 @@ app.MapPost("/ocr", async Task<IResult> (
         {
             return Results.Json(
                 new ChallengeAckResponse { Ok = false, Error = ex.Message },
-                AppJsonContext.Default.ChallengeAckResponse,
+                AppJsonContext.Relaxed.ChallengeAckResponse,
                 statusCode: StatusCodes.Status400BadRequest);
         }
         catch (Exception ex)
@@ -656,7 +657,7 @@ app.MapPost("/ocr", async Task<IResult> (
             logger.LogError(ex, "Debug /ocr local path failed");
             return Results.Json(
                 new ChallengeAckResponse { Ok = false, Error = "OCR failed: " + ex.Message },
-                AppJsonContext.Default.ChallengeAckResponse,
+                AppJsonContext.Relaxed.ChallengeAckResponse,
                 statusCode: StatusCodes.Status500InternalServerError);
         }
     }
@@ -672,7 +673,7 @@ app.MapPost("/ocr", async Task<IResult> (
                     "or { path } (local PDF, non-ASCII paths ok). " +
                     "Optional: teamId, key, callbackUrl (ignored for sync). Add ?verbose=1 for page text and ms/page.",
             },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -702,7 +703,7 @@ app.MapPost("/ocr", async Task<IResult> (
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = ex.Message },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
     catch (HttpRequestException ex)
@@ -710,14 +711,14 @@ app.MapPost("/ocr", async Task<IResult> (
         logger.LogWarning(ex, "Debug /ocr download failed");
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "Failed to download PDF: " + ex.Message },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status502BadGateway);
     }
     catch (InvalidOperationException ex)
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = ex.Message },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
     catch (Exception ex)
@@ -725,7 +726,7 @@ app.MapPost("/ocr", async Task<IResult> (
         logger.LogError(ex, "Debug /ocr pipeline failed");
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "OCR failed: " + ex.Message },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status500InternalServerError);
     }
 
@@ -738,7 +739,7 @@ app.MapPost("/ocr", async Task<IResult> (
         Key = string.IsNullOrWhiteSpace(body.Key) ? "debug" : body.Key.Trim(),
         Result = results,
     };
-    return Results.Json(callbackShaped, AppJsonContext.Default.ChallengeCallbackBody);
+    return Results.Json(callbackShaped, AppJsonContext.Relaxed.ChallengeCallbackBody);
 });
 
 app.MapPost("/ocr/upload", async Task<IResult> (
@@ -755,7 +756,7 @@ app.MapPost("/ocr/upload", async Task<IResult> (
                 Ok = false,
                 Error = "POST /ocr/upload expects multipart/form-data with a file field, or a path field.",
             },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -769,7 +770,7 @@ app.MapPost("/ocr/upload", async Task<IResult> (
         logger.LogWarning(ex, "Debug /ocr/upload form parse failed");
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "Invalid multipart body: " + ex.Message },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -800,7 +801,7 @@ app.MapPost("/ocr/upload", async Task<IResult> (
             {
                 return Results.Json(
                     new ChallengeAckResponse { Ok = false, Error = "PDF exceeds 300 MB." },
-                    AppJsonContext.Default.ChallengeAckResponse,
+                    AppJsonContext.Relaxed.ChallengeAckResponse,
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
@@ -811,7 +812,7 @@ app.MapPost("/ocr/upload", async Task<IResult> (
             {
                 return Results.Json(
                     new ChallengeAckResponse { Ok = false, Error = "Upload is not a PDF (missing %PDF header)." },
-                    AppJsonContext.Default.ChallengeAckResponse,
+                    AppJsonContext.Relaxed.ChallengeAckResponse,
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
@@ -829,7 +830,7 @@ app.MapPost("/ocr/upload", async Task<IResult> (
         {
             return Results.Json(
                 new ChallengeAckResponse { Ok = false, Error = "Provide a file field or a path field." },
-                AppJsonContext.Default.ChallengeAckResponse,
+                AppJsonContext.Relaxed.ChallengeAckResponse,
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
@@ -850,7 +851,7 @@ app.MapPost("/ocr/upload", async Task<IResult> (
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = ex.Message },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
     catch (Exception ex)
@@ -858,7 +859,7 @@ app.MapPost("/ocr/upload", async Task<IResult> (
         logger.LogError(ex, "Debug /ocr/upload failed");
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "OCR failed: " + ex.Message },
-            AppJsonContext.Default.ChallengeAckResponse,
+            AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status500InternalServerError);
     }
 });
@@ -924,7 +925,7 @@ static IResult FinishDebug(int teamId, string? key, string fileId, OcrResponse o
     {
         return Results.Json(
             OcrTextDebug.From(ocr, mode),
-            AppJsonContext.Default.OcrTextDebugResponse);
+            AppJsonContext.Relaxed.OcrTextDebugResponse);
     }
 
     ChallengeCallbackBody callbackShaped = new()
@@ -933,7 +934,7 @@ static IResult FinishDebug(int teamId, string? key, string fileId, OcrResponse o
         Key = string.IsNullOrWhiteSpace(key) ? "debug" : key.Trim(),
         Result = [ChallengeResultMapper.BuildFileResult(fileId, ocr)],
     };
-    return Results.Json(callbackShaped, AppJsonContext.Default.ChallengeCallbackBody);
+    return Results.Json(callbackShaped, AppJsonContext.Relaxed.ChallengeCallbackBody);
 }
 
 ClusterHealthInfo? BuildClusterHealth(IServiceProvider sp)
