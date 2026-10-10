@@ -25,7 +25,10 @@ public sealed class OcrDebugRequest
     public string? Path { get; set; }
 }
 
-/// <summary>Debug body for <c>POST /ocr?verbose=1</c> and <c>POST /ocr/upload?verbose=1</c>.</summary>
+/// <summary>
+/// Debug body for <c>POST /ocr?verbose=1</c> and <c>POST /ocr/upload?verbose=1</c>.
+/// <see cref="Pages"/> matches the competition result: pages with no rules are omitted.
+/// </summary>
 public sealed class OcrTextDebugResponse
 {
     public bool Ok { get; set; }
@@ -51,6 +54,8 @@ public sealed class OcrTextDebugPage
     public string Text { get; set; } = "";
     /// <summary><c>textLayer</c> when the PDF text was used, otherwise <c>ocr</c>.</summary>
     public string Source { get; set; } = "ocr";
+    /// <summary>Contest rules for this page. Present only when the list has items.</summary>
+    public List<ChallengeRule>? RuleList { get; set; }
 }
 
 public sealed class OcrPageResult

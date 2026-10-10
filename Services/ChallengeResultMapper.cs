@@ -12,14 +12,31 @@ public static class ChallengeResultMapper
     public const int OriginMaxLen = 100;
 
     /// <summary>
-    /// Pages with no OCR text are omitted from verbose page text.
-    /// A vision page that returned rules but left <c>text</c> blank still counts,
-    /// because the names and origin snippets live on the rule list.
-    /// Protocol output uses <see cref="BuildFileResult(string, OcrResponse)"/> and
-    /// drops a page whose rule list is empty even when the page has text.
+    /// True when the page has text or a prebuilt rule list.
+    /// Pipeline page lists use this so NER can still search text that produced no names.
+    /// External responses do not: <see cref="BuildFileResult(string, OcrResponse)"/> and
+    /// verbose debug keep a page only when it has at least one rule with items.
+    /// A vision page that returned rules but left <c>text</c> blank still counts.
     /// </summary>
     public static bool IncludeInOutput(OcrPageResult page) =>
         !string.IsNullOrWhiteSpace(page.Text) || page.RuleList is { Count: > 0 };
+
+    /// <summary>
+    /// Rules that carry at least one item. An empty rule object is not a hit.
+    /// </summary>
+    public static List<ChallengeRule> RulesWithItems(IReadOnlyList<ChallengeRule>? rules)
+    {
+        List<ChallengeRule> kept = [];
+        if (rules is null)
+            return kept;
+        foreach (ChallengeRule rule in rules)
+        {
+            if (rule.RuleItemList is { Count: > 0 })
+                kept.Add(rule);
+        }
+
+        return kept;
+    }
 
     public static ChallengeFileResult BuildFileResult(string fileId, OcrResponse ocr)
     {
@@ -29,15 +46,7 @@ public static class ChallengeResultMapper
             List<ChallengePageResult> pages = new(ocr.Pages.Count);
             foreach (OcrPageResult page in ocr.Pages)
             {
-                if (page.RuleList is not { Count: > 0 })
-                    continue;
-                List<ChallengeRule> rules = [];
-                foreach (ChallengeRule rule in page.RuleList)
-                {
-                    if (rule.RuleItemList is { Count: > 0 })
-                        rules.Add(rule);
-                }
-
+                List<ChallengeRule> rules = RulesWithItems(page.RuleList);
                 if (rules.Count == 0)
                     continue;
                 pages.Add(new ChallengePageResult
