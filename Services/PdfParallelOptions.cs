@@ -23,16 +23,18 @@ internal static class PdfParallelOptions
         PrewarmWorkers = true,
     };
 
-    public static RenderOptions CreateRenderOptions(int dpi) =>
+    public static RenderOptions CreateRenderOptions(int dpi, bool removeRedSeal) =>
         new(
             Dpi: dpi,
             WithAnnotations: false,
             WithFormFill: false,
             AntiAliasing: PdfAntiAliasing.None,
-            Grayscale: true)
+            // Red-seal removal needs the red channel. Gray8 cannot tell a seal from text.
+            Grayscale: !removeRedSeal)
         {
-            // PDFium renders Gray8. The parallel path reads those bytes with no BGRA expand.
-            // Conversion.ToImages ignores NativeGrayscale, so the in-process fallback stays a bitmap.
-            NativeGrayscale = true,
+            // PDFium renders Gray8 when the switch is off. The parallel path reads those
+            // bytes with no BGRA expand. Conversion.ToImages ignores NativeGrayscale, so
+            // the in-process fallback stays a bitmap.
+            NativeGrayscale = !removeRedSeal,
         };
 }

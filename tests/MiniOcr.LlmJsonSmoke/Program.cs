@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using MiniOcr;
 using MiniOcr.Models;
 using MiniOcr.Services;
+using SkiaSharp;
 
 int failed = 0;
 
@@ -103,6 +104,22 @@ Assert(joined.Contains("甲方北京华", StringComparison.Ordinal) && joined.Co
     "page 1, arriving second, still sees page 2's head");
 await outOfOrder.CompleteAsync();
 Assert(ordered.Count == 2, "both pages are sent once, including the page that arrived early");
+
+AppConfigFile? redOff = JsonSerializer.Deserialize(
+    """{"ocr":{"removeRedSeal":false}}""", AppJsonContext.Default.AppConfigFile);
+Assert(redOff?.Ocr?.RemoveRedSeal == false, "config json removeRedSeal false");
+AppConfigFile? redOmitted = JsonSerializer.Deserialize(
+    """{"ocr":{"mode":"local"}}""", AppJsonContext.Default.AppConfigFile);
+Assert(redOmitted?.Ocr?.RemoveRedSeal == true, "omitted removeRedSeal stays true");
+
+using SKBitmap grayPage = new(4, 4, SKColorType.Gray8, SKAlphaType.Opaque);
+Assert(RedSealFilter.Apply(grayPage) == 0, "Gray8 pages skip red-seal removal");
+using SKBitmap colorPage = new(8, 8, SKColorType.Bgra8888, SKAlphaType.Premul);
+colorPage.Erase(new SKColor(234, 232, 230));
+colorPage.SetPixel(4, 4, new SKColor(220, 40, 30, 255));
+Assert(RedSealFilter.Apply(colorPage) >= 1, "BGRA red seal pixel is replaced before detection");
+SKColor kept = colorPage.GetPixel(4, 4);
+Assert(kept.Red == 234 && kept.Green == 232 && kept.Blue == 230, "BGRA red becomes the page paper color");
 
 if (failed > 0)
 {

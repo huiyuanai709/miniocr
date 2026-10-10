@@ -16,6 +16,11 @@ public sealed class OcrRuntimeConfig
     public int LineWorkerCount { get; init; }
     public int DetIntraOpThreads { get; init; }
     public bool UseDirectionClassification { get; init; }
+    /// <summary>
+    /// When true (default), color pages lose high-saturation red before detection.
+    /// <c>MINIOCR_REMOVE_RED_SEAL=0</c> keeps the Gray8 render path.
+    /// </summary>
+    public bool RemoveRedSeal { get; init; } = true;
     public int RasterWorkerCount { get; init; }
     /// <summary><c>parallel</c> (default) or <c>inprocess</c>.</summary>
     public string RenderMode { get; init; } = "parallel";
@@ -102,6 +107,7 @@ public sealed class OcrRuntimeConfig
 
         bool useClsFile = ocr.UseCls ?? false;
         bool useCls = ReadBool("MINIOCR_USE_CLS", useClsFile);
+        bool removeRedSeal = ReadBool("MINIOCR_REMOVE_RED_SEAL", ocr.RemoveRedSeal);
 
         // Vision OCR is IO-bound: leave CPU free for PDFium — default raster workers = min(8, cores).
         bool llmMode = string.Equals(mode, "llm", StringComparison.OrdinalIgnoreCase);
@@ -204,6 +210,7 @@ public sealed class OcrRuntimeConfig
             LineWorkerCount = line,
             DetIntraOpThreads = det,
             UseDirectionClassification = useCls,
+            RemoveRedSeal = removeRedSeal,
             RasterWorkerCount = raster,
             RenderMode = renderMode,
             RenderProcessCount = renderProcesses,
@@ -321,6 +328,7 @@ public sealed class OcrRuntimeConfig
         LineWorkerCount = LineWorkerCount,
         DetIntraOpThreads = DetIntraOpThreads,
         UseDirectionClassification = UseDirectionClassification,
+        RemoveRedSeal = RemoveRedSeal,
         RasterWorkerCount = RasterWorkerCount,
         RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),
         RenderProcessCount = RenderProcessCount,
