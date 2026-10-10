@@ -1,3 +1,4 @@
+using System.Text.Json;
 using MiniOcr.Models;
 using MiniOcr.Services;
 
@@ -20,6 +21,9 @@ void AssertContains(IEnumerable<EntityHit> hits, string name, string msg)
     bool ok = hits.Any(h => h.Name == name);
     AssertTrue(ok, msg + $" (expect '{name}', got: [{string.Join(", ", hits.Select(h => h.Name))}])");
 }
+
+static string JsonOf<T>(T value) =>
+    JsonSerializer.Serialize(value, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
 
 Console.WriteLine("=== EntityExtractor smoke ===");
 
@@ -182,6 +186,61 @@ OcrResponse vision = new()
 };
 ChallengeFileResult visionMapped = ChallengeResultMapper.BuildFileResult("v", vision);
 AssertTrue(visionMapped.Pages.Count == 1 && visionMapped.Pages[0].Page == 3, "vision rules kept when text blank; empty page dropped");
+
+OcrResponse visionWithEmptyRule = new()
+{
+    Pages =
+    [
+        vision.Pages[2],
+        new OcrPageResult
+        {
+            Page = 10,
+            Text = "第十页只有一个空规则对象。",
+            RuleList =
+            [
+                new ChallengeRule
+                {
+                    RuleCode = "B04",
+                    RuleName = "人员名称",
+                    RuleItemList = [],
+                },
+            ],
+        },
+    ],
+};
+ChallengeFileResult emptyRuleMapped = ChallengeResultMapper.BuildFileResult("v2", visionWithEmptyRule);
+AssertTrue(emptyRuleMapped.Pages.Count == 1 && emptyRuleMapped.Pages[0].Page == 3, "empty rule object does not keep page 10");
+AssertTrue(!JsonOf(emptyRuleMapped).Contains("\"ruleList\":[]", StringComparison.Ordinal), "protocol JSON has no empty ruleList");
+
+OcrResponse nerDoc = new()
+{
+    Ok = true,
+    PageCount = 4,
+    Pages =
+    [
+        new OcrPageResult { Page = 1, Text = otPage, Width = 10, OcrMs = 1 },
+        new OcrPageResult { Page = 2, Text = "   \n\t" },
+        new OcrPageResult { Page = 3, Text = "本合同封面，没有名称。" },
+        new OcrPageResult { Page = 10, Text = "联系人：张伟出席会议。", OcrMs = 4 },
+    ],
+    Entities = new OcrEntities
+    {
+        Companies = [new EntityHit { Name = "成都交子商圈物业服务有限公司" }],
+        Persons = [new EntityHit { Name = "游春燕" }, new EntityHit { Name = "张伟" }],
+    },
+};
+ChallengeFileResult nerMapped = ChallengeResultMapper.BuildFileResult("f-ner", nerDoc);
+OcrTextDebugResponse nerDebug = OcrTextDebug.From(nerDoc, "local");
+AssertTrue(nerMapped.Pages.Select(p => p.Page).SequenceEqual([1, 10]), "POST /ocr keeps pages 1 and 10");
+AssertTrue(nerDebug.Pages.Select(p => p.Page).SequenceEqual([1, 10]), "verbose drops the page with no rules");
+AssertTrue(nerDebug.PageCount == 4, "verbose pageCount stays the document length");
+AssertTrue(nerDebug.Pages[1].Text.Contains("张伟", StringComparison.Ordinal), "verbose keeps text of a ruled page");
+AssertTrue(nerDebug.Pages[1].RuleList is { Count: > 0 }, "verbose ruleList is the protocol list");
+string nerJson = JsonOf(nerMapped);
+string debugJson = JsonOf(nerDebug);
+AssertTrue(!nerJson.Contains("\"ruleList\":[]", StringComparison.Ordinal), "callback-shaped JSON has no empty ruleList");
+AssertTrue(!debugJson.Contains("\"ruleList\":[]", StringComparison.Ordinal), "verbose JSON has no empty ruleList");
+AssertTrue(!debugJson.Contains("\"page\":3", StringComparison.Ordinal), "verbose JSON omits the pageless-rules page");
 
 Console.WriteLine();
 Console.WriteLine("=== LLM page groups ===");

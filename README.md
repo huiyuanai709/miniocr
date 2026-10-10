@@ -198,7 +198,7 @@ curl -sS -X POST http://127.0.0.1:5080/ocr/upload \
   -F "file=@samples/sample-multipage.pdf;type=application/pdf"
 ```
 
-`?verbose=1` 时响应带每页文本和耗时。本机文件用 `{"path":"/absolute/path/to/file.pdf"}`。
+`?verbose=1` 时响应带有规则的页的文本、耗时和 `ruleList`，没有规则的页不出现，页码保持不变。本机文件用 `{"path":"/absolute/path/to/file.pdf"}`。
 
 ## SIMD 档位（x64 Native AOT）
 

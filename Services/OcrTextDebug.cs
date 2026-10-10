@@ -7,18 +7,34 @@ public static class OcrTextDebug
     public static OcrTextDebugResponse From(OcrResponse ocr, string mode)
     {
         double msPerPage = ocr.PageCount > 0 ? ocr.Timings.OcrMs / ocr.PageCount : 0;
-        var pages = new List<OcrTextDebugPage>(ocr.Pages.Count);
-        foreach (OcrPageResult page in ocr.Pages)
+        // Same pages as POST /ocr and the challenge callback: a page is kept only
+        // when BuildFileResult leaves it with at least one rule item.
+        ChallengeFileResult protocol = ChallengeResultMapper.BuildFileResult("", ocr);
+        var pages = new List<OcrTextDebugPage>(protocol.Pages.Count);
+        foreach (ChallengePageResult hit in protocol.Pages)
         {
+            if (hit.RuleList.Count == 0)
+                continue;
+            OcrPageResult? src = null;
+            foreach (OcrPageResult page in ocr.Pages)
+            {
+                if (page.Page == hit.Page)
+                {
+                    src = page;
+                    break;
+                }
+            }
+
             pages.Add(new OcrTextDebugPage
             {
-                Page = page.Page,
-                Width = page.Width,
-                Height = page.Height,
-                RasterizeMs = page.RasterizeMs,
-                OcrMs = page.OcrMs,
-                Text = page.Text ?? "",
-                Source = string.IsNullOrEmpty(page.Source) ? "ocr" : page.Source,
+                Page = hit.Page,
+                Width = src?.Width ?? 0,
+                Height = src?.Height ?? 0,
+                RasterizeMs = src?.RasterizeMs ?? 0,
+                OcrMs = src?.OcrMs ?? 0,
+                Text = src?.Text ?? "",
+                Source = src is null || string.IsNullOrEmpty(src.Source) ? "ocr" : src.Source,
+                RuleList = hit.RuleList,
             });
         }
 
