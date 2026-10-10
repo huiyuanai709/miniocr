@@ -17,6 +17,12 @@
 # probes the CPU at run time and lights up AVX2 / AVX-512 automatically. They are a
 # one-binary convenience package (measured slower than AOT) that self-extracts
 # libSkiaSharp / pdfium on first run.
+#
+# linux-x64 (both AOT tiers and the single-file package) is compiled inside
+# ubuntu:20.04 so Native AOT links glibc 2.31. GitHub removed the ubuntu-20.04
+# hosted runner on 2025-04-15; ubuntu-latest's newer glibc is what the linker
+# records, and those binaries then fail on Ubuntu 20.04 with GLIBC version errors.
+# musl is out of scope. Windows, macOS, and linux-arm64 stay on their own runners.
 name: Publish Native AOT
 
 on:
@@ -58,13 +64,9 @@ jobs:
 
           # --- x64 SIMD tiers (two only) ---
           # avx2 = Haswell (2013)+; portable default, keeps the unsuffixed artifact name.
+          # linux-x64 counterparts are publish-linux-x64 (Ubuntu 20.04 container).
           - rid: win-x64
             os: windows-latest
-            simd: avx2
-            suffix: ""
-            singlefile: false
-          - rid: linux-x64
-            os: ubuntu-latest
             simd: avx2
             suffix: ""
             singlefile: false
@@ -76,20 +78,11 @@ jobs:
             simd: avx512v2
             suffix: -avx512v2
             singlefile: false
-          - rid: linux-x64
-            os: ubuntu-latest
-            simd: avx512v2
-            suffix: -avx512v2
-            singlefile: false
 
           # --- true single-file (non-AOT): one binary, natives extract on first run ---
+          # linux-x64 single-file is publish-linux-x64 as well.
           - rid: win-x64
             os: windows-latest
-            simd: ""
-            suffix: -singlefile
-            singlefile: true
-          - rid: linux-x64
-            os: ubuntu-latest
             simd: ""
             suffix: -singlefile
             singlefile: true
@@ -138,6 +131,190 @@ jobs:
               --self-contained true \
               -o "$OUT"
           fi
+
+      - name: Package zip (exclude .dbg / .pdb)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RID="${{ matrix.rid }}${{ matrix.suffix }}"
+          SRC="artifacts/${RID}"
+          # Drop large debug symbol files if present (StripSymbols=true already)
+          find "$SRC" -type f \( -name '*.dbg' -o -name '*.pdb' \) -delete || true
+          mkdir -p dist
+          if command -v zip >/dev/null 2>&1; then
+            (cd artifacts && zip -r "../dist/miniocr-${RID}.zip" "${RID}")
+          else
+            # windows-latest often lacks zip(1)
+            if command -v pwsh >/dev/null 2>&1; then
+              pwsh -NoLogo -NoProfile -Command \
+                "Compress-Archive -Path 'artifacts/${RID}/*' -DestinationPath 'dist/miniocr-${RID}.zip' -Force"
+            else
+              powershell -NoLogo -NoProfile -Command \
+                "Compress-Archive -Path 'artifacts\\${RID}\\*' -DestinationPath 'dist\\miniocr-${RID}.zip' -Force"
+            fi
+          fi
+          ls -la "dist/miniocr-${RID}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniocr-${{ matrix.rid }}${{ matrix.suffix }}
+          path: dist/miniocr-${{ matrix.rid }}${{ matrix.suffix }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach zip to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/miniocr-${{ matrix.rid }}${{ matrix.suffix }}.zip
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Compile linux-x64 against Ubuntu 20.04's glibc (2.31). The hosted
+  # ubuntu-20.04 runner label was removed on 2025-04-15, so this job uses a
+  # current x64 runner only to start the container. Publish steps match `publish`.
+  publish-linux-x64:
+    name: linux-x64${{ matrix.suffix }}
+    runs-on: ubuntu-24.04
+    container: ubuntu:20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: linux-x64
+            simd: avx2
+            suffix: ""
+            singlefile: false
+          - rid: linux-x64
+            simd: avx512v2
+            suffix: -avx512v2
+            singlefile: false
+          - rid: linux-x64
+            simd: ""
+            suffix: -singlefile
+            singlefile: true
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install Ubuntu 20.04 build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Focal is past standard support. archive.ubuntu.com still served it
+          # when this job was added; if those indices move, retry old-releases.
+          if ! apt-get update; then
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+              [ -f "$f" ] || continue
+              sed -i \
+                -e 's|http://archive.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \
+                -e 's|http://security.ubuntu.com/ubuntu|http://old-releases.ubuntu.com/ubuntu|g' \
+                "$f"
+            done
+            apt-get update
+          fi
+          # clang + zlib1g-dev: Native AOT link. git: submodule checkout.
+          # zip: packaging. binutils: readelf/objdump glibc gate.
+          # libicu-dev / libssl-dev: .NET 11 SDK on Ubuntu 20.04 (libicu66, OpenSSL 1.1).
+          apt-get install -y --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            git \
+            libicu-dev \
+            libssl-dev \
+            zip \
+            zlib1g-dev
+          echo "---- toolchain ----"
+          ldd --version
+          clang --version
+          git --version
+          command -v zip
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Checks out external/SimdPaddleOCR and external/PDFtoImage at their gitlinks.
+          submodules: recursive
+
+      - name: Setup .NET 11 RC
+        uses: actions/setup-dotnet@v4
+        with:
+          # Project TFM is net11.0; install latest 11.0.x preview/RC
+          dotnet-version: "11.0.x"
+          dotnet-quality: preview
+
+      - name: Publish (${{ matrix.rid }}${{ matrix.suffix }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="artifacts/${{ matrix.rid }}${{ matrix.suffix }}"
+          mkdir -p "$OUT"
+          # Use -p: (not /p:) — Git Bash on Windows strips the leading slash and
+          # MSBuild then treats "p:IlcInstructionSet=avx2" as a second project
+          # (MSB1008 Only one project can be specified).
+          if [ "${{ matrix.singlefile }}" = "true" ]; then
+            dotnet publish ./MiniOcr.csproj \
+              -c Release \
+              -r "${{ matrix.rid }}" \
+              --self-contained true \
+              -o "$OUT" \
+              -p:MiniOcrSingleFile=true
+          elif [ -n "${{ matrix.simd }}" ]; then
+            dotnet publish ./MiniOcr.csproj \
+              -c Release \
+              -r "${{ matrix.rid }}" \
+              --self-contained true \
+              -o "$OUT" \
+              -p:IlcInstructionSet=${{ matrix.simd }}
+          else
+            dotnet publish ./MiniOcr.csproj \
+              -c Release \
+              -r "${{ matrix.rid }}" \
+              --self-contained true \
+              -o "$OUT"
+          fi
+
+      - name: Require GLIBC <= 2.31
+        shell: bash
+        run: |
+          set -euo pipefail
+          RID="${{ matrix.rid }}${{ matrix.suffix }}"
+          check() {
+            bin="$1"
+            echo "==== $bin ===="
+            tmp=$(mktemp)
+            readelf -V "$bin" > "$tmp"
+            objdump -T "$bin" >> "$tmp"
+            versions=$(grep -oE 'GLIBC_[0-9]+\.[0-9]+' "$tmp" | sort -uV || true)
+            rm -f "$tmp"
+            if [ -z "$versions" ]; then
+              echo "no GLIBC versions found in $bin" >&2
+              exit 1
+            fi
+            printf '%s\n' "$versions"
+            max=$(printf '%s\n' "$versions" | sed 's/^GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -n 1)
+            major=${max%%.*}
+            minor=${max#*.}
+            if [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -gt 31 ]; }; then
+              echo "$bin requires GLIBC_${max}, newer than Ubuntu 20.04 (2.31)" >&2
+              exit 1
+            fi
+            echo "$bin max GLIBC_${max} is compatible with Ubuntu 20.04 (glibc 2.31)"
+          }
+          if [ ! -f "artifacts/${RID}/MiniOcr" ]; then
+            echo "missing artifacts/${RID}/MiniOcr" >&2
+            exit 1
+          fi
+          check "artifacts/${RID}/MiniOcr"
+          shopt -s nullglob
+          for so in "artifacts/${RID}/"*.so; do
+            check "$so"
+          done
 
       - name: Package zip (exclude .dbg / .pdb)
         shell: bash
