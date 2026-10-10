@@ -36,6 +36,8 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# libGLX_nvidia.so.0 (NVIDIA Vulkan ICD) needs libX11 and libXext.
+# Missing libXext.so.6 makes the loader fail and OCR fall back to CPU.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -45,6 +47,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libicu74 \
         libssl3 \
         libvulkan1 \
+        libx11-6 \
+        libxext6 \
         zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
