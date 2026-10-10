@@ -5,12 +5,12 @@
 # Submodules must be checked out before building:
 #   git submodule update --init --recursive
 #
-# Default instruction set is AVX2. AVX-512 hosts:
-#   docker compose build --build-arg ILC_INSTRUCTION_SET=avx512v2
+# Linux image publishes AVX-512 (avx512v2). Hosts without it:
+#   docker compose build --build-arg ILC_INSTRUCTION_SET=avx2
 FROM ubuntu:24.04 AS build
 
 ARG DOTNET_VERSION=11.0.100-rc.1.26425.128
-ARG ILC_INSTRUCTION_SET=avx2
+ARG ILC_INSTRUCTION_SET=avx512v2
 
 ENV DEBIAN_FRONTEND=noninteractive
 

@@ -237,7 +237,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 主机上的卡号由 compose 里的 `device_ids` / `NVIDIA_VISIBLE_DEVICES` 决定。容器里只能看到这一张卡，所以每个进程的 `MINIOCR_OCR_VULKAN_DEVICE` 都是 `0`，不要写成 `1`–`7`。
 
-默认镜像基于 Ubuntu 24.04（运行时需要 glibc 2.38 和 `libicu74`）。`Dockerfile` 在构建阶段用仓库源码做 `linux-x64` Native AOT 发布（默认 AVX2），再把产物放进运行镜像，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。构建前要初始化子模块，否则缺少 `external/SimdPaddleOCR` 和 `external/PDFtoImage`。密钥只从环境变量进入进程，不写进镜像：
+默认镜像基于 Ubuntu 24.04（运行时需要 glibc 2.38 和 `libicu74`）。`Dockerfile` 在构建阶段用仓库源码做 `linux-x64` Native AOT 发布，指令集是 AVX-512（`avx512v2`），再把产物放进运行镜像，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。构建前要初始化子模块，否则缺少 `external/SimdPaddleOCR` 和 `external/PDFtoImage`。密钥只从环境变量进入进程，不写进镜像：
 
 | 变量 | 作用 |
 | --- | --- |
@@ -259,13 +259,13 @@ docker compose up
 
 健康检查：`curl -sS http://127.0.0.1:5080/health`（工作进程把端口换成 `5081`–`5087`）。GPU 预热较慢，compose 的 `start_period` 是 180 秒。
 
-CPU 支持 AVX-512 时在编译期换指令集：
+镜像里的二进制带 AVX-512。CPU 没有该指令集时进程会直接退出，改回 AVX2 再构建：
 
 ```bash
-docker compose build --build-arg ILC_INSTRUCTION_SET=avx512v2
+docker compose build --build-arg ILC_INSTRUCTION_SET=avx2
 ```
 
-指令集不匹配时进程会直接退出，改回默认的 `avx2`。`Dockerfile.publish` 与 `Dockerfile` 是同一套源码发布：
+`Dockerfile.publish` 与 `Dockerfile` 是同一套源码发布：
 
 ```bash
 docker build -f Dockerfile.publish -t miniocr:local .
