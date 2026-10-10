@@ -39,6 +39,73 @@ Assert(wire.Contains("\"response_format\"", StringComparison.Ordinal), "wire fie
 Assert(wire.Contains("\"json_object\"", StringComparison.Ordinal), "wire type is json_object");
 Assert(!wire.Contains("responseFormat", StringComparison.Ordinal), "camelCase name is not sent");
 
+ChallengeCallbackBody callback = new()
+{
+    TeamId = 7,
+    Key = "k",
+    Result =
+    [
+        new ChallengeFileResult
+        {
+            FileId = "f1",
+            Pages =
+            [
+                new ChallengePageResult
+                {
+                    Page = 1,
+                    RuleList =
+                    [
+                        new ChallengeRule
+                        {
+                            RuleCode = "B06",
+                            RuleName = "公司名称",
+                            RuleItemList =
+                            [
+                                new ChallengeRuleItem
+                                {
+                                    CompanyName = "北京华腾科技有限公司",
+                                    Count = 1,
+                                    OriginText = ["甲方：北京华腾科技有限公司"],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+};
+string callbackJson = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+    callback, AppJsonContext.Relaxed.ChallengeCallbackBody));
+Assert(callbackJson.Contains("北京华腾科技有限公司", StringComparison.Ordinal), "callback writes Chinese as UTF-8");
+Assert(callbackJson.Contains("公司名称", StringComparison.Ordinal), "callback rule name stays UTF-8");
+Assert(callbackJson.Contains("\"ruleName\":\"公司名称\"", StringComparison.Ordinal), "callback keeps camelCase ruleName");
+Assert(callbackJson.Contains("\"companyName\":\"北京华腾科技有限公司\"", StringComparison.Ordinal), "callback keeps camelCase companyName");
+Assert(!callbackJson.Contains("\\u", StringComparison.Ordinal), "callback does not use \\u escapes");
+string defaultJson = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+    callback, AppJsonContext.Default.ChallengeCallbackBody));
+Assert(defaultJson.Contains("\\u", StringComparison.Ordinal), "default context still escapes non-ASCII");
+
+JsonSerializerOptions httpOptions = new()
+{
+    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    TypeInfoResolver = AppJsonContext.Relaxed,
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+};
+string httpJson = JsonSerializer.Serialize(new ChallengeAckResponse { Ok = false, Error = "文件不存在" }, httpOptions);
+Assert(httpJson.Contains("文件不存在", StringComparison.Ordinal), "HTTP JSON options keep Chinese as UTF-8");
+Assert(!httpJson.Contains("\\u", StringComparison.Ordinal), "HTTP JSON options do not use \\u escapes");
+
+Microsoft.AspNetCore.Http.Json.JsonOptions aspNet = new();
+aspNet.SerializerOptions.Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping;
+aspNet.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Relaxed);
+string aspNetJson = JsonSerializer.Serialize(
+    new ChallengeAckResponse { Ok = false, Error = "文件不存在" }, aspNet.SerializerOptions);
+Assert(aspNetJson.Contains("文件不存在", StringComparison.Ordinal), "ASP.NET JsonOptions keep Chinese as UTF-8");
+Assert(!aspNetJson.Contains("\\u", StringComparison.Ordinal), "ASP.NET JsonOptions do not use \\u escapes");
+Assert(aspNetJson.Contains("\"ok\":", StringComparison.Ordinal), "ASP.NET JsonOptions keep camelCase");
+
 Assert(LlmJson.IsFormatRejected(400, "{\"error\":\"unsupported response_format\"}"), "400 mentioning response_format is a rejection");
 Assert(!LlmJson.IsFormatRejected(500, "response_format"), "non-400 is not a format rejection");
 Assert(!LlmJson.IsFormatRejected(400, "model not found"), "unrelated 400 stays a hard error");
