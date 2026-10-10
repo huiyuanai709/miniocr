@@ -134,11 +134,12 @@ ChallengeFileResult skipped = ChallengeResultMapper.BuildFileResult(
     [
         new OcrPageResult { Page = 1, Text = otPage },
         new OcrPageResult { Page = 2, Text = "   \n\t" },
+        new OcrPageResult { Page = 3, Text = "本合同封面，没有名称。" },
         new OcrPageResult { Page = 4, Text = "联系人：张伟出席会议。" },
     ],
     ["成都交子商圈物业服务有限公司"],
     ["游春燕", "张伟"]);
-AssertTrue(skipped.Pages.Count == 2, "blank page omitted");
+AssertTrue(skipped.Pages.Count == 2, "blank page and page with no rules omitted");
 AssertTrue(skipped.Pages[0].Page == 1 && skipped.Pages[1].Page == 4, "original page numbers kept");
 AssertTrue(
     skipped.Pages[1].RuleList.Any(r => r.RuleCode == "B04" && r.RuleItemList.Any(i => i.PersonName == "张伟")),
@@ -149,6 +150,12 @@ OcrResponse vision = new()
     Pages =
     [
         new OcrPageResult { Page = 1, Text = "" },
+        new OcrPageResult
+        {
+            Page = 2,
+            Text = "只有正文，没有名单。",
+            RuleList = [],
+        },
         new OcrPageResult
         {
             Page = 3,
