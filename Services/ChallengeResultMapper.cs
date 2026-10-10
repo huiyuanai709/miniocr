@@ -12,9 +12,11 @@ public static class ChallengeResultMapper
     public const int OriginMaxLen = 100;
 
     /// <summary>
-    /// Pages with no OCR text are omitted from the protocol output.
-    /// A vision page that returned rules but left <c>text</c> blank is kept,
+    /// Pages with no OCR text are omitted from verbose page text.
+    /// A vision page that returned rules but left <c>text</c> blank still counts,
     /// because the names and origin snippets live on the rule list.
+    /// Protocol output uses <see cref="BuildFileResult(string, OcrResponse)"/> and
+    /// drops a page whose rule list is empty even when the page has text.
     /// </summary>
     public static bool IncludeInOutput(OcrPageResult page) =>
         !string.IsNullOrWhiteSpace(page.Text) || page.RuleList is { Count: > 0 };
@@ -27,14 +29,21 @@ public static class ChallengeResultMapper
             List<ChallengePageResult> pages = new(ocr.Pages.Count);
             foreach (OcrPageResult page in ocr.Pages)
             {
-                if (!IncludeInOutput(page))
+                if (page.RuleList is not { Count: > 0 })
+                    continue;
+                List<ChallengeRule> rules = [];
+                foreach (ChallengeRule rule in page.RuleList)
+                {
+                    if (rule.RuleItemList is { Count: > 0 })
+                        rules.Add(rule);
+                }
+
+                if (rules.Count == 0)
                     continue;
                 pages.Add(new ChallengePageResult
                 {
                     Page = page.Page,
-                    RuleList = page.RuleList is { Count: > 0 }
-                        ? page.RuleList
-                        : [],
+                    RuleList = rules,
                 });
             }
 
@@ -84,6 +93,9 @@ public static class ChallengeResultMapper
                     RuleItemList = companyItems,
                 });
             }
+
+            if (rules.Count == 0)
+                continue;
 
             pageResults.Add(new ChallengePageResult
             {
