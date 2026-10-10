@@ -246,10 +246,10 @@ Console.WriteLine("=== takeover drops only remote leases ===");
 
 Console.WriteLine("=== model mismatch warning ===");
 AssertTrue(
-    ClusterNodeRegistry.Mismatch("llm", "gpt-4o", 72, "local", "ChineseV6Tiny", 96) is not null,
+    ClusterNodeRegistry.Mismatch("llm", "gpt-4o", 72, "local", "ChineseV6Small", 96) is not null,
     "mode, model, and dpi differences are reported");
 AssertTrue(
-    ClusterNodeRegistry.Mismatch("local", "ChineseV6Tiny", 96, "local", "ChineseV6Tiny", 96) is null,
+    ClusterNodeRegistry.Mismatch("local", "ChineseV6Small", 96, "local", "ChineseV6Small", 96) is null,
     "identical nodes produce no warning");
 
 Console.WriteLine("=== NER groups stay in document order when OCR finishes out of order ===");
@@ -482,7 +482,7 @@ Console.WriteLine("=== distributed NER config ===");
         Capacity = 2,
         EngineCount = 2,
         OcrMode = "local",
-        Model = "ChineseV6Tiny",
+        Model = "ChineseV6Small",
         Dpi = 96,
         AdvertiseUrl = "http://127.0.0.1:5080",
         LlmConfigured = true,

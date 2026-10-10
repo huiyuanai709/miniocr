@@ -76,7 +76,7 @@ public static class OcrCompareRunner
         {
             wechat = await WeChatOcrEngine.ConnectAsync(location, config, logger, CancellationToken.None, instanceCount: 1)
                 .ConfigureAwait(false);
-            Console.WriteLine("Loading one ChineseV6Tiny engine for the local side of the comparison...");
+            Console.WriteLine("Loading one ChineseV6Small engine for the local side of the comparison...");
             local = await OcrEngine.CreateAsync(logs.CreateLogger<OcrEngine>(), config, CancellationToken.None)
                 .ConfigureAwait(false);
 

@@ -8,7 +8,7 @@ namespace MiniOcr.Services;
 /// </summary>
 public sealed class ClusterRuntimeConfig
 {
-    public const string LocalModelName = "ChineseV6Tiny";
+    public const string LocalModelName = "ChineseV6Small";
 
     public bool Enabled { get; init; }
     /// <summary><c>coordinator</c>, <c>worker</c>, or <c>both</c>.</summary>

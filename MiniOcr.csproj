@@ -55,9 +55,9 @@
     <ProjectReference Include="external/PDFtoImage/src/Parallel/Parallel.csproj" />
     <!-- Pinned fork branch cursor/metal-ocr-backend-08b9 @ f574915 (merged Vulkan
          arena cap, plus Metal working-set cap and AOT-preserved .metal shaders).
-         ChineseV6Tiny models come from the same tree. Default backend stays CPU. -->
+         ChineseV6Small models come from the same tree. Default backend stays CPU. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
-    <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny.csproj" />
+    <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Small/Sdcb.SimdPaddleOCR.Models.ChineseV6Small.csproj" />
   </ItemGroup>
 
   <Target Name="EnsureSimdPaddleOcrSubmodule" BeforeTargets="Restore;Build;Publish">
@@ -80,7 +80,7 @@
   <ItemGroup>
     <!-- Keep model / Skia / PDFium assemblies from being trimmed away -->
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR" />
-    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny" />
+    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Small" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.TextLineOrientation" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.ModelProvider" />
     <TrimmerRootAssembly Include="PDFtoImage" />
