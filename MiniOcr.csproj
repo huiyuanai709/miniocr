@@ -1,5 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
+  <!-- Self-contained and Native AOT publishes swap in Satori GC (experimental).
+       UseSatoriGC defaults to true; -p:UseSatoriGC=false keeps the stock runtime.
+       Latest net11 feed: https://www.nuget.org/packages/PublishWithSatoriGC -->
+  <Sdk Name="PublishWithSatoriGC" Version="11.0.0-satori.38067405561.1" />
+
   <PropertyGroup>
     <TargetFramework>net11.0</TargetFramework>
     <Nullable>enable</Nullable>
