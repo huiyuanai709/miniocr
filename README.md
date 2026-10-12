@@ -291,6 +291,29 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 `llm.timeoutSeconds`、`maxCharsPerRequest`、`fallbackToHeuristics` 没有对应环境变量，写在 `config.docker.json`。OCR 为 Vulkan、4 个引擎、DPI 96、关闭方向分类。识别批大小不设 `MINIOCR_REC_BATCH`，24GB 显卡会保持较大的批。8 个进程各自的 `maxConcurrency` 是 16；出口压力大时用 `MINIOCR_LLM_MAX_CONCURRENCY` 调低。
 
+### 推测副本（`speculative retry` 日志）
+
+`Cluster job … speculative retry node=gpuN … leaseMs=40000` **不是租约到期**。空闲 GPU 认领的是已经租给另一张卡的页，两张卡都会把这几页 OCR 跑完，先提交的结果生效。行里的 `leaseMs` 是这份**新副本**的租约：默认每页 `pageTimeoutSeconds=20`，冷启动一批是 2 页，所以 `2 × 20000 = 40000`。普通认领是 Debug；副本、进度汇总，以及真正的 `lease expired`，才是 Information。控制台上会觉得“全是重试”。
+
+副本只在待认领队列已经空、但还有页没完成时发出：
+
+- 未完成页 ≤ `speculativeTailPages`（默认 4）：立刻复制，不管原租约是不是刚发出去。8 张卡上，一次只有 1–4 页要 OCR 的任务（短 PDF，或文本层跳过后只剩几页）会把这些页再跑一遍。2 页任务的日志就是 `leaseMs=40000`，`speculativeCopies` 等于页数，GPU 浪费约 100%。
+- 未完成页更多，且 `speculativeStaleLeases` 默认开着：主租约年龄 ≥ `max(2.5 秒, 0.6 × 按这张卡自己的速度估计的剩余时间)` 就复制。页能在大约 1 秒内跑完时，长文档几乎不走这里，浪费通常是队尾 0–4 页。单页到 1.5–2 秒以上、队列又已经见底时，队尾会多出大约一到两成页，并连着打出多行。
+- 同一页同时最多两份。结束日志里的 `speculativeCopies` 就是发出去的副本页数（同一页的副本租约到期后又被复制，会再计一次）。Worker 不会因为原卡先交卷而取消已经开始的 OCR。
+
+加大 `MINIOCR_CLUSTER_LEASE_SECONDS` 或 `MINIOCR_CLUSTER_PAGE_TIMEOUT_SECONDS` **不会**减少这种日志，只会让卡死的批更晚回到队列（那一行是 `lease expired`）。join grace、自适应 batch、公平认领也不是这条日志的原因。`MINIOCR_CLUSTER_SPECULATIVE_TAIL=0` 会被夹成 1，最后一页的副本关不掉。
+
+8×4090、每进程 4 个引擎时，所有进程加上：
+
+```bash
+MINIOCR_CLUSTER_SPECULATIVE_STALE=0
+MINIOCR_CLUSTER_SPECULATIVE_TAIL=1
+```
+
+健康的卡不再互相复制默认的队尾 4 页，也不再复制“只跑了 2.5 秒”的租约。最后 1 页仍会复制，用来盖住真正慢的那一页。某张卡没响应时，页要等该批租约到期才回队列（2 页默认 40 秒，一批最长 180 秒）；整次任务的后盾仍是 `jobDeadlineSeconds`（默认 300）。长文档的 `speculativeCopies` 接近 0 就保持这两项。若有一张卡稳定更慢、尾延迟变差，再把 `MINIOCR_CLUSTER_SPECULATIVE_STALE` 设回 `1`。
+
+`MINIOCR_CLUSTER_CAPACITY` 保持 `0`（跟引擎数走，这里是 4）。`renderAheadPages` 保持 4。不要把 capacity 设得比本进程引擎数更大，调度器会高估这张卡的并行度，更容易把还在排队的页当成已经超时。
+
 上传的 PDF 没有可再次下载的地址时，协调进程把它写到 `MINIOCR_CLUSTER_SHARED_DIR`（compose 里是卷 `miniocr-jobs`，挂到 `/var/lib/miniocr/jobs`）。同机的工作进程直接打开这个文件。路径不存在或长度对不上时，仍向协调进程下载。任务结束后删除该文件；渲染进程先放开对它的映射。别的机器上看不到这个路径，所以还是走下载。
 
 比赛目录 `MINIOCR_CHALLENGE_RESOURCE_DIR` 里的 PDF 不走上面的复制：worker 就地只读打开原件，任务结束不删除。该目录不要指到 `sharedDir`。
