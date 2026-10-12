@@ -170,7 +170,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | 70 | 视觉 JPEG 质量（40–95） |
 | `MINIOCR_LLM_THINKING` | `llm.thinking` | false | 思考模式。默认发送 `thinking.type=disabled` |
 | `MINIOCR_LLM_JSON_OBJECT` | `llm.jsonObject` | true | `response_format.type=json_object` |
-| `MINIOCR_LLM_NER_MAX_ATTEMPTS` | `llm.nerMaxAttempts` | 3 | 每组 NER 请求次数（含首次，1–8）。JSON 解析失败，以及 408 / 429 / 5xx / 超时 / 连接失败会短退避重试；401 / 403 不重试 |
+| `MINIOCR_LLM_NER_MAX_ATTEMPTS` | `llm.nerMaxAttempts` | 3 | 每组 NER 的 chat completion 次数（含首次，1–8）。JSON 缺失、截断或类型错误时，剩余次数改为强制 `thinking=enabled` 的纠正请求，并带回错误输出，不再原样重发同一条提示。403 / 408 / 429 / 5xx / 超时 / 连接失败按刚才那次请求短退避重试；401 不重试 |
 | `MINIOCR_WECHAT_OCR_PATH` | `ocr.wechatOcrPath` | 空 | 插件可执行文件或 dll |
 | `MINIOCR_WECHAT_DIR` | `ocr.wechatDir` | 空 | 含 `mmmojo_64.dll` 的目录 |
 | `MINIOCR_WECHAT_INSTANCES` | `ocr.wechatInstances` | 1–3 | 插件进程数 |

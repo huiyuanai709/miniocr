@@ -427,8 +427,10 @@ public sealed class LlmEntityExtractor
     }
 
     /// <summary>
-    /// One NER group. Parse failures and transient HTTP are retried up to
-    /// <see cref="LlmRuntimeConfig.NerMaxAttempts"/> (default 3). 401/403 fail on the first response.
+    /// One NER group, up to <see cref="LlmRuntimeConfig.NerMaxAttempts"/> chat completions (default 3).
+    /// A payload that is missing, truncated, or the wrong JSON type spends the remaining attempts on a
+    /// thinking-on correction that quotes the bad reply. HTTP 403/408/429/5xx, timeouts, and transport
+    /// errors retry that same request. 401 fails on the first response.
     /// The last failure is thrown unchanged so cluster NER requeues and the local pipeline can still return empty.
     /// </summary>
     private async Task<BatchResult> CompleteBatchAsync(
@@ -438,13 +440,18 @@ public sealed class LlmEntityExtractor
     {
         int maxAttempts = NormalizeNerAttempts(_config.NerMaxAttempts);
         string pages = string.Join(',', batch.PageNumbers);
+        string? repairBody = null;
         Exception? last = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
+            bool correction = repairBody is not null;
             try
             {
-                return await CompleteBatchOnceAsync(batch, pagesMode, attempt, maxAttempts, ct)
-                    .ConfigureAwait(false);
+                return correction
+                    ? await CompleteRepairAsync(batch, pagesMode, repairBody!, attempt, maxAttempts, ct)
+                        .ConfigureAwait(false)
+                    : await CompleteBatchOnceAsync(batch, pagesMode, attempt, maxAttempts, ct)
+                        .ConfigureAwait(false);
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
@@ -466,13 +473,27 @@ public sealed class LlmEntityExtractor
                     throw;
                 }
 
-                _logger.LogWarning(
-                    ex,
-                    "LLM NER attempt {Attempt}/{MaxAttempts} failed for pages {Pages} ({Reason}); retrying",
-                    attempt,
-                    maxAttempts,
-                    pages,
-                    DescribeRetry(ex));
+                if (ex is LlmPayloadParseException parse)
+                {
+                    repairBody = parse.BadBody;
+                    _logger.LogWarning(
+                        ex,
+                        "LLM NER attempt {Attempt}/{MaxAttempts} failed for pages {Pages} (json parse); next attempt is a thinking correction",
+                        attempt,
+                        maxAttempts,
+                        pages);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "LLM NER attempt {Attempt}/{MaxAttempts} failed for pages {Pages} ({Reason}); retrying",
+                        attempt,
+                        maxAttempts,
+                        pages,
+                        DescribeRetry(ex));
+                }
+
                 await Task.Delay(RetryBackoffMs(attempt), ct).ConfigureAwait(false);
             }
         }
@@ -492,8 +513,8 @@ public sealed class LlmEntityExtractor
     }
 
     /// <summary>
-    /// JSON that did not deserialize, HTTP 408/429/5xx, HttpClient timeouts, and transport errors.
-    /// 401/403 and other 4xx are not retried.
+    /// JSON that did not deserialize, HTTP 403/408/429/5xx, HttpClient timeouts, and transport errors.
+    /// 401 and other 4xx are not retried. Parse failures are retried as a thinking correction, not the same prompt.
     /// </summary>
     internal static bool IsRetryableNerFailure(Exception ex)
     {
@@ -511,7 +532,7 @@ public sealed class LlmEntityExtractor
         if (http.StatusCode is { } status)
         {
             int code = (int)status;
-            if (code is 408 or 429)
+            if (code is 403 or 408 or 429)
                 return true;
             return code is >= 500 and <= 599;
         }
@@ -521,10 +542,7 @@ public sealed class LlmEntityExtractor
     }
 
     private static bool IsAuthFailure(Exception ex) =>
-        ex is HttpRequestException
-        {
-            StatusCode: HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden,
-        };
+        ex is HttpRequestException { StatusCode: HttpStatusCode.Unauthorized };
 
     private static string DescribeRetry(Exception ex)
     {
@@ -544,9 +562,47 @@ public sealed class LlmEntityExtractor
         return ex.GetType().Name;
     }
 
-    private async Task<BatchResult> CompleteBatchOnceAsync(
+    private Task<BatchResult> CompleteBatchOnceAsync(
         LlmPageGrouper.PageBatch batch,
         bool pagesMode,
+        int attempt,
+        int maxAttempts,
+        CancellationToken ct) =>
+        SendAndParseAsync(
+            batch,
+            pagesMode,
+            repairBody: null,
+            thinking: _config.ToThinkingOption(),
+            attempt,
+            maxAttempts,
+            ct);
+
+    /// <summary>
+    /// One follow-up after a bad payload. Thinking is forced on even when
+    /// <see cref="LlmRuntimeConfig.Thinking"/> is false. The bad reply is both the
+    /// assistant turn and part of the repair instruction.
+    /// </summary>
+    private Task<BatchResult> CompleteRepairAsync(
+        LlmPageGrouper.PageBatch batch,
+        bool pagesMode,
+        string repairBody,
+        int attempt,
+        int maxAttempts,
+        CancellationToken ct) =>
+        SendAndParseAsync(
+            batch,
+            pagesMode,
+            repairBody,
+            thinking: new ThinkingOption { Type = "enabled" },
+            attempt,
+            maxAttempts,
+            ct);
+
+    private async Task<BatchResult> SendAndParseAsync(
+        LlmPageGrouper.PageBatch batch,
+        bool pagesMode,
+        string? repairBody,
+        ThinkingOption thinking,
         int attempt,
         int maxAttempts,
         CancellationToken ct)
@@ -554,23 +610,21 @@ public sealed class LlmEntityExtractor
         string userText = batch.Text;
         string url = _config.BaseUrl.TrimEnd('/') + "/v1/chat/completions";
         bool jsonMode = _config.JsonObject && Volatile.Read(ref _jsonObjectEnabled) == 1;
+        bool correction = repairBody is not null;
         ChatCompletionRequest body = new()
         {
             Model = _config.Model,
             Temperature = 0,
-            Thinking = _config.ToThinkingOption(),
+            Thinking = thinking,
             ResponseFormat = jsonMode ? LlmJson.JsonObject : null,
-            Messages =
-            [
-                new ChatMessage { Role = "system", Content = pagesMode ? SystemPromptPages : SystemPrompt },
-                new ChatMessage { Role = "user", Content = userText },
-            ],
+            Messages = BuildMessages(pagesMode, userText, repairBody),
         };
 
         _logger.LogInformation(
-            "LLM NER request: attempt={Attempt}/{MaxAttempts}, model={Model}, chars={Chars}, pages={Pages}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}",
+            "LLM NER request: attempt={Attempt}/{MaxAttempts}, correction={Correction}, model={Model}, chars={Chars}, pages={Pages}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}",
             attempt,
             maxAttempts,
+            correction ? "yes" : "no",
             _config.Model,
             userText.Length,
             string.Join(',', batch.PageNumbers),
@@ -579,13 +633,85 @@ public sealed class LlmEntityExtractor
             url);
 
         string raw = await PostChatAsync(url, body, jsonMode, ct).ConfigureAwait(false);
-        ChatCompletionResponse? parsed =
-            JsonSerializer.Deserialize(raw, AppJsonContext.Default.ChatCompletionResponse);
+        return ParseCompletion(raw);
+    }
+
+    private static List<ChatMessage> BuildMessages(bool pagesMode, string userText, string? repairBody)
+    {
+        List<ChatMessage> messages =
+        [
+            new ChatMessage { Role = "system", Content = pagesMode ? SystemPromptPages : SystemPrompt },
+            new ChatMessage { Role = "user", Content = userText },
+        ];
+        if (repairBody is null)
+            return messages;
+
+        string clipped = ClipForRepair(repairBody);
+        messages.Add(new ChatMessage { Role = "assistant", Content = clipped });
+        messages.Add(new ChatMessage { Role = "user", Content = RepairInstruction + clipped });
+        return messages;
+    }
+
+    /// <summary>Head and tail, so a truncated payload still shows the broken end.</summary>
+    internal const int RepairBodyMaxChars = 64_000;
+
+    internal static string ClipForRepair(string text)
+    {
+        if (text.Length <= RepairBodyMaxChars)
+            return text;
+        int head = RepairBodyMaxChars / 2;
+        int tail = RepairBodyMaxChars - head;
+        return string.Concat(
+            text.AsSpan(0, head),
+            "\n…(middle omitted)…\n",
+            text.AsSpan(text.Length - tail));
+    }
+
+    private const string RepairInstruction =
+        """
+        上一条回复不是合法 JSON。请开启思考，把下面的错误输出改成一个合法的 JSON 对象，且只输出这个对象。
+        不要 markdown，不要解释。page 和 count 必须是 JSON 数字，不能是字符串。
+        有逐页结果时使用 {"pages":[{"page":1,"ruleList":[]}]}。
+        没有逐页结果时使用 {"companies":[],"persons":[]}。
+        错误输出：
+        """;
+
+    /// <summary>Chat-completion envelope parsed, then the message content. Invalid content keeps the bad text for a correction call.</summary>
+    private static BatchResult ParseCompletion(string raw)
+    {
+        ChatCompletionResponse? parsed;
+        try
+        {
+            parsed = JsonSerializer.Deserialize(raw, AppJsonContext.Default.ChatCompletionResponse);
+        }
+        catch (JsonException ex)
+        {
+            throw new LlmPayloadParseException(
+                "LLM chat completion JSON was invalid: " + ex.Message,
+                raw,
+                ex);
+        }
+
         string? content = parsed?.Choices?.FirstOrDefault()?.Message?.Content;
         if (string.IsNullOrWhiteSpace(content))
-            throw new InvalidOperationException("LLM returned empty message content.");
+            throw new LlmPayloadParseException("LLM returned empty message content.", raw);
 
         string json = NerPrompt.ExtractJsonObject(content);
+        try
+        {
+            return ParsePayload(json);
+        }
+        catch (JsonException ex)
+        {
+            throw new LlmPayloadParseException(
+                "LLM NER payload JSON was invalid: " + ex.Message,
+                content,
+                ex);
+        }
+    }
+
+    private static BatchResult ParsePayload(string json)
+    {
         BatchResult result = new();
 
         // Per-page payload (direction A) wins; a flat name list is the fallback shape.
@@ -616,6 +742,18 @@ public sealed class LlmEntityExtractor
         }
 
         return result;
+    }
+
+    /// <summary>Parse failure that still has the model text to send back.</summary>
+    private sealed class LlmPayloadParseException : InvalidOperationException
+    {
+        public LlmPayloadParseException(string message, string badBody, Exception? inner = null)
+            : base(message, inner)
+        {
+            BadBody = badBody ?? "";
+        }
+
+        public string BadBody { get; }
     }
 
     /// <summary>Model-produced per-page rules: keep B04/B06 only, repair names, drop empties.</summary>

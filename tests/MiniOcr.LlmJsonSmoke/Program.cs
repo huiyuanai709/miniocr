@@ -345,16 +345,43 @@ using (HttpClient parseHttp = new(parseFails) { BaseAddress = new Uri("http://ll
 {
     Exception? parseError = await TryExtract(MakeExtractor(parseHttp, attempts: 3, parseLog));
     Assert(parseError is JsonException or InvalidOperationException,
-        $"truncated JSON still throws after retries ({parseError?.GetType().Name}: {parseError?.Message})");
+        $"truncated JSON still throws after the correction budget ({parseError?.GetType().Name}: {parseError?.Message})");
     Assert(parseFails.Calls == 3, $"parse failure uses 3 attempts (calls={parseFails.Calls})");
-    Assert(parseLog.Lines.Exists(l => l.Contains("attempt 1/3", StringComparison.Ordinal) && l.Contains("retrying", StringComparison.Ordinal)),
-        "attempt 1/3 is logged before the retry");
-    Assert(parseLog.Lines.Exists(l => l.Contains("attempt 2/3", StringComparison.Ordinal) && l.Contains("retrying", StringComparison.Ordinal)),
-        "attempt 2/3 is logged before the retry");
-    Assert(parseLog.Lines.Exists(l => l.Contains("attempt=3/3", StringComparison.Ordinal)),
-        "the last request logs attempt 3/3");
-    Assert(!parseLog.Lines.Exists(l => l.Contains("attempt 3/3", StringComparison.Ordinal) && l.Contains("retrying", StringComparison.Ordinal)),
-        "the exhausted attempt is not logged as another retry");
+    Assert(!IsThinkingCorrection(parseFails.RequestBodies[0]), "the first call is the original prompt");
+    Assert(IsThinkingCorrection(parseFails.RequestBodies[1]) && IsThinkingCorrection(parseFails.RequestBodies[2]),
+        "later parse attempts are thinking corrections, not the same prompt");
+    Assert(ReadRequest(parseFails.RequestBodies[1]).Messages.Exists(m => (m.Content ?? "").Contains("{", StringComparison.Ordinal) && m.Role == "assistant"),
+        "the correction quotes the bad assistant content");
+    Assert(parseLog.Lines.Exists(l => l.Contains("attempt 1/3", StringComparison.Ordinal) && l.Contains("thinking correction", StringComparison.Ordinal)),
+        "attempt 1/3 is logged as a thinking correction");
+    Assert(parseLog.Lines.Exists(l => l.Contains("attempt 2/3", StringComparison.Ordinal) && l.Contains("thinking correction", StringComparison.Ordinal)),
+        "attempt 2/3 is logged as a thinking correction");
+    Assert(parseLog.Lines.Exists(l => l.Contains("attempt=3/3", StringComparison.Ordinal) && l.Contains("correction=yes", StringComparison.Ordinal)),
+        "the last request is logged as a correction");
+    Assert(!parseLog.Lines.Exists(l => l.Contains("attempt 3/3", StringComparison.Ordinal) && l.Contains("thinking correction", StringComparison.Ordinal)),
+        "the exhausted attempt does not schedule another correction");
+}
+
+ScriptedHandler repaired = new();
+string badPage = """{"pages":[{"page":"abc","ruleList":[]}]}""";
+repaired.EnqueueOk(Assistant(badPage));
+repaired.EnqueueOk(Assistant(StringPagePayload));
+using (HttpClient repairHttp = new(repaired) { BaseAddress = new Uri("http://llm.test") })
+{
+    LlmExtractionResult repairedResult = await MakeExtractor(repairHttp, attempts: 3).ExtractAsync(
+        [new OcrPageResult { Page = 26, Text = "正本成都交子商圈物业服务有限公司" }],
+        CancellationToken.None);
+    Assert(repaired.Calls == 2, $"type-wrong JSON is corrected on the next attempt (calls={repaired.Calls})");
+    Assert(repairedResult.Pages.Count == 1 && repairedResult.Pages[0].Page == 26,
+        "the thinking correction is parsed as the page result");
+    ChatCompletionRequest first = ReadRequest(repaired.RequestBodies[0]);
+    ChatCompletionRequest second = ReadRequest(repaired.RequestBodies[1]);
+    Assert(first.Thinking?.Type == "disabled", "the first call keeps configured thinking off");
+    Assert(second.Thinking?.Type == "enabled", "the correction forces thinking on");
+    Assert(second.Messages.Exists(m => m.Role == "assistant" && (m.Content ?? "").Contains("\"page\":\"abc\"", StringComparison.Ordinal)),
+        "the correction includes the bad response as the assistant turn");
+    Assert(second.Messages.Exists(m => m.Role == "user" && (m.Content ?? "").Contains("错误输出", StringComparison.Ordinal) && (m.Content ?? "").Contains("\"page\":\"abc\"", StringComparison.Ordinal)),
+        "the correction user message quotes the bad body");
 }
 
 ScriptedHandler oneShot = new();
@@ -365,26 +392,41 @@ using (HttpClient oneHttp = new(oneShot) { BaseAddress = new Uri("http://llm.tes
     Assert(once is not null && oneShot.Calls == 1, $"NerMaxAttempts=1 does not retry a parse failure (calls={oneShot.Calls})");
 }
 
-ListLog authLog = new();
+ListLog forbiddenLog = new();
 ScriptedHandler forbidden = new();
 forbidden.EnqueueStatus(HttpStatusCode.Forbidden, "{\"error\":\"bad key\"}");
+forbidden.EnqueueOk(Assistant("""{"companies":[],"persons":[]}"""));
 using (HttpClient forbidHttp = new(forbidden) { BaseAddress = new Uri("http://llm.test") })
 {
-    Exception? auth = await TryExtract(MakeExtractor(forbidHttp, attempts: 3, authLog));
-    Assert(forbidden.Calls == 1, $"403 is not retried (calls={forbidden.Calls})");
-    Assert(auth is HttpRequestException { StatusCode: HttpStatusCode.Forbidden },
-        $"403 throws with status ({auth?.GetType().Name}: {auth?.Message})");
-    Assert(authLog.Lines.Exists(l => l.Contains("not retrying", StringComparison.Ordinal) && l.Contains("403", StringComparison.Ordinal)),
-        "403 log says not retrying");
+    Exception? denied = await TryExtract(MakeExtractor(forbidHttp, attempts: 3, forbiddenLog));
+    Assert(denied is null && forbidden.Calls == 2, $"403 is retried (calls={forbidden.Calls}, {denied?.Message})");
+    Assert(forbiddenLog.Lines.Exists(l => l.Contains("retrying", StringComparison.Ordinal) && l.Contains("403", StringComparison.Ordinal)),
+        "403 log says retrying");
+    Assert(!forbiddenLog.Lines.Exists(l => l.Contains("not retrying", StringComparison.Ordinal)),
+        "403 is not treated as a hard auth failure");
 }
 
+ScriptedHandler always403 = new();
+always403.EnqueueStatus(HttpStatusCode.Forbidden, "{\"error\":\"bad key\"}");
+always403.EnqueueStatus(HttpStatusCode.Forbidden, "{\"error\":\"bad key\"}");
+always403.EnqueueStatus(HttpStatusCode.Forbidden, "{\"error\":\"bad key\"}");
+using (HttpClient alwaysForbidHttp = new(always403) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? denied = await TryExtract(MakeExtractor(alwaysForbidHttp, attempts: 3));
+    Assert(always403.Calls == 3 && denied is HttpRequestException { StatusCode: HttpStatusCode.Forbidden },
+        $"exhausted 403 still throws (calls={always403.Calls}, {denied?.GetType().Name}: {denied?.Message})");
+}
+
+ListLog authLog = new();
 ScriptedHandler unauthorized = new();
 unauthorized.EnqueueStatus(HttpStatusCode.Unauthorized, "{\"error\":\"no\"}");
 using (HttpClient unauthHttp = new(unauthorized) { BaseAddress = new Uri("http://llm.test") })
 {
-    Exception? auth = await TryExtract(MakeExtractor(unauthHttp, attempts: 3));
+    Exception? auth = await TryExtract(MakeExtractor(unauthHttp, attempts: 3, authLog));
     Assert(unauthorized.Calls == 1 && auth is HttpRequestException { StatusCode: HttpStatusCode.Unauthorized },
         $"401 is not retried (calls={unauthorized.Calls}, {auth?.Message})");
+    Assert(authLog.Lines.Exists(l => l.Contains("not retrying", StringComparison.Ordinal) && l.Contains("401", StringComparison.Ordinal)),
+        "401 log says not retrying");
 }
 
 ScriptedHandler badRequest = new();
@@ -487,6 +529,24 @@ static async Task<Exception?> TryExtract(LlmEntityExtractor extractor)
     }
 }
 
+static ChatCompletionRequest ReadRequest(string body) =>
+    JsonSerializer.Deserialize(body, AppJsonContext.Default.ChatCompletionRequest)
+    ?? throw new InvalidOperationException("empty chat request");
+
+static bool IsThinkingCorrection(string body)
+{
+    ChatCompletionRequest request = ReadRequest(body);
+    if (request.Thinking?.Type != "enabled")
+        return false;
+    foreach (ChatMessage message in request.Messages)
+    {
+        if (message.Role == "user" && (message.Content ?? "").Contains("错误输出", StringComparison.Ordinal))
+            return true;
+    }
+
+    return false;
+}
+
 static string UserText(string body)
 {
     ChatCompletionRequest? request = JsonSerializer.Deserialize(body, AppJsonContext.Default.ChatCompletionRequest);
@@ -498,8 +558,11 @@ static string UserText(string body)
 sealed class ScriptedHandler : HttpMessageHandler
 {
     private readonly Queue<Func<HttpResponseMessage>> _steps = new();
+    private readonly List<string> _requestBodies = [];
 
     public int Calls { get; private set; }
+
+    public IReadOnlyList<string> RequestBodies => _requestBodies;
 
     public void EnqueueOk(string json) => EnqueueStatus(HttpStatusCode.OK, json);
 
@@ -515,8 +578,10 @@ sealed class ScriptedHandler : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        if (request.Content is not null)
-            await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        string requestBody = request.Content is null
+            ? ""
+            : await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        _requestBodies.Add(requestBody);
         Calls++;
         if (_steps.Count == 0)
             throw new InvalidOperationException($"unexpected LLM call {Calls}");

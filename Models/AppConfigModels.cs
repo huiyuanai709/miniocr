@@ -62,8 +62,9 @@ public sealed class LlmFileConfig
 
     /// <summary>
     /// Chat-completion attempts per NER group, including the first call (clamped 1–8).
-    /// JSON parse failures and transient HTTP (408, 429, 5xx, timeouts, transport)
-    /// are retried with a short backoff. 401/403 are not. Default 3.
+    /// JSON parse failures spend the remaining attempts on a thinking-on correction that
+    /// quotes the bad reply. HTTP 403, 408, 429, 5xx, timeouts, and transport errors retry
+    /// the same request with a short backoff. 401 is not retried. Default 3.
     /// Env <c>MINIOCR_LLM_NER_MAX_ATTEMPTS</c> overrides this.
     /// </summary>
     public int NerMaxAttempts { get; set; } = 3;
@@ -150,7 +151,7 @@ public sealed class LlmRuntimeConfig
 
     /// <summary>
     /// Attempts per NER group, including the first call. Default 3.
-    /// Parse failures and transient HTTP are retried; 401/403 are not.
+    /// Parse failures become a thinking correction; HTTP 403 and other transient HTTP retry the same request. 401 does not.
     /// </summary>
     public int NerMaxAttempts { get; init; } = 3;
 
