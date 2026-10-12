@@ -173,8 +173,32 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_WECHAT_DIR` | `ocr.wechatDir` | 空 | 含 `mmmojo_64.dll` 的目录 |
 | `MINIOCR_WECHAT_INSTANCES` | `ocr.wechatInstances` | 1–3 | 插件进程数 |
 | `MINIOCR_WECHAT_FALLBACK` | `ocr.wechatFallbackToLocal` | true | 为 false 时找不到插件则退出 |
+| `MINIOCR_CHALLENGE_RESOURCE_DIR` | `challenge.resourceDir` | 空 | 比赛 PDF 目录。空则仍按 URL 下载。非空时只读，见下文 |
 
 未设置的引擎数、行内线程和检测线程按逻辑核数估算。显式环境变量或文件值优先。小显存 GPU 上引擎数会降为 1。
+
+### 比赛本地 PDF（`POST /challenge`、`POST /`、同步 `POST /ocr`）
+
+部署机上文件已经在 `/home/deploy/resource/f1.pdf` 这类路径时，不必再按请求里的 URL 下载。环境变量优先于 `config.json` 的 `challenge.resourceDir`。两者都空（默认）时行为与以前相同：`files[]` 里每一项都要有 `fileId` 和绝对的 http(s) `url`。
+
+目录非空时：
+
+- `files:[{"fileId":"f1"}]` 即可，`url` 可以不传。`f1` 打开 `{目录}/f1.pdf`。`fileId` 已经以 `.pdf` 结尾则不再追加；没有扩展名才追加 `.pdf`。
+- 只读。进程不会在该目录里创建、写入、截断、移动、改名或删除文件，也不会把原件挪进集群共享目录。容器里跑时把目录只读挂进去（`:ro`），不要给进程写权限。
+- 文件存在：读入内存，`downloadMode=local-resource`，不下载，也不做 URL 预取。日志带 `fileId`、解析后的路径和 `downloadMode`。
+- 文件不存在：若同时给了绝对 http(s) `url`，再按原来的方式下载（`downloadMode=url-fallback` 之后仍是实际下载模式）。没有可用 URL 时，该文件记空页并打警告，不让整个任务失败。
+- `fileId` 只能是目录下的单个文件名。含 `..`、斜杠或盘符的名字不会拼进目录。
+- 集群：协调进程把这份路径交给同机 worker（`LocalPath`），不复制到 `MINIOCR_CLUSTER_SHARED_DIR`，任务结束也不删除原件。每个进程都要设置同一个 `MINIOCR_CHALLENGE_RESOURCE_DIR`，worker 才能就地打开。看不到该文件的 worker 改为向协调进程下载内存里的副本。
+
+```bash
+MINIOCR_CHALLENGE_RESOURCE_DIR=/home/deploy/resource ./MiniOcr --urls http://0.0.0.0:5080
+```
+
+```bash
+curl -sS -X POST http://127.0.0.1:5080/challenge \
+  -H 'Content-Type: application/json' \
+  -d '{"teamId":1,"key":"k","callbackUrl":"https://example.test/cb","files":[{"fileId":"f1"}]}'
+```
 
 ## HTTP
 
@@ -266,6 +290,8 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 `llm.timeoutSeconds`、`maxCharsPerRequest`、`fallbackToHeuristics` 没有对应环境变量，写在 `config.docker.json`。OCR 为 Vulkan、4 个引擎、DPI 96、关闭方向分类。识别批大小不设 `MINIOCR_REC_BATCH`，24GB 显卡会保持较大的批。8 个进程各自的 `maxConcurrency` 是 16；出口压力大时用 `MINIOCR_LLM_MAX_CONCURRENCY` 调低。
 
 上传的 PDF 没有可再次下载的地址时，协调进程把它写到 `MINIOCR_CLUSTER_SHARED_DIR`（compose 里是卷 `miniocr-jobs`，挂到 `/var/lib/miniocr/jobs`）。同机的工作进程直接打开这个文件。路径不存在或长度对不上时，仍向协调进程下载。任务结束后删除该文件；渲染进程先放开对它的映射。别的机器上看不到这个路径，所以还是走下载。
+
+比赛目录 `MINIOCR_CHALLENGE_RESOURCE_DIR` 里的 PDF 不走上面的复制：worker 就地只读打开原件，任务结束不删除。该目录不要指到 `sharedDir`。
 
 ```bash
 git submodule update --init --recursive

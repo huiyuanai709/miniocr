@@ -23,6 +23,7 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
     private readonly ILogger<ChallengeJobService> _logger;
     private readonly ClusterCoordinator? _cluster;
     private readonly OcrTraceLog? _trace;
+    private readonly string _resourceDir;
     private readonly CancellationTokenSource _cts = new();
     private Task? _worker;
     private readonly SemaphoreSlim _jobGate = new(MaxConcurrentJobs, MaxConcurrentJobs);
@@ -33,7 +34,8 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         IHttpClientFactory httpClientFactory,
         ILogger<ChallengeJobService> logger,
         ClusterCoordinator? cluster = null,
-        OcrTraceLog? trace = null)
+        OcrTraceLog? trace = null,
+        ChallengeRuntimeConfig? challenge = null)
     {
         _downloader = downloader;
         _pipeline = pipeline;
@@ -41,6 +43,7 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         _logger = logger;
         _cluster = cluster;
         _trace = trace;
+        _resourceDir = challenge?.ResourceDir ?? "";
         _channel = Channel.CreateBounded<ChallengeJob>(new BoundedChannelOptions(32)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -145,19 +148,53 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         foreach (ChallengeFileRef file in job.Files)
         {
             string fileId = file.FileId ?? "";
-            string? url = file.Url;
-            if (string.IsNullOrWhiteSpace(url))
+            ChallengeResourceFiles.SourceDecision decision =
+                ChallengeResourceFiles.Decide(_resourceDir, file.FileId, file.Url);
+            if (decision.Kind == ChallengeResourceFiles.SourceKind.Missing)
             {
-                _logger.LogWarning("Skipping file with empty url: fileId={FileId}", fileId);
+                _logger.LogWarning(
+                    "Challenge file has no PDF: fileId={FileId}, path={Path}, downloadMode={Mode}",
+                    fileId,
+                    decision.LocalPath,
+                    _resourceDir.Length > 0 ? ChallengeResourceFiles.DownloadMode : "url");
                 results.Add(new ChallengeFileResult { FileId = fileId, Pages = [] });
                 continue;
             }
 
             try
             {
-                _cluster?.BeginSourcePrefetch(url);
-                ParallelPdfDownloader.DownloadResult download =
-                    await _downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+                ParallelPdfDownloader.DownloadResult download;
+                string? sourceUrl;
+                if (decision.Kind == ChallengeResourceFiles.SourceKind.Local)
+                {
+                    _logger.LogInformation(
+                        "Challenge file local resource: fileId={FileId}, path={Path}, downloadMode={Mode}",
+                        fileId,
+                        decision.LocalPath,
+                        ChallengeResourceFiles.DownloadMode);
+                    ChallengeResourceFiles.LocalRead local =
+                        ChallengeResourceFiles.ReadLocal(decision.LocalPath!);
+                    download = new ParallelPdfDownloader.DownloadResult(
+                        local.Buffer, local.Mode, local.ElapsedMs);
+                    // Path lets cluster workers open the same file. It is not an http URL, so no prefetch.
+                    sourceUrl = decision.LocalPath;
+                }
+                else
+                {
+                    string url = decision.Url!;
+                    if (decision.LocalPath is not null)
+                    {
+                        _logger.LogInformation(
+                            "Challenge file not in resource dir, downloading: fileId={FileId}, path={Path}, downloadMode=url-fallback",
+                            fileId,
+                            decision.LocalPath);
+                    }
+
+                    _cluster?.BeginSourcePrefetch(url);
+                    download = await _downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+                    sourceUrl = url;
+                }
+
                 using (download.Buffer)
                 {
                     string requestId = string.IsNullOrEmpty(job.RequestId) ? "" : job.RequestId;
@@ -166,28 +203,29 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
                         ? OcrTraceLog.BeginScope(requestId, entry, fileId, job.TeamId)
                         : null;
                     OcrResponse ocr = await _pipeline
-                        .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, sourceUrl: url)
+                        .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, sourceUrl: sourceUrl)
                         .ConfigureAwait(false);
 
                     if (_trace is { Enabled: true })
                     {
                         _trace.Text(
-                            entry, requestId, fileId, url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
-                            job.TeamId, download.Mode);
+                            entry, requestId, fileId, decision.Url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
+                            job.TeamId, download.Mode, path: decision.LocalPath);
                     }
 
                     ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(fileId, ocr);
                     results.Add(mapped);
                     _logger.LogInformation(
-                        "Challenge file done: fileId={FileId}, pages={Pages}, downloadMode={Mode}",
+                        "Challenge file done: fileId={FileId}, path={Path}, pages={Pages}, downloadMode={Mode}",
                         fileId,
+                        decision.LocalPath,
                         mapped.Pages.Count,
                         download.Mode);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Challenge file failed: fileId={FileId}", fileId);
+                _logger.LogError(ex, "Challenge file failed: fileId={FileId}, path={Path}", fileId, decision.LocalPath);
                 results.Add(new ChallengeFileResult { FileId = fileId, Pages = [] });
             }
         }

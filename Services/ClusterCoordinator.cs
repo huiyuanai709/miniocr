@@ -25,6 +25,7 @@ public sealed class ClusterCoordinator : IHostedService
     private readonly LlmEntityExtractor _llm;
     private readonly ILogger<ClusterCoordinator> _logger;
     private readonly OcrTraceLog? _trace;
+    private readonly string _resourceDir;
     private readonly ConcurrentDictionary<string, ClusterJob> _jobs = new(StringComparer.Ordinal);
     private readonly object _publish = new();
     private readonly CancellationTokenSource _cts = new();
@@ -38,7 +39,8 @@ public sealed class ClusterCoordinator : IHostedService
         ILogger<ClusterCoordinator> logger,
         LlmEntityExtractor llm,
         NacosClient? nacos = null,
-        OcrTraceLog? trace = null)
+        OcrTraceLog? trace = null,
+        ChallengeRuntimeConfig? challenge = null)
     {
         _config = config;
         _registry = registry;
@@ -47,6 +49,7 @@ public sealed class ClusterCoordinator : IHostedService
         _llm = llm;
         _logger = logger;
         _trace = trace;
+        _resourceDir = challenge?.ResourceDir ?? "";
     }
 
     public bool DistributedNer => _config.DistributedNer;
@@ -441,9 +444,26 @@ public sealed class ClusterCoordinator : IHostedService
         scheduler.SetHoldLocalWindow(expectRemote && _config.JoinGraceMs > 0);
 
         string sharedPath = "";
+        bool preserveShared = false;
+        string? traceSource = sourceUrl;
         try
         {
-        if (!ClusterSharedPdf.IsRemoteUrl(sourceUrl))
+        if (ChallengeResourceFiles.TryAdoptForCluster(_resourceDir, sourceUrl, pdfLength, out string resourcePath))
+        {
+            // Workers on this host open the contest PDF in place. Do not copy it into
+            // sharedDir and do not delete it when the job ends.
+            sharedPath = resourcePath;
+            preserveShared = true;
+            traceSource = resourcePath;
+            sourceUrl = null;
+            _logger.LogInformation(
+                "Cluster job {JobId} contest PDF in place: path={Path}, bytes={Bytes}, downloadMode={Mode}",
+                id,
+                resourcePath,
+                pdfLength,
+                ChallengeResourceFiles.DownloadMode);
+        }
+        else if (!ClusterSharedPdf.IsRemoteUrl(sourceUrl))
         {
             sharedPath = ClusterSharedPdf.TryWrite(
                 _config.SharedDir,
@@ -502,7 +522,10 @@ public sealed class ClusterCoordinator : IHostedService
         _jobs[id] = job;
 
         WarnModelMismatch(remotes, dpi);
-        _trace?.ClusterJob(id, sourceUrl, pageCount);
+        _trace?.ClusterJob(id, traceSource, pageCount);
+        string sourceLabel = preserveShared
+            ? ChallengeResourceFiles.DownloadMode
+            : string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator";
         if (streamClassify)
         {
             _logger.LogInformation(
@@ -513,7 +536,7 @@ public sealed class ClusterCoordinator : IHostedService
                 dpi,
                 remotes.Count,
                 localCap,
-                string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator",
+                sourceLabel,
                 string.IsNullOrEmpty(sharedPath) ? "off" : "file");
         }
         else
@@ -528,7 +551,7 @@ public sealed class ClusterCoordinator : IHostedService
                 dpi,
                 remotes.Count,
                 localCap,
-                string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator",
+                sourceLabel,
                 string.IsNullOrEmpty(sharedPath) ? "off" : "file");
         }
 
@@ -865,7 +888,16 @@ public sealed class ClusterCoordinator : IHostedService
         }
         finally
         {
-            ClusterSharedPdf.DeleteWhenDone(sharedPath, _logger);
+            if (preserveShared)
+            {
+                _logger.LogDebug(
+                    "Leaving contest PDF in place {Path} (resource dir is read-only)",
+                    sharedPath);
+            }
+            else
+            {
+                ClusterSharedPdf.DeleteWhenDone(sharedPath, _logger);
+            }
         }
     }
 
