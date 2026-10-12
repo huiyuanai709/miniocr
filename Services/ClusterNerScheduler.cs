@@ -488,13 +488,28 @@ public sealed class ClusterNerScheduler
 
             List<string> companies = [];
             List<string> persons = [];
+            List<ClusterNerEntityHit> hits = [];
             foreach (Group group in _groups.Values.OrderBy(g => g.Pages.Length == 0 ? int.MaxValue : g.Pages[0]))
             {
+                hits.AddRange(group.Entities);
                 companies.AddRange(group.Companies);
                 persons.AddRange(group.Persons);
             }
 
-            return EntityPostProcessor.Merge(pages, companies, persons);
+            if (hits.Count == 0)
+                return EntityPostProcessor.Merge(pages, companies, persons);
+
+            // Direction A: per-page model rules win. Attach them to the accepted page
+            // objects (the pipeline holds the same references) so the contest mapping
+            // passes the model count / originText through instead of re-counting.
+            foreach (ChallengePageResult ruled in ClusterNerAssembler.PagesFromHits(hits))
+            {
+                int index = ruled.Page - 1;
+                if (ruled.RuleList is { Count: > 0 } && (uint)index < (uint)_pageCount && _accepted[index] is not null)
+                    _accepted[index]!.RuleList = ruled.RuleList;
+            }
+
+            return ClusterNerAssembler.EntitiesFromHits(hits);
         }
     }
 
@@ -1044,5 +1059,161 @@ public static class ClusterNerAssembler
         }
 
         return hits;
+    }
+
+    /// <summary>
+    /// Direction A: turn the model's per-page ruleList into protocol hits. A page is kept
+    /// only when it belongs to this group (a page number taken from the lookahead head is
+    /// dropped), and the model's own <c>count</c> / <c>originText</c> are preserved.
+    /// </summary>
+    public static List<ClusterNerEntityHit> BuildFromPages(
+        IReadOnlyList<OcrPageResult> groupPages,
+        IReadOnlyList<ChallengePageResult> modelPages)
+    {
+        List<ClusterNerEntityHit> hits = [];
+        if (groupPages.Count == 0 || modelPages.Count == 0)
+            return hits;
+
+        HashSet<int> assigned = [];
+        foreach (OcrPageResult page in groupPages)
+            assigned.Add(page.Page);
+
+        foreach (ChallengePageResult page in modelPages)
+        {
+            if (!assigned.Contains(page.Page) || page.RuleList is null)
+                continue;
+            foreach (ChallengeRule rule in page.RuleList)
+            {
+                string kind = rule.RuleCode switch
+                {
+                    "B04" => "person",
+                    "B06" => "company",
+                    _ => "",
+                };
+                if (kind.Length == 0)
+                    continue;
+                foreach (ChallengeRuleItem item in rule.RuleItemList)
+                {
+                    string name = kind == "person" ? item.PersonName ?? "" : item.CompanyName ?? "";
+                    if (name.Length == 0)
+                        continue;
+                    hits.Add(new ClusterNerEntityHit
+                    {
+                        Kind = kind,
+                        Name = name,
+                        Page = page.Page,
+                        Count = Math.Max(1, item.Count),
+                        OriginText = item.OriginText ?? [],
+                    });
+                }
+            }
+        }
+
+        return hits;
+    }
+
+    /// <summary>Group per-page hits into contest rule lists (one object per page, B04 then B06).</summary>
+    public static List<ChallengePageResult> PagesFromHits(IEnumerable<ClusterNerEntityHit> hits)
+    {
+        SortedDictionary<int, List<ChallengeRuleItem>> persons = new();
+        SortedDictionary<int, List<ChallengeRuleItem>> companies = new();
+        HashSet<(int Page, string Kind, string Name)> seen = [];
+
+        foreach (ClusterNerEntityHit hit in hits)
+        {
+            if (hit.Page <= 0 || string.IsNullOrEmpty(hit.Name))
+                continue;
+            bool person = hit.Kind == "person";
+            if (!person && hit.Kind != "company")
+                continue;
+            string name = person ? EntityText.RepairPerson(hit.Name) : EntityText.Repair(hit.Name);
+            if (name.Length == 0 || !seen.Add((hit.Page, hit.Kind, name)))
+                continue;
+
+            SortedDictionary<int, List<ChallengeRuleItem>> bucket = person ? persons : companies;
+            if (!bucket.TryGetValue(hit.Page, out List<ChallengeRuleItem>? items))
+            {
+                items = [];
+                bucket[hit.Page] = items;
+            }
+
+            items.Add(new ChallengeRuleItem
+            {
+                PersonName = person ? name : null,
+                CompanyName = person ? null : name,
+                Count = Math.Max(1, hit.Count),
+                OriginText = hit.OriginText ?? [],
+            });
+        }
+
+        SortedSet<int> pageNumbers = [];
+        pageNumbers.UnionWith(persons.Keys);
+        pageNumbers.UnionWith(companies.Keys);
+        List<ChallengePageResult> pages = [];
+        foreach (int page in pageNumbers)
+        {
+            List<ChallengeRule> rules = [];
+            if (persons.TryGetValue(page, out List<ChallengeRuleItem>? personItems) && personItems.Count > 0)
+                rules.Add(new ChallengeRule { RuleCode = "B04", RuleName = "人员名称", RuleItemList = personItems });
+            if (companies.TryGetValue(page, out List<ChallengeRuleItem>? companyItems) && companyItems.Count > 0)
+                rules.Add(new ChallengeRule { RuleCode = "B06", RuleName = "公司名称", RuleItemList = companyItems });
+            if (rules.Count > 0)
+                pages.Add(new ChallengePageResult { Page = page, RuleList = rules });
+        }
+
+        return pages;
+    }
+
+    /// <summary>Aggregate per-page hits into document entities (count summed, pages listed).</summary>
+    public static OcrEntities EntitiesFromHits(IEnumerable<ClusterNerEntityHit> hits)
+    {
+        Dictionary<(string Kind, string Name), (int Count, SortedSet<int> Pages)> agg = new();
+
+        foreach (ClusterNerEntityHit hit in hits)
+        {
+            if (hit.Page <= 0 || string.IsNullOrEmpty(hit.Name))
+                continue;
+            bool person = hit.Kind == "person";
+            if (!person && hit.Kind != "company")
+                continue;
+            string name = person ? EntityText.RepairPerson(hit.Name) : EntityText.Repair(hit.Name);
+            if (name.Length == 0)
+                continue;
+
+            (string Kind, string Name) key = (hit.Kind, name);
+            if (!agg.TryGetValue(key, out (int Count, SortedSet<int> Pages) current))
+                current = (0, []);
+            current.Pages.Add(hit.Page);
+            agg[key] = (current.Count + Math.Max(1, hit.Count), current.Pages);
+        }
+
+        List<EntityHit> companies = [];
+        List<EntityHit> persons = [];
+        foreach (KeyValuePair<(string Kind, string Name), (int Count, SortedSet<int> Pages)> entry in agg)
+        {
+            EntityHit entity = new()
+            {
+                Name = entry.Key.Name,
+                Count = entry.Value.Count,
+                Pages = entry.Value.Pages.ToList(),
+            };
+            if (entry.Key.Kind == "person")
+                persons.Add(entity);
+            else
+                companies.Add(entity);
+        }
+
+        SortByCount(companies);
+        SortByCount(persons);
+        return new OcrEntities { Companies = companies, Persons = persons };
+    }
+
+    private static void SortByCount(List<EntityHit> hits)
+    {
+        hits.Sort(static (a, b) =>
+        {
+            int c = b.Count.CompareTo(a.Count);
+            return c != 0 ? c : string.CompareOrdinal(a.Name, b.Name);
+        });
     }
 }

@@ -140,7 +140,7 @@ Assert(firstBody.Contains("甲方北京华", StringComparison.Ordinal), "the fir
 Assert(firstBody.Contains("下一页开头", StringComparison.Ordinal), "single-node prompt marks the next-page head");
 Assert(firstBody.Contains("腾科技有限公司", StringComparison.Ordinal), "lookahead carries the split company tail");
 Assert(!firstBody.Contains("page 2", StringComparison.Ordinal), "the blank page is not a lookahead source");
-OcrEntities entities = await session.CompleteAsync();
+OcrEntities entities = (await session.CompleteAsync()).Entities;
 Assert(capture.Count == 2, "the trailing group is sent when the document ends");
 string secondBody = UserText(capture.Bodies[1]);
 Assert(secondBody.Contains("腾科技有限公司", StringComparison.Ordinal), "the last page is still sent");
@@ -171,6 +171,81 @@ Assert(joined.Contains("甲方北京华", StringComparison.Ordinal) && joined.Co
     "page 1, arriving second, still sees page 2's head");
 await outOfOrder.CompleteAsync();
 Assert(ordered.Count == 2, "both pages are sent once, including the page that arrived early");
+
+// Direction A: the model answers with per-page ruleList; its count and originText are kept.
+CaptureHandler pagesHandler = new()
+{
+    ResponseJson = """{"choices":[{"message":{"role":"assistant","content":"{\"pages\":[{\"page\":1,\"ruleList\":[{\"ruleCode\":\"B06\",\"ruleItemList\":[{\"companyName\":\"成都交子商圈物业服务有限公司\",\"count\":2,\"originText\":[\"正本成都交子商圈物业服务有限公司2026年度\"]}]}]}]}"}}]}""",
+};
+using HttpClient pagesHttp = new(pagesHandler) { BaseAddress = new Uri("http://llm.test") };
+LlmEntityExtractor pagesExtractor = new(pagesHttp, new LlmRuntimeConfig
+{
+    Enabled = true,
+    BaseUrl = "http://llm.test",
+    ApiKey = "test-key",
+    Model = "test-model",
+    TimeoutSeconds = 30,
+    PagesPerRequest = 1,
+    MaxCharsPerRequest = 100_000,
+    MaxConcurrency = 1,
+    JsonObject = true,
+}, new QuietLog());
+LlmExtractionResult pagesResult = await pagesExtractor.ExtractAsync(
+    [new OcrPageResult { Page = 1, Text = "正本成都交子商圈物业服务有限公司2026年度" }],
+    CancellationToken.None);
+Assert(pagesResult.Pages.Count == 1 && pagesResult.Pages[0].Page == 1, "per-page rules are returned");
+ChallengeRuleItem modelItem = pagesResult.Pages[0].RuleList[0].RuleItemList[0];
+Assert(modelItem.CompanyName == "成都交子商圈物业服务有限公司" && modelItem.Count == 2,
+    "model count and name are kept (no exact-match recompute)");
+Assert(pagesResult.Entities.Companies.Count == 0 && pagesResult.Entities.Persons.Count == 0,
+    "entities are left for the pipeline to derive from the page rules");
+string pagesBody = UserText(pagesHandler.Bodies[0]);
+Assert(pagesBody.Contains("--- page 1 ---", StringComparison.Ordinal), "per-page prompt still gets the page marker");
+
+// Direction A on the distributed path: per-page model rules become hits with the model's own count.
+List<ClusterNerEntityHit> pageHits = ClusterNerAssembler.BuildFromPages(
+    [new OcrPageResult { Page = 1, Text = "x" }],
+    [
+        new ChallengePageResult
+        {
+            Page = 1,
+            RuleList =
+            [
+                new ChallengeRule
+                {
+                    RuleCode = "B06",
+                    RuleItemList =
+                    [
+                        new ChallengeRuleItem
+                        {
+                            CompanyName = "成都交子商圈物业服务有限公司",
+                            Count = 2,
+                            OriginText = ["正本成都交子商圈物业服务有限公司"],
+                        },
+                    ],
+                },
+            ],
+        },
+        new ChallengePageResult
+        {
+            Page = 99,
+            RuleList =
+            [
+                new ChallengeRule
+                {
+                    RuleCode = "B06",
+                    RuleItemList = [new ChallengeRuleItem { CompanyName = "别家公司", Count = 5, OriginText = ["别家公司"] }],
+                },
+            ],
+        },
+    ]);
+Assert(pageHits.Count == 1 && pageHits[0].Page == 1 && pageHits[0].Count == 2,
+    "only assigned pages become hits and the model count is kept");
+OcrEntities fromHits = ClusterNerAssembler.EntitiesFromHits(pageHits);
+Assert(fromHits.Companies.Count == 1 && fromHits.Companies[0].Count == 2, "entity count follows the model");
+List<ChallengePageResult> roundTrip = ClusterNerAssembler.PagesFromHits(pageHits);
+Assert(roundTrip.Count == 1 && roundTrip[0].Page == 1 && roundTrip[0].RuleList[0].RuleItemList[0].Count == 2,
+    "hits round-trip back to per-page rules with the model count");
 
 AppConfigFile? redOff = JsonSerializer.Deserialize(
     """{"ocr":{"removeRedSeal":false}}""", AppJsonContext.Default.AppConfigFile);
@@ -209,6 +284,9 @@ sealed class CaptureHandler : HttpMessageHandler
 {
     private readonly List<string> _bodies = [];
     private readonly List<TaskCompletionSource<string>> _waiters = [];
+
+    public string ResponseJson { get; set; } =
+        """{"choices":[{"message":{"role":"assistant","content":"{\"companies\":[],\"persons\":[]}"}}]}""";
 
     public IReadOnlyList<string> Bodies
     {
@@ -257,7 +335,7 @@ sealed class CaptureHandler : HttpMessageHandler
                 _waiters[index].TrySetResult(body);
         }
 
-        string json = """{"choices":[{"message":{"role":"assistant","content":"{\"companies\":[],\"persons\":[]}"}}]}""";
+        string json = ResponseJson;
         return new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json"),

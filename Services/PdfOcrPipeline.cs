@@ -539,7 +539,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             }
         }
 
-        (OcrEntities entities, NerStages nerStages) = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+        (LlmExtractionResult nerResult, NerStages nerStages) = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+        OcrEntities entities = AttachModelPages(pages, nerResult);
         List<OcrPageResult> visible = VisiblePages(pages);
 
         totalSw.Stop();
@@ -736,7 +737,12 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             nerStages = new NerStages(tail, 0, clusterNerGroups, 0);
         }
         else
-            (entities, nerStages) = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+        {
+            (LlmExtractionResult nerResult, NerStages distributedStages) = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+            nerStages = distributedStages;
+            entities = AttachModelPages(pages, nerResult);
+        }
+
         List<OcrPageResult> visible = VisiblePages(pages);
         totalSw.Stop();
 
@@ -1366,7 +1372,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         return EntityExtractor.ToEntities(acc);
     }
 
-    private async Task<(OcrEntities Entities, NerStages Ner)> ExtractEntitiesAsync(
+    private async Task<(LlmExtractionResult Result, NerStages Ner)> ExtractEntitiesAsync(
         OcrPageResult[] pages,
         LlmEntityExtractor.LlmExtractionSession? ner)
     {
@@ -1378,31 +1384,58 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         {
             try
             {
-                OcrEntities llmEntities = await ner.CompleteAsync().ConfigureAwait(false);
+                LlmExtractionResult llm = await ner.CompleteAsync().ConfigureAwait(false);
                 _logger.LogInformation(
-                    "LLM NER done: companies={Companies}, persons={Persons}",
-                    llmEntities.Companies.Count,
-                    llmEntities.Persons.Count);
-                return (llmEntities, ner.Stages);
+                    "LLM NER done: pages={Pages}, companies={Companies}, persons={Persons}",
+                    llm.Pages.Count,
+                    llm.Entities.Companies.Count,
+                    llm.Entities.Persons.Count);
+                return (llm, ner.Stages);
             }
             catch (Exception ex)
             {
                 _logger.LogError(
                     ex,
                     "LLM NER failed; returning empty entities (no heuristic fallback after LLM)");
-                return (new OcrEntities(), ner.Stages);
+                return (new LlmExtractionResult(), ner.Stages);
             }
         }
 
         if (fallbackWhenNoLlm)
         {
             List<string> texts = pages.Select(p => p.Text ?? "").ToList();
-            return (EntityExtractor.ExtractFromPages(texts), default);
+            return (new LlmExtractionResult { Entities = EntityExtractor.ExtractFromPages(texts) }, default);
         }
 
         _logger.LogInformation(
             "LLM NER unused/unconfigured and fallbackToHeuristics=false — empty entities");
-        return (new OcrEntities(), default);
+        return (new LlmExtractionResult(), default);
+    }
+
+    /// <summary>
+    /// Direction A: when the model returned per-page rules, put them on the pages
+    /// so the contest mapping passes them through verbatim (model count / originText),
+    /// and derive <see cref="OcrEntities"/> from those rules. No fallback: an empty
+    /// <c>originText</c> stays empty. Otherwise keep the flat name-list path
+    /// (deterministic counting).
+    /// </summary>
+    private static OcrEntities AttachModelPages(OcrPageResult[] pages, LlmExtractionResult result)
+    {
+        if (result.Pages.Count == 0)
+            return result.Entities;
+
+        Dictionary<int, ChallengePageResult> byPage = [];
+        foreach (ChallengePageResult page in result.Pages)
+            byPage[page.Page] = page;
+
+        foreach (OcrPageResult page in pages)
+        {
+            if (page is null || !byPage.TryGetValue(page.Page, out ChallengePageResult? model) || model.RuleList is null)
+                continue;
+            page.RuleList = model.RuleList;
+        }
+
+        return EntitiesFromVisionPages(pages);
     }
 
     private sealed class TextLayerPlan

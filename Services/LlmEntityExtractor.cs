@@ -13,6 +13,7 @@ namespace MiniOcr.Services;
 public sealed class LlmEntityExtractor
 {
     private const string SystemPrompt = NerPrompt.Text;
+    private const string SystemPromptPages = NerPrompt.TextPages;
 
     private readonly HttpClient _http;
     private readonly LlmRuntimeConfig _config;
@@ -57,7 +58,7 @@ public sealed class LlmEntityExtractor
         return new LlmExtractionSession(this, pageCount, concurrency, ct);
     }
 
-    public Task<OcrEntities> ExtractAsync(
+    public Task<LlmExtractionResult> ExtractAsync(
         IReadOnlyList<OcrPageResult> pages,
         CancellationToken ct)
     {
@@ -74,23 +75,55 @@ public sealed class LlmEntityExtractor
         return session.CompleteAsync();
     }
 
-    public Task<LlmEntityPayload> ExtractBatchAsync(
+    public async Task<LlmEntityPayload> ExtractBatchAsync(
         string userText,
         IReadOnlyList<int> pageNumbers,
-        CancellationToken ct) =>
-        CompleteBatchAsync(new LlmPageGrouper.PageBatch(userText, pageNumbers as int[] ?? pageNumbers.ToArray()), ct);
+        CancellationToken ct)
+    {
+        BatchResult result = await CompleteBatchAsync(
+            new LlmPageGrouper.PageBatch(userText, pageNumbers as int[] ?? pageNumbers.ToArray()),
+            pagesMode: false,
+            ct).ConfigureAwait(false);
+        return new LlmEntityPayload { Companies = result.Companies, Persons = result.Persons };
+    }
+
+    /// <summary>Per-page batch call used by the distributed NER path (direction A).</summary>
+    internal async Task<List<ChallengePageResult>> ExtractPagesBatchAsync(
+        string userText,
+        IReadOnlyList<int> pageNumbers,
+        CancellationToken ct)
+    {
+        BatchResult result = await CompleteBatchAsync(
+            new LlmPageGrouper.PageBatch(userText, pageNumbers as int[] ?? pageNumbers.ToArray()),
+            pagesMode: true,
+            ct).ConfigureAwait(false);
+        return result.Pages;
+    }
 
     public async Task<ClusterNerResultRequest> ExtractDistributedAsync(
         ClusterNerAssignment claim,
         CancellationToken ct)
     {
         string prompt = ClusterNerPrompt.WithLookahead(claim.PromptText, claim.Lookahead, claim.LookaheadPage);
-        LlmEntityPayload payload = await ExtractBatchAsync(prompt, claim.Pages, ct).ConfigureAwait(false);
+        List<ChallengePageResult> modelPages = await ExtractPagesBatchAsync(prompt, claim.Pages, ct)
+            .ConfigureAwait(false);
+        List<ClusterNerEntityHit> hits = ClusterNerAssembler.BuildFromPages(claim.Bodies, modelPages);
+
+        List<string> companies = [];
+        List<string> persons = [];
+        foreach (ClusterNerEntityHit hit in hits)
+        {
+            if (hit.Kind == "company")
+                companies.Add(hit.Name);
+            else if (hit.Kind == "person")
+                persons.Add(hit.Name);
+        }
+
         return new ClusterNerResultRequest
         {
-            Companies = payload.Companies,
-            Persons = payload.Persons,
-            Entities = ClusterNerAssembler.Build(claim.Bodies, claim.Lookahead, payload),
+            Companies = companies,
+            Persons = persons,
+            Entities = hits,
         };
     }
 
@@ -111,6 +144,7 @@ public sealed class LlmEntityExtractor
         private readonly List<Task> _tasks = [];
         private readonly List<string> _companies = [];
         private readonly List<string> _persons = [];
+        private readonly Dictionary<int, ChallengePageResult> _pageRules = [];
         private LlmPageGrouper.PageBatch? _held;
         private long _requestTicks;
         private long _firstStart;
@@ -147,7 +181,7 @@ public sealed class LlmEntityExtractor
                 Queue(batch);
         }
 
-        public async Task<OcrEntities> CompleteAsync()
+        public async Task<LlmExtractionResult> CompleteAsync()
         {
             List<LlmPageGrouper.PageBatch> tail;
             OcrPageResult[] pages;
@@ -170,11 +204,11 @@ public sealed class LlmEntityExtractor
                 {
                     _owner._logger.LogInformation(
                         "LLM NER: no non-empty pages; skipping chat completions");
-                    return MergeToEntities(pages, _companies, _persons);
+                    return BuildResult(pages);
                 }
 
                 await Task.WhenAll(pending).ConfigureAwait(false);
-                return MergeToEntities(pages, _companies, _persons);
+                return BuildResult(pages);
             }
             finally
             {
@@ -192,6 +226,25 @@ public sealed class LlmEntityExtractor
                 _slots.Dispose();
                 _failCts.Dispose();
             }
+        }
+
+        /// <summary>
+        /// Model-side per-page rules win when present; otherwise fall back to the
+        /// flat name lists merged against the pages.
+        /// </summary>
+        private LlmExtractionResult BuildResult(OcrPageResult[] pages)
+        {
+            List<ChallengePageResult> modelPages;
+            OcrEntities entities;
+            lock (_gate)
+            {
+                modelPages = _pageRules.Values.OrderBy(p => p.Page).ToList();
+                entities = modelPages.Count > 0
+                    ? new OcrEntities()
+                    : MergeToEntities(pages, _companies, _persons);
+            }
+
+            return new LlmExtractionResult { Entities = entities, Pages = modelPages };
         }
 
         private NerStages SnapshotStages()
@@ -306,34 +359,30 @@ public sealed class LlmEntityExtractor
                 StageClock.RaisePeak(ref _peak, now);
                 start = StageClock.Stamp();
                 started = true;
-                LlmEntityPayload payload = await _owner.CompleteBatchAsync(batch, _failCts.Token)
+                BatchResult payload = await _owner.CompleteBatchAsync(batch, pagesMode: true, _failCts.Token)
                     .ConfigureAwait(false);
 
                 List<string> localCompanies = [];
                 List<string> localPersons = [];
-                if (payload.Companies is not null)
+                foreach (string c in payload.Companies)
                 {
-                    foreach (string c in payload.Companies)
-                    {
-                        if (!string.IsNullOrWhiteSpace(c))
-                            localCompanies.Add(c);
-                    }
+                    if (!string.IsNullOrWhiteSpace(c))
+                        localCompanies.Add(c);
                 }
 
-                if (payload.Persons is not null)
+                foreach (string person in payload.Persons)
                 {
-                    foreach (string person in payload.Persons)
-                    {
-                        if (!string.IsNullOrWhiteSpace(person))
-                            localPersons.Add(person);
-                    }
+                    if (!string.IsNullOrWhiteSpace(person))
+                        localPersons.Add(person);
                 }
 
-                if (localCompanies.Count == 0 && localPersons.Count == 0)
+                if (payload.Pages.Count == 0 && localCompanies.Count == 0 && localPersons.Count == 0)
                     return;
 
                 lock (_gate)
                 {
+                    foreach (ChallengePageResult page in payload.Pages)
+                        _pageRules[page.Page] = page;
                     _companies.AddRange(localCompanies);
                     _persons.AddRange(localPersons);
                 }
@@ -376,8 +425,9 @@ public sealed class LlmEntityExtractor
         }
     }
 
-    private async Task<LlmEntityPayload> CompleteBatchAsync(
+    private async Task<BatchResult> CompleteBatchAsync(
         LlmPageGrouper.PageBatch batch,
+        bool pagesMode,
         CancellationToken ct)
     {
         Exception? parseError = null;
@@ -385,7 +435,7 @@ public sealed class LlmEntityExtractor
         {
             try
             {
-                return await CompleteBatchOnceAsync(batch, ct).ConfigureAwait(false);
+                return await CompleteBatchOnceAsync(batch, pagesMode, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (attempt == 0 && LlmJson.IsParseFailure(ex) && !ct.IsCancellationRequested)
             {
@@ -400,8 +450,9 @@ public sealed class LlmEntityExtractor
         throw parseError ?? new InvalidOperationException("LLM NER JSON parse failed.");
     }
 
-    private async Task<LlmEntityPayload> CompleteBatchOnceAsync(
+    private async Task<BatchResult> CompleteBatchOnceAsync(
         LlmPageGrouper.PageBatch batch,
+        bool pagesMode,
         CancellationToken ct)
     {
         string userText = batch.Text;
@@ -415,7 +466,7 @@ public sealed class LlmEntityExtractor
             ResponseFormat = jsonMode ? LlmJson.JsonObject : null,
             Messages =
             [
-                new ChatMessage { Role = "system", Content = SystemPrompt },
+                new ChatMessage { Role = "system", Content = pagesMode ? SystemPromptPages : SystemPrompt },
                 new ChatMessage { Role = "user", Content = userText },
             ],
         };
@@ -437,8 +488,117 @@ public sealed class LlmEntityExtractor
             throw new InvalidOperationException("LLM returned empty message content.");
 
         string json = NerPrompt.ExtractJsonObject(content);
+        BatchResult result = new();
+
+        // Per-page payload (direction A) wins; a flat name list is the fallback shape.
+        LlmPagesPayload? pages = LlmJson.Deserialize<LlmPagesPayload>(json);
+        if (pages?.Pages is { Count: > 0 })
+        {
+            result.Pages.AddRange(SanitizePages(pages.Pages));
+            return result;
+        }
+
         LlmEntityPayload? payload = LlmJson.Deserialize<LlmEntityPayload>(json);
-        return payload ?? new LlmEntityPayload();
+        if (payload?.Companies is not null)
+        {
+            foreach (string c in payload.Companies)
+            {
+                if (!string.IsNullOrWhiteSpace(c))
+                    result.Companies.Add(c);
+            }
+        }
+
+        if (payload?.Persons is not null)
+        {
+            foreach (string p in payload.Persons)
+            {
+                if (!string.IsNullOrWhiteSpace(p))
+                    result.Persons.Add(p);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>Model-produced per-page rules: keep B04/B06 only, repair names, drop empties.</summary>
+    internal static List<ChallengePageResult> SanitizePages(IEnumerable<LlmPageEntities> raw)
+    {
+        List<ChallengePageResult> pages = [];
+        foreach (LlmPageEntities page in raw)
+        {
+            if (page.Page <= 0 || page.RuleList is null)
+                continue;
+            List<ChallengeRule> rules = SanitizeRules(page.RuleList);
+            if (rules.Count == 0)
+                continue;
+            pages.Add(new ChallengePageResult { Page = page.Page, RuleList = rules });
+        }
+
+        return pages;
+    }
+
+    private static List<ChallengeRule> SanitizeRules(IEnumerable<ChallengeRule> raw)
+    {
+        List<ChallengeRule> rules = [];
+        foreach (ChallengeRule rule in raw)
+        {
+            string code = (rule.RuleCode ?? "").Trim().ToUpperInvariant();
+            if (code is not ("B04" or "B06") || rule.RuleItemList is null)
+                continue;
+            bool person = code == "B04";
+            List<ChallengeRuleItem> items = [];
+            HashSet<string> seen = new(StringComparer.Ordinal);
+            foreach (ChallengeRuleItem item in rule.RuleItemList)
+            {
+                string name = person
+                    ? EntityText.RepairPerson(item.PersonName)
+                    : EntityText.Repair(item.CompanyName);
+                if (name.Length == 0 || !seen.Add(EntityText.Identity(name)))
+                    continue;
+
+                List<string> origins = [];
+                if (item.OriginText is not null)
+                {
+                    foreach (string origin in item.OriginText)
+                    {
+                        if (string.IsNullOrWhiteSpace(origin))
+                            continue;
+                        string s = origin.Trim();
+                        origins.Add(s.Length > ChallengeResultMapper.OriginMaxLen
+                            ? s[..ChallengeResultMapper.OriginMaxLen]
+                            : s);
+                    }
+                }
+
+                items.Add(new ChallengeRuleItem
+                {
+                    PersonName = person ? name : null,
+                    CompanyName = person ? null : name,
+                    Count = item.Count > 0 ? item.Count : Math.Max(1, origins.Count),
+                    OriginText = origins,
+                });
+            }
+
+            if (items.Count == 0)
+                continue;
+
+            rules.Add(new ChallengeRule
+            {
+                RuleCode = code,
+                RuleName = person ? "人员名称" : "公司名称",
+                RuleItemList = items,
+            });
+        }
+
+        return rules;
+    }
+
+    /// <summary>One batch's model output before it is folded into the session result.</summary>
+    private sealed class BatchResult
+    {
+        public List<ChallengePageResult> Pages { get; } = [];
+        public List<string> Companies { get; } = [];
+        public List<string> Persons { get; } = [];
     }
 
     private async Task<string> PostChatAsync(

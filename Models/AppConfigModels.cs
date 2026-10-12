@@ -282,6 +282,34 @@ public sealed class LlmEntityPayload
 }
 
 /// <summary>
+/// Per-page LLM NER payload (model-side extraction). The model returns the
+/// contest-shaped <c>ruleList</c> for every page it saw, carrying its own
+/// <c>count</c> and <c>originText</c> instead of a flat, page-agnostic name list.
+/// </summary>
+public sealed class LlmPagesPayload
+{
+    public List<LlmPageEntities>? Pages { get; set; }
+}
+
+/// <summary>One page block of <see cref="LlmPagesPayload"/>; <see cref="Page"/> is the PDF page number.</summary>
+public sealed class LlmPageEntities
+{
+    public int Page { get; set; }
+    public List<ChallengeRule>? RuleList { get; set; }
+}
+
+/// <summary>
+/// Result of one LLM NER pass. When <see cref="Pages"/> is non-empty the model
+/// produced per-page rules and <see cref="Entities"/> is left empty for the caller
+/// to derive from those rules; otherwise the flat <see cref="Entities"/> names are used.
+/// </summary>
+public sealed class LlmExtractionResult
+{
+    public OcrEntities Entities { get; init; } = new();
+    public List<ChallengePageResult> Pages { get; init; } = [];
+}
+
+/// <summary>
 /// Vision OCR page payload. Prefer contest-shaped <see cref="RuleList"/>;
 /// <see cref="Text"/> is full-page OCR text used for origin snippets / fallback mapping.
 /// </summary>
