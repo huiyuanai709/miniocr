@@ -18,6 +18,7 @@
     <Compile Include="..\..\Services\EntityText.cs" Link="EntityText.cs" />
     <Compile Include="..\..\Services\ChallengeResultMapper.cs" Link="ChallengeResultMapper.cs" />
     <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />
+    <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
     <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
     <Compile Include="..\..\Models\ClusterModels.cs" Link="ClusterModels.cs" />
   </ItemGroup>

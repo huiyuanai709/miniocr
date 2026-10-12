@@ -17,6 +17,7 @@
     <Compile Include="..\..\Services\LlmPageGrouper.cs" Link="LlmPageGrouper.cs" />
     <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />
     <Compile Include="..\..\Models\ClusterModels.cs" Link="ClusterModels.cs" />
+    <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
     <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
   </ItemGroup>
 </Project>
