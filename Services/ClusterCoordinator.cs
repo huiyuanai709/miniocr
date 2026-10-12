@@ -458,7 +458,8 @@ public sealed class ClusterCoordinator : IHostedService
         CancellationToken ct,
         Func<ClusterJob, CancellationToken, Task>? alongside = null,
         Func<ChannelReader<(string BatchId, int Page)>, ClusterJob, CancellationToken, Task>? recognizeFeed = null,
-        Action? onOcrReady = null)
+        Action? onOcrReady = null,
+        Action? onGpuReady = null)
     {
         string id = Guid.NewGuid().ToString("N");
         List<ClusterRemote> remotes = _registry.Remotes();
@@ -601,6 +602,43 @@ public sealed class ClusterCoordinator : IHostedService
         }
 
         using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        async Task WatchGpuRoomAsync()
+        {
+            if (onGpuReady is null)
+                return;
+            while (!linked.IsCancellationRequested)
+            {
+                long seen = scheduler.Version;
+                if (scheduler.GpuHasRoom())
+                {
+                    ClusterScheduleSnapshot snap = scheduler.Snapshot();
+                    if (!snap.Complete)
+                    {
+                        _logger.LogInformation(
+                            "Cluster job {JobId} OCR queue is empty with spare slots: done={Done}/{Pages} leased={Leased}; next PDF may start",
+                            id,
+                            snap.Done,
+                            pageCount,
+                            snap.LeasedPages);
+                    }
+
+                    onGpuReady();
+                    return;
+                }
+
+                try
+                {
+                    await scheduler.WaitForChangeAsync(seen, TimeSpan.FromSeconds(2), linked.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+        }
+
+        Task gpuRoom = onGpuReady is null ? Task.CompletedTask : WatchGpuRoomAsync();
         Task? classify = alongside is null
             ? null
             : Task.Run(() => alongside(job, linked.Token), CancellationToken.None);
@@ -863,6 +901,7 @@ public sealed class ClusterCoordinator : IHostedService
         {
             job.MarkFinished();
             await linked.CancelAsync().ConfigureAwait(false);
+            await Quiet(gpuRoom).ConfigureAwait(false);
             if (classify is not null)
                 await Quiet(classify).ConfigureAwait(false);
             await Quiet(notify).ConfigureAwait(false);

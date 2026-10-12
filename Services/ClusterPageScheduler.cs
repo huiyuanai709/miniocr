@@ -244,6 +244,57 @@ public sealed class ClusterPageScheduler
         get { lock (_gate) return _done == _pageCount; }
     }
 
+    /// <summary>
+    /// Admission is finished, the claim queue is empty, and the pages still on GPUs are fewer
+    /// than the combined capacity of nodes that have joined this file. The next PDF can start:
+    /// nodes that already dropped to zero in-flight take it, and nodes still holding pages keep
+    /// those pages at full speed.
+    /// </summary>
+    public bool GpuHasRoom()
+    {
+        lock (_gate)
+            return GpuHasRoomCore();
+    }
+
+    private bool GpuHasRoomCore()
+    {
+        if (_admissionOpen || _invisible > 0)
+            return false;
+        if (_pending.Count > 0)
+            return false;
+        int remaining = _pageCount - _done;
+        if (remaining <= 0)
+            return true;
+
+        HashSet<string> live = new(StringComparer.Ordinal);
+        foreach ((string node, int pages) in _committed)
+        {
+            if (pages > 0)
+                live.Add(node);
+        }
+
+        foreach (Lease lease in _leases.Values)
+        {
+            foreach (int index in lease.Pages)
+            {
+                if ((uint)index < (uint)_pageCount && !_pages[index].Done)
+                {
+                    live.Add(lease.NodeId);
+                    break;
+                }
+            }
+        }
+
+        int slots = 0;
+        foreach (string node in live)
+        {
+            if (_caps.TryGetValue(node, out int cap))
+                slots += Math.Max(1, cap);
+        }
+
+        return slots > 0 && remaining < slots;
+    }
+
     public long Version
     {
         get { lock (_gate) return _version; }

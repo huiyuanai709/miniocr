@@ -9,10 +9,12 @@ using SkiaSharp;
 namespace MiniOcr.Services;
 
 /// <summary>
-/// One PDF. <see cref="OcrCompleted"/> finishes when GPU OCR for this file is done
-/// (the next file may start). <see cref="Response"/> still waits for NER.
+/// One PDF. <see cref="ReleaseNext"/> finishes when the next file may take a free GPU
+/// (cluster: the claim queue is empty and a slot is spare; otherwise when OCR finishes).
+/// <see cref="OcrCompleted"/> finishes when GPU OCR for this file is done.
+/// <see cref="Response"/> still waits for NER.
 /// </summary>
-public readonly record struct PdfOcrRun(Task OcrCompleted, Task<OcrResponse> Response);
+public readonly record struct PdfOcrRun(Task OcrCompleted, Task<OcrResponse> Response, Task ReleaseNext);
 
 public sealed class PdfOcrPipeline : IAsyncDisposable
 {
@@ -97,7 +99,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         Stopwatch totalSw = Stopwatch.StartNew();
         byte[] array = pdf.DangerousGetArray();
         int length = pdf.Length;
-        return ProcessCoreAsync(array, length, downloadMs, downloadMode, totalSw, dpiOverride, sourceUrl, ct, onOcrReady: null);
+        return ProcessCoreAsync(array, length, downloadMs, downloadMode, totalSw, dpiOverride, sourceUrl, ct, onOcrReady: null, onGpuReady: null);
     }
 
     /// <summary>
@@ -114,11 +116,19 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int? dpiOverride = null,
         string? sourceUrl = null)
     {
-        TaskCompletionSource gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource ocrGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource nextGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Stopwatch totalSw = Stopwatch.StartNew();
         byte[] array = pdf.DangerousGetArray();
         int length = pdf.Length;
-        return new PdfOcrRun(gate.Task, Run());
+        return new PdfOcrRun(ocrGate.Task, Run(), nextGate.Task);
+
+        void ReleaseNext(string reason)
+        {
+            if (!nextGate.TrySetResult())
+                return;
+            _logger.LogInformation("Next PDF may start ({Reason})", reason);
+        }
 
         async Task<OcrResponse> Run()
         {
@@ -126,18 +136,25 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             {
                 return await ProcessCoreAsync(
                     array, length, downloadMs, downloadMode, totalSw, dpiOverride, sourceUrl, ct,
-                    () => gate.TrySetResult()).ConfigureAwait(false);
+                    () =>
+                    {
+                        ocrGate.TrySetResult();
+                        ReleaseNext("ocr-complete");
+                    },
+                    () => ReleaseNext("gpu-room")).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                gate.TrySetException(ex);
+                ocrGate.TrySetException(ex);
+                nextGate.TrySetException(ex);
                 throw;
             }
             finally
             {
                 // Paths with no separate NER stage (vision) signal here, after OCR.
                 // An earlier signal makes this a no-op.
-                gate.TrySetResult();
+                ocrGate.TrySetResult();
+                nextGate.TrySetResult();
             }
         }
     }
@@ -151,7 +168,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int? dpiOverride,
         string? sourceUrl,
         CancellationToken ct,
-        Action? onOcrReady)
+        Action? onOcrReady,
+        Action? onGpuReady)
     {
         try
         {
@@ -173,7 +191,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 "OCR pipeline (cluster): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, mode={Mode}",
                 pageCount, pdfByteCount, dpi, _config.Mode);
             return await ProcessDistributedAsync(
-                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, sourceUrl, totalSw, ct, onOcrReady)
+                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, sourceUrl, totalSw, ct, onOcrReady, onGpuReady)
                 .ConfigureAwait(false);
         }
 
@@ -674,7 +692,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         string? sourceUrl,
         Stopwatch totalSw,
         CancellationToken ct,
-        Action? onOcrReady)
+        Action? onOcrReady,
+        Action? onGpuReady)
     {
         bool vision = _config.IsLlmMode;
         bool distributeNer = !vision && _cluster!.DistributedNer;
@@ -761,7 +780,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     },
                     token,
                     string.IsNullOrEmpty(job.SharedPath) ? null : job.SharedPath),
-                onOcrReady: onOcrReady).ConfigureAwait(false);
+                onOcrReady: onOcrReady,
+                onGpuReady: onGpuReady).ConfigureAwait(false);
             jobId = outcome.JobId;
             distributedEntities = outcome.UsedDistributedNer ? outcome.Entities ?? new OcrEntities() : null;
             clusterOcrDoneMs = outcome.OcrDoneMs;
@@ -1478,10 +1498,9 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
     /// <summary>
     /// Direction A: when the model returned per-page rules, put them on the pages
-    /// so the contest mapping passes them through verbatim (model count / originText),
-    /// and derive <see cref="OcrEntities"/> from those rules. No fallback: an empty
-    /// <c>originText</c> stays empty. Otherwise keep the flat name-list path
-    /// (deterministic counting).
+    /// so the contest mapping passes them through (model count, locally rebuilt
+    /// <c>originText</c> when the model omitted it), and derive <see cref="OcrEntities"/>
+    /// from those rules. Otherwise keep the flat name-list path (deterministic counting).
     /// </summary>
     private static OcrEntities AttachModelPages(OcrPageResult[] pages, LlmExtractionResult result)
     {

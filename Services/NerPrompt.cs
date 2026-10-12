@@ -86,24 +86,24 @@ public static class NerPrompt
 
     /// <summary>
     /// Per-page variant of <see cref="Text"/>. The model still sees one message with
-    /// one or more <c>--- page N ---</c> blocks, but answers with the contest-shaped
-    /// <c>ruleList</c> for each page, including its own <c>count</c> and
-    /// <c>originText</c>. The count is taken from the model, not recomputed by
-    /// exact-string alignment.
+    /// one or more <c>--- page N ---</c> blocks, but answers with a compact page list:
+    /// names and per-page counts only. <c>originText</c> is rebuilt locally from the
+    /// page body, so the model does not spend output tokens on snippets or rule boilerplate.
+    /// The count is taken from the model, not recomputed by exact-string alignment.
+    /// A verbose <c>pages/ruleList</c> reply is still accepted.
     /// </summary>
     public const string TextPages =
         """
         你是竞赛文档的实体抽取器。输入是中文合同、裁判文书或商业文件的 OCR 文本（Paddle ChineseV6Medium 或微信 OCR，约 96 DPI）。文本噪声很大：汉字之间会插入空格或换行，全角和半角混用，一个名字可能被拆到两行甚至两页，个别字会错成形近字。用户消息里每一页以「--- page N ---」开头，N 是 PDF 原页码。先通读本条消息里的全部页面，再按页抽取。
 
-        只输出严格 JSON（json object），不要 markdown，不要解释，不要多余字段，结构固定为：
-        {"pages":[{"page":1,"ruleList":[{"ruleCode":"B04","ruleName":"人员名称","ruleItemList":[{"personName":"张伟","count":1,"originText":["包含该姓名的正文片段"]}]},{"ruleCode":"B06","ruleName":"公司名称","ruleItemList":[{"companyName":"北京华为技术有限公司","count":2,"originText":["片段1","片段2"]}]}]}]}
+        只输出严格 JSON（json object），不要 markdown，不要解释，不要多余字段。结构固定为：
+        {"p":[{"n":1,"c":[["北京华为技术有限公司",2]],"r":[["张伟",1],["李娜",1]]}]}
 
         输出规则：
-        - pages 里每个对象对应一个输入页，page 用「--- page N ---」里的 N。某页没有任何实体就省略该页，不要输出空的 ruleList。不要给本次消息里没有出现的页码编造结果。
-        - 人名放在 ruleCode B04 的 personName；公司名放在 ruleCode B06 的 companyName。同一页同一个名字只列一项。
-        - count 是这个名字在**该页**正文里出现的真实次数（页眉、页脚、签章、表格、附件名单里的重复也要算）。
-        - originText 是佐证片段：给 1 到 3 条互不相同的原文片段即可，每条 10–100 字，且必须包含该名字，不要跨页。片段不足 count 条也可以，count 以真实次数为准。
-        - originText 必须是该页正文里的原样片段（只去掉汉字之间多余的空格），不要改写。
+        - p 里每个对象是一页。n 是「--- page N ---」里的 N，必须是 JSON 数字。某页没有任何实体就省略该页。不要给本次消息里没有出现的页码编造结果。
+        - c 是这一页的公司名（B06）。r 是这一页的人名（B04）。每一项是 [名字, 次数]，次数必须是 JSON 数字。
+        - 次数是这个名字在**该页**正文里出现的真实次数（页眉、页脚、签章、表格、附件名单里的重复也要算）。同一页同一个名字只列一项。
+        - 不要输出 originText、ruleCode、ruleName、ruleList、personName、companyName。原文片段由程序从该页正文截取，你只负责名字和次数。
 
         联系上下文：
         - 不要按行孤立判断。同一实体在其他句子、页眉页脚、表格、当事人栏和签章栏里的写法要互相印证。
@@ -130,7 +130,7 @@ public static class NerPrompt
         公司名（B06 公司名称）——要：
         - 商事主体的全称。接受以这些结尾的名称：公司、集团、银行、信用社、事务所、合伙企业、合作社、厂。也接受英文 Inc.、Ltd.、LLC、Corp.、Co.、Company、Corporation。
         - 律师事务所、会计师事务所算公司。商业银行（含「银行」）算公司。
-        - 正文里同时出现法定全称和明确写明的简称时，两者都输出、各自计各自的 count。例如正文写明「成都高新菁蓉汇智人才服务有限公司（以下简称：人才公司）」时，「成都高新菁蓉汇智人才服务有限公司」和「人才公司」都输出。
+        - 正文里同时出现法定全称和明确写明的简称时，两者都输出、各自计各自的次数。例如正文写明「成都高新菁蓉汇智人才服务有限公司（以下简称：人才公司）」时，「成都高新菁蓉汇智人才服务有限公司」和「人才公司」都输出。
         - 分公司、支公司、分行、支行是另一个主体。母公司全称和分支机构全称如果都完整出现在正文里，两个都输出。
         - 正文里作为单位主体使用的服务/管理类名称也要输出，例如「客户服务中心」「商务服务中心」。
         公司名——不要：
@@ -151,7 +151,7 @@ public static class NerPrompt
         --- page 2 ---
         北京华为技术有限公司盖章确认。张伟再次签字。
         输出：
-        {"pages":[{"page":1,"ruleList":[{"ruleCode":"B04","ruleName":"人员名称","ruleItemList":[{"personName":"张伟","count":1,"originText":["甲 方：北 京 华 为 技 术 有 限 公 司\n法定代表人：张 伟"]},{"personName":"李娜","count":1,"originText":["法定代表人：张 伟\n联系人：李娜女士"]}]},{"ruleCode":"B06","ruleName":"公司名称","ruleItemList":[{"companyName":"北京华为技术有限公司","count":1,"originText":["甲 方：北 京 华 为 技 术 有 限 公 司"]}]}]},{"page":2,"ruleList":[{"ruleCode":"B04","ruleName":"人员名称","ruleItemList":[{"personName":"张伟","count":1,"originText":["北京华为技术有限公司盖章确认。张伟再次签字。"]}]},{"ruleCode":"B06","ruleName":"公司名称","ruleItemList":[{"companyName":"北京华为技术有限公司","count":1,"originText":["北京华为技术有限公司盖章确认。张伟再次签字。"]}]}]}]}
+        {"p":[{"n":1,"c":[["北京华为技术有限公司",1]],"r":[["张伟",1],["李娜",1]]},{"n":2,"c":[["北京华为技术有限公司",1]],"r":[["张伟",1]]}]}
         """;
 
     /// <summary>

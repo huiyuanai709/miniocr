@@ -333,6 +333,49 @@ using (HttpClient distHttp = new(distributed) { BaseAddress = new Uri("http://ll
         && distResult.Entities[0].Count == 2
         && distResult.Entities[0].Kind == "company",
         "distributed NER keeps the coerced page and count");
+    ChatCompletionRequest sent = ReadRequest(distributed.RequestBodies[0]);
+    string system = sent.Messages.Find(m => m.Role == "system")?.Content ?? "";
+    Assert(system.Contains("{\"p\":", StringComparison.Ordinal), "pages prompt asks for compact JSON");
+    Assert(system.Contains("不要输出 originText", StringComparison.Ordinal), "pages prompt does not ask the model to write snippets");
+}
+
+const string CompactPayload =
+    """{"p":[{"n":1,"c":[["成都交子商圈物业服务有限公司","2"],"人才公司"],"r":[{"n":"张伟","c":1},["李娜"]]},{"n":2,"c":[],"r":[]}]}""";
+ScriptedHandler compact = new();
+compact.EnqueueOk(Assistant(CompactPayload));
+using (HttpClient compactHttp = new(compact) { BaseAddress = new Uri("http://llm.test") })
+{
+    LlmEntityExtractor compactExtractor = MakeExtractor(compactHttp, attempts: 1);
+    string page1 = "正本成都交子商圈物业服务有限公司2026年度合同由张伟签署，人才公司盖章，联系人李娜到场。";
+    LlmExtractionResult compactResult = await compactExtractor.ExtractAsync(
+        [new OcrPageResult { Page = 1, Text = page1 }],
+        CancellationToken.None);
+    Assert(compactResult.Pages.Count == 1 && compactResult.Pages[0].Page == 1, "compact reply keeps the page and drops an empty page");
+    ChallengeRuleItem? company = null;
+    ChallengeRuleItem? person = null;
+    foreach (ChallengeRule rule in compactResult.Pages[0].RuleList)
+    {
+        foreach (ChallengeRuleItem item in rule.RuleItemList)
+        {
+            if (item.CompanyName == "成都交子商圈物业服务有限公司")
+                company = item;
+            if (item.PersonName == "张伟")
+                person = item;
+        }
+    }
+
+    Assert(company is not null && company.Count == 2, "compact company count is the model's, not a recount");
+    Assert(person is not null && person.Count == 1, "object-shaped person hit keeps its count");
+    Assert(compactResult.Pages[0].RuleList.SelectMany(r => r.RuleItemList).Any(i => i.CompanyName == "人才公司"),
+        "a bare company name is accepted");
+    Assert(compactResult.Pages[0].RuleList.SelectMany(r => r.RuleItemList).Any(i => i.PersonName == "李娜"),
+        "a bare person name defaults count to 1");
+    Assert(company!.OriginText.Count > 0
+        && company.OriginText.All(t => t.Length is >= 10 and <= 100)
+        && company.OriginText.All(t => t.Contains("成都交子商圈物业服务有限公司", StringComparison.Ordinal)),
+        "originText is rebuilt locally and contains the company name");
+    Assert(person!.OriginText.Count > 0 && person.OriginText.All(t => t.Contains("张伟", StringComparison.Ordinal)),
+        "originText is rebuilt locally around the person name");
 }
 
 ListLog parseLog = new();
