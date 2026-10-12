@@ -24,6 +24,7 @@ public sealed class ClusterCoordinator : IHostedService
     private readonly NacosClient? _nacos;
     private readonly LlmEntityExtractor _llm;
     private readonly ILogger<ClusterCoordinator> _logger;
+    private readonly OcrTraceLog? _trace;
     private readonly ConcurrentDictionary<string, ClusterJob> _jobs = new(StringComparer.Ordinal);
     private readonly object _publish = new();
     private readonly CancellationTokenSource _cts = new();
@@ -36,7 +37,8 @@ public sealed class ClusterCoordinator : IHostedService
         IHttpClientFactory httpFactory,
         ILogger<ClusterCoordinator> logger,
         LlmEntityExtractor llm,
-        NacosClient? nacos = null)
+        NacosClient? nacos = null,
+        OcrTraceLog? trace = null)
     {
         _config = config;
         _registry = registry;
@@ -44,6 +46,7 @@ public sealed class ClusterCoordinator : IHostedService
         _nacos = nacos;
         _llm = llm;
         _logger = logger;
+        _trace = trace;
     }
 
     public bool DistributedNer => _config.DistributedNer;
@@ -499,6 +502,7 @@ public sealed class ClusterCoordinator : IHostedService
         _jobs[id] = job;
 
         WarnModelMismatch(remotes, dpi);
+        _trace?.ClusterJob(id, sourceUrl, pageCount);
         if (streamClassify)
         {
             _logger.LogInformation(
