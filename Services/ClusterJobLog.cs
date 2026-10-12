@@ -7,7 +7,10 @@ namespace MiniOcr.Services;
 /// Routine claim / heartbeat / batch-done / empty-poll lines are Debug unless
 /// <see cref="ClusterRuntimeConfig.VerboseDispatch"/> is set, in which case they are Information.
 /// Either way, <c>Logging:LogLevel</c> on the caller category still filters them.
-/// Progress summaries, speculative retries, and lease expiry stay Information.
+/// Progress summaries, speculative page copies, and lease expiry stay Information.
+/// The copy line is worded "speculative retry". Its leaseMs is that copy's own
+/// lease (page count times page timeout, so two pages at the 20s default is 40000),
+/// not evidence that an older lease timed out. Expiry is the separate "lease expired" line.
 /// </summary>
 internal static class ClusterJobLog
 {
