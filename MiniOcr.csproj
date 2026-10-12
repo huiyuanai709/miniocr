@@ -62,10 +62,10 @@
     <!-- Pinned fork main @ 9d4d944 (upstream sdcb/SimdPaddleOCR main: Vulkan
          memory-type retry, GPU shape/CTC caches, AVX2 ArgMax scratch reuse,
          GPU thread budgets, Metal SE fusion, and the browser/WASI Vulkan
-         probe skip). ChineseV6Small models come from the same tree.
+         probe skip). ChineseV6Medium models come from the same tree.
          Default backend stays CPU. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
-    <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Small/Sdcb.SimdPaddleOCR.Models.ChineseV6Small.csproj" />
+    <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Medium/Sdcb.SimdPaddleOCR.Models.ChineseV6Medium.csproj" />
   </ItemGroup>
 
   <Target Name="EnsureSimdPaddleOcrSubmodule" BeforeTargets="Restore;Build;Publish">
@@ -88,7 +88,7 @@
   <ItemGroup>
     <!-- Keep model / Skia / PDFium assemblies from being trimmed away -->
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR" />
-    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Small" />
+    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Medium" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.TextLineOrientation" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.ModelProvider" />
     <TrimmerRootAssembly Include="PDFtoImage" />

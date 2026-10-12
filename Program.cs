@@ -180,16 +180,16 @@ Console.WriteLine(
 OcrEngine? engine = null;
 if (llmOcrMode)
 {
-    Console.WriteLine("Skipping ChineseV6Small / PaddleOcrAll — ocr.mode=llm (vision OCR).");
+    Console.WriteLine($"Skipping {ClusterRuntimeConfig.LocalModelName} / PaddleOcrAll — ocr.mode=llm (vision OCR).");
 }
 else if (runtimeConfig.IsWeChatMode)
 {
     Console.WriteLine(
-        $"Skipping ChineseV6Small / PaddleOcrAll — ocr.mode=wechat ({wechatEngine?.KindName}, instances={wechatEngine?.InstanceCount ?? 0}).");
+        $"Skipping {ClusterRuntimeConfig.LocalModelName} / PaddleOcrAll — ocr.mode=wechat ({wechatEngine?.KindName}, instances={wechatEngine?.InstanceCount ?? 0}).");
 }
 else
 {
-    Console.WriteLine("Loading ChineseV6Small OCR models...");
+    Console.WriteLine($"Loading {ClusterRuntimeConfig.LocalModelName} OCR models...");
     engine = await OcrEngine.CreateAsync(
         bootstrapLogs.CreateLogger<OcrEngine>(),
         runtimeConfig);
@@ -428,6 +428,7 @@ app.MapGet("/health", (IServiceProvider sp) =>
             ConfigFileExisted = configFileExisted,
             ConfigPathSource = configLoad.PathSource,
             OcrMode = cfg.Mode,
+            OcrModel = cfg.IsLlmMode || cfg.IsWeChatMode ? "" : ClusterRuntimeConfig.LocalModelName,
             WeChatKind = wechatEngine?.KindName ?? "",
             WeChatPluginPath = wechatEngine?.PluginPath ?? "",
             WeChatDir = wechatEngine?.WeChatDir ?? "",
