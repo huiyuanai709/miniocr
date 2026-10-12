@@ -25,6 +25,8 @@ public sealed class ClusterWorkerHost : IHostedService
     private readonly OcrTraceLog? _trace;
     private readonly string _resourceDir;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _sessions = new(StringComparer.Ordinal);
+    /// <summary>Jobs whose OCR claim loop is still running. NER-only tails stay in <see cref="_sessions"/> but drop out of here.</summary>
+    private readonly ConcurrentDictionary<string, byte> _ocrSlots = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte[]> _pdfCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Task<byte[]>> _urlFetches = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _recentlyLeft = new(StringComparer.Ordinal);
@@ -176,7 +178,7 @@ public sealed class ClusterWorkerHost : IHostedService
             return false;
         }
 
-        if (_sessions.Count >= ClusterDispatchRules.MaxWorkerSessions && !_sessions.ContainsKey(req.JobId))
+        if (!ClusterDispatchRules.CanStartOcrSession(_ocrSlots.Count, _sessions.ContainsKey(req.JobId)))
         {
             error = "Worker is at session capacity.";
             return false;
@@ -268,7 +270,7 @@ public sealed class ClusterWorkerHost : IHostedService
         int pdfLength,
         string traceEntry)
     {
-        if (_sessions.Count >= ClusterDispatchRules.MaxWorkerSessions && !_sessions.ContainsKey(jobId))
+        if (!ClusterDispatchRules.CanStartOcrSession(_ocrSlots.Count, _sessions.ContainsKey(jobId)))
         {
             _logger.LogDebug(
                 "Cluster worker {NodeId} ignored job {JobId}: at session capacity",
@@ -283,6 +285,8 @@ public sealed class ClusterWorkerHost : IHostedService
             sessionCts.Dispose();
             return;
         }
+
+        _ocrSlots.TryAdd(jobId, 0);
 
         if (!string.IsNullOrWhiteSpace(sourceUrl))
             _trace?.Url(traceEntry, requestId: "", sourceUrl, jobId: jobId, nodeId: _self.NodeId);
@@ -518,7 +522,19 @@ public sealed class ClusterWorkerHost : IHostedService
             }
 
             if (nerTask is not null)
+            {
+                // OCR claim loop has left the GPU. Keep NER on LLM threads and free the
+                // session slot so the next PDF can be recognized on this node.
+                if (_ocrSlots.TryRemove(jobId, out _))
+                {
+                    _logger.LogInformation(
+                        "Cluster worker {NodeId} job {JobId} OCR finished; NER keeps running without blocking the next PDF",
+                        _self.NodeId,
+                        jobId);
+                }
+
                 await nerTask.ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -529,6 +545,7 @@ public sealed class ClusterWorkerHost : IHostedService
         }
         finally
         {
+            _ocrSlots.TryRemove(jobId, out _);
             if (sharedPdfPath is not null)
                 await _pipeline.ReleaseSharedPdfAsync(sharedPdfPath).ConfigureAwait(false);
             else if (renderPdf is not null)
@@ -929,7 +946,9 @@ public sealed class ClusterWorkerHost : IHostedService
         {
             NodeId = _self.NodeId,
             Capacity = _self.Capacity,
-            ActiveSessions = _sessions.Count,
+            // NER-only tails stay in ActiveJobs so they are not offered again, but they
+            // do not count as a GPU session.
+            ActiveSessions = _ocrSlots.Count,
             ActiveJobs = ActiveJobIds(),
         };
         using HttpRequestMessage req = new(HttpMethod.Post, _config.CoordinatorUrl + "/cluster/dispatch");

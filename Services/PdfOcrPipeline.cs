@@ -8,6 +8,12 @@ using SkiaSharp;
 
 namespace MiniOcr.Services;
 
+/// <summary>
+/// One PDF. <see cref="OcrCompleted"/> finishes when GPU OCR for this file is done
+/// (the next file may start). <see cref="Response"/> still waits for NER.
+/// </summary>
+public readonly record struct PdfOcrRun(Task OcrCompleted, Task<OcrResponse> Response);
+
 public sealed class PdfOcrPipeline : IAsyncDisposable
 {
     private readonly OcrEngine? _engine;
@@ -91,7 +97,49 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         Stopwatch totalSw = Stopwatch.StartNew();
         byte[] array = pdf.DangerousGetArray();
         int length = pdf.Length;
-        return ProcessCoreAsync(array, length, downloadMs, downloadMode, totalSw, dpiOverride, sourceUrl, ct);
+        return ProcessCoreAsync(array, length, downloadMs, downloadMode, totalSw, dpiOverride, sourceUrl, ct, onOcrReady: null);
+    }
+
+    /// <summary>
+    /// Same pipeline as <see cref="ProcessAsync"/>, but <see cref="PdfOcrRun.OcrCompleted"/>
+    /// completes when this PDF's OCR finishes. NER keeps running until
+    /// <see cref="PdfOcrRun.Response"/>. The caller must keep <paramref name="pdf"/> alive
+    /// until <see cref="PdfOcrRun.Response"/> completes.
+    /// </summary>
+    public PdfOcrRun Start(
+        RentedBuffer pdf,
+        double downloadMs,
+        string downloadMode,
+        CancellationToken ct,
+        int? dpiOverride = null,
+        string? sourceUrl = null)
+    {
+        TaskCompletionSource gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Stopwatch totalSw = Stopwatch.StartNew();
+        byte[] array = pdf.DangerousGetArray();
+        int length = pdf.Length;
+        return new PdfOcrRun(gate.Task, Run());
+
+        async Task<OcrResponse> Run()
+        {
+            try
+            {
+                return await ProcessCoreAsync(
+                    array, length, downloadMs, downloadMode, totalSw, dpiOverride, sourceUrl, ct,
+                    () => gate.TrySetResult()).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                gate.TrySetException(ex);
+                throw;
+            }
+            finally
+            {
+                // Paths with no separate NER stage (vision) signal here, after OCR.
+                // An earlier signal makes this a no-op.
+                gate.TrySetResult();
+            }
+        }
     }
 
     private async Task<OcrResponse> ProcessCoreAsync(
@@ -102,7 +150,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         Stopwatch totalSw,
         int? dpiOverride,
         string? sourceUrl,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action? onOcrReady)
     {
         try
         {
@@ -124,7 +173,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 "OCR pipeline (cluster): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, mode={Mode}",
                 pageCount, pdfByteCount, dpi, _config.Mode);
             return await ProcessDistributedAsync(
-                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, sourceUrl, totalSw, ct)
+                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, sourceUrl, totalSw, ct, onOcrReady)
                 .ConfigureAwait(false);
         }
 
@@ -147,7 +196,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct,
                 modeLabel: "wechat",
                 workers: _wechat.InstanceCount,
-                recognize: (image, token) => _wechat.RecognizeBitmapAsync(image.RequireBitmap(), token))
+                recognize: (image, token) => _wechat.RecognizeBitmapAsync(image.RequireBitmap(), token),
+                onOcrReady: onOcrReady)
                 .ConfigureAwait(false);
         }
 
@@ -159,7 +209,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct,
             modeLabel: "local",
             workers: _engine.EngineCount,
-            recognize: RecognizeLocalAsync)
+            recognize: RecognizeLocalAsync,
+            onOcrReady: onOcrReady)
             .ConfigureAwait(false);
         }
         finally
@@ -417,7 +468,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         CancellationToken ct,
         string modeLabel,
         int workers,
-        Func<PageImage, CancellationToken, Task<string>> recognize)
+        Func<PageImage, CancellationToken, Task<string>> recognize,
+        Action? onOcrReady)
     {
         s_gpuJob.Value = new GpuJob();
         try
@@ -539,6 +591,15 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             }
         }
 
+        if (onOcrReady is not null)
+        {
+            _logger.LogInformation(
+                "OCR complete; NER continues without blocking the next PDF pages={Pages} mode={Mode}",
+                pageCount,
+                modeLabel);
+            onOcrReady();
+        }
+
         (LlmExtractionResult nerResult, NerStages nerStages) = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
         OcrEntities entities = AttachModelPages(pages, nerResult);
         List<OcrPageResult> visible = VisiblePages(pages);
@@ -612,7 +673,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         string downloadMode,
         string? sourceUrl,
         Stopwatch totalSw,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action? onOcrReady)
     {
         bool vision = _config.IsLlmMode;
         bool distributeNer = !vision && _cluster!.DistributedNer;
@@ -698,7 +760,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         return ValueTask.CompletedTask;
                     },
                     token,
-                    string.IsNullOrEmpty(job.SharedPath) ? null : job.SharedPath)).ConfigureAwait(false);
+                    string.IsNullOrEmpty(job.SharedPath) ? null : job.SharedPath),
+                onOcrReady: onOcrReady).ConfigureAwait(false);
             jobId = outcome.JobId;
             distributedEntities = outcome.UsedDistributedNer ? outcome.Entities ?? new OcrEntities() : null;
             clusterOcrDoneMs = outcome.OcrDoneMs;

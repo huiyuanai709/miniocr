@@ -229,7 +229,9 @@ public sealed class ClusterCoordinator : IHostedService
         }
 
         bool nodeCanNer = !string.IsNullOrWhiteSpace(nodeId) && _registry.NerCapacity(nodeId) > 0;
-        foreach (ClusterJob job in _jobs.Values.OrderBy(j => j.Started))
+        foreach (ClusterJob job in _jobs.Values
+                     .OrderBy(static j => ClusterDispatchRules.OfferOrder(j.Scheduler.IsComplete))
+                     .ThenBy(static j => j.Started))
         {
             if (job.IsFinished)
                 continue;
@@ -413,7 +415,8 @@ public sealed class ClusterCoordinator : IHostedService
         IReadOnlyList<OcrPageResult>? textLayerPages,
         CancellationToken ct,
         Func<ClusterJob, CancellationToken, Task>? alongside = null,
-        Func<ChannelReader<(string BatchId, int Page)>, ClusterJob, CancellationToken, Task>? recognizeFeed = null)
+        Func<ChannelReader<(string BatchId, int Page)>, ClusterJob, CancellationToken, Task>? recognizeFeed = null,
+        Action? onOcrReady = null)
     {
         string id = Guid.NewGuid().ToString("N");
         List<ClusterRemote> remotes = _registry.Remotes();
@@ -767,8 +770,22 @@ public sealed class ClusterCoordinator : IHostedService
 
             ocrDoneMs = (DateTimeOffset.UtcNow - job.Started).TotalMilliseconds;
             if (ner is not null)
-            {
                 ner.Seal();
+            // GPU OCR for this PDF is done. NER (distributed or the caller's local pass)
+            // keeps running; the next file may take the GPU without waiting for it.
+            // Leases and speculative copies inside this PDF are unchanged: the local
+            // claim loop has already drained, and remote leases still expire as before.
+            if (onOcrReady is not null)
+            {
+                _logger.LogInformation(
+                    "Cluster job {JobId} OCR complete; NER continues without blocking the next PDF ocrDoneMs={OcrDone:F0}",
+                    id,
+                    ocrDoneMs);
+                onOcrReady();
+            }
+
+            if (ner is not null)
+            {
                 if (localNer is not null)
                     await localNer.ConfigureAwait(false);
                 nerDoneMs = (DateTimeOffset.UtcNow - job.Started).TotalMilliseconds;
