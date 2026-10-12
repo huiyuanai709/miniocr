@@ -153,7 +153,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_REMOVE_RED_SEAL` | `ocr.removeRedSeal` | true | 彩色页在检测前去掉高饱和红章，换成页角纸色或白。灰度页跳过。`0` / `false` / `off` 关闭，并回到 Gray8 渲染 |
 | `MINIOCR_OCR_BACKEND` | `ocr.backend` | `cpu` | `cpu` / `auto` / `vulkan` / `metal`。`metal` 仅 macOS |
 | `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空 | 设备序号或名称子串 |
-| `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 按核数 | 进程内栅格线程。`parallel` 时用于回退 |
+| `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 按核数 | 进程内栅格线程，上限为逻辑核数。`parallel` 时用于回退 |
 | `MINIOCR_RENDER_MODE` | `ocr.renderMode` | `parallel` | `parallel` 或 `inprocess` |
 | `MINIOCR_RENDER_PROCESSES` | `ocr.renderProcesses` | 1–4 | 并行渲染进程数 |
 | `MINIOCR_OCR_TEXT_LAYER` | `ocr.textLayer` | `auto` | `auto` / `off` / `force`。有可用文本层时跳过识别 |
@@ -177,7 +177,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_WECHAT_FALLBACK` | `ocr.wechatFallbackToLocal` | true | 为 false 时找不到插件则退出 |
 | `MINIOCR_CHALLENGE_RESOURCE_DIR` | `challenge.resourceDir` | 空 | 比赛 PDF 目录。空则仍按 URL 下载。非空时只读，见下文 |
 
-未设置的引擎数、行内线程和检测线程按逻辑核数估算。显式环境变量或文件值优先。小显存 GPU 上引擎数会降为 1。
+未设置的引擎数、行内线程、检测线程和栅格线程按逻辑核数估算。显式环境变量或文件值优先，栅格线程上限为逻辑核数。小显存 GPU 上引擎数会降为 1。
 
 ### 比赛本地 PDF（`POST /challenge`、`POST /`、同步 `POST /ocr`）
 
