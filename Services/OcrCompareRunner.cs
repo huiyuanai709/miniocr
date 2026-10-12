@@ -81,7 +81,7 @@ public static class OcrCompareRunner
                 .ConfigureAwait(false);
 
             var rows = new List<PageRow>(limit);
-            RenderOptions render = PdfParallelOptions.CreateRenderOptions(dpi, config.RemoveRedSeal);
+            RenderOptions render = PdfParallelOptions.CreateRenderOptions(dpi, config);
 
             for (int i = 0; i < limit; i++)
             {
@@ -92,7 +92,8 @@ public static class OcrCompareRunner
                 if (!enumerator.MoveNext())
                     throw new InvalidOperationException($"PDFtoImage did not yield page {i + 1}.");
                 using SKBitmap bitmap = enumerator.Current;
-                RedSealFilter.Apply(bitmap);
+                if (config.RemoveRedSeal)
+                    RedSealFilter.Apply(bitmap, config.RedSealAllInk ? 0 : RedSealFilter.MinSealSideForDpi(dpi));
 
                 PageRow row = new() { Page = i + 1, Width = bitmap.Width, Height = bitmap.Height };
                 row.WeChat = await TimeAsync(() => wechat.RecognizeBitmapAsync(bitmap, CancellationToken.None))

@@ -166,6 +166,8 @@ public sealed class HealthResponse
     public bool UseDirectionClassification { get; set; }
     /// <summary>When true, high-saturation red is removed from color pages before detection.</summary>
     public bool RemoveRedSeal { get; set; } = true;
+    /// <summary>PDFium smoothing in use: <c>all</c>, <c>none</c>, or a comma list of <c>text</c>, <c>images</c>, <c>paths</c>.</summary>
+    public string AntiAliasing { get; set; } = "all";
     public int RasterWorkerCount { get; set; }
     /// <summary><c>parallel</c> (default) or <c>inprocess</c>.</summary>
     public string RenderMode { get; set; } = "parallel";

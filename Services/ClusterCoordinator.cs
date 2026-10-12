@@ -302,10 +302,51 @@ public sealed class ClusterCoordinator : IHostedService
         return true;
     }
 
-    public ClusterClaimResponse Claim(ClusterJob job, string nodeId, int maxPages)
+    public ClusterClaimResponse Claim(ClusterJob job, string nodeId, int maxPages) =>
+        ClaimCore(job, nodeId, maxPages, out _);
+
+    /// <summary>
+    /// Claim that holds the HTTP request open for up to <paramref name="holdMs"/> when nothing is
+    /// claimable yet. Pages admitted by the text-layer stream, released leases and tail copies wake
+    /// the request at once, instead of the worker sleeping out its <c>retryAfterMs</c> and asking again.
+    /// </summary>
+    public async Task<ClusterClaimResponse> ClaimAsync(
+        ClusterJob job,
+        string nodeId,
+        int maxPages,
+        int holdMs,
+        CancellationToken ct)
+    {
+        ClusterClaimResponse first = ClaimCore(job, nodeId, maxPages, out long seen);
+        if (!first.Wait || holdMs <= 0 || job.IsFinished)
+            return first;
+
+        try
+        {
+            await job.Scheduler.WaitForChangeAsync(seen, TimeSpan.FromMilliseconds(holdMs), ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return first;
+        }
+
+        ClusterClaimResponse second = ClaimCore(job, nodeId, maxPages, out _);
+        if (second.Wait)
+        {
+            // The coordinator already held the line; the worker can come straight back.
+            second.RetryAfterMs = Math.Min(second.RetryAfterMs, 50);
+        }
+
+        return second;
+    }
+
+    private ClusterClaimResponse ClaimCore(ClusterJob job, string nodeId, int maxPages, out long version)
     {
         if (job.IsFinished)
+        {
+            version = job.Scheduler.Version;
             return new ClusterClaimResponse { Done = true };
+        }
 
         if (maxPages <= 0)
             maxPages = 1;
@@ -315,6 +356,7 @@ public sealed class ClusterCoordinator : IHostedService
             job.Scheduler.SetNerBlocker(job.Ner.EarliestMissingPage());
 
         ClusterClaim claim = job.Scheduler.Claim(nodeId, maxPages, DateTimeOffset.UtcNow);
+        version = claim.Version;
         LogExpiries(job);
         LogClaim(job.Id, nodeId, claim);
 
@@ -594,6 +636,7 @@ public sealed class ClusterCoordinator : IHostedService
                 classify = null;
                 for (int i = 0; i < pageCount; i++)
                     scheduler.AdmitPage(i);
+                scheduler.SealAdmission();
             }
 
             if (_config.PipelineOcr && recognizeFeed is not null)
