@@ -9,4 +9,5 @@ namespace MiniOcr;
 [JsonSerializable(typeof(AppConfigFile))]
 [JsonSerializable(typeof(LlmFileConfig))]
 [JsonSerializable(typeof(OcrFileConfig))]
+[JsonSerializable(typeof(ChallengeFileConfig))]
 internal partial class AppJsonContext : JsonSerializerContext;

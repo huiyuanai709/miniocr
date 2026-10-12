@@ -8,10 +8,25 @@ public sealed class AppConfigFile
 {
     public LlmFileConfig? Llm { get; set; }
     public OcrFileConfig? Ocr { get; set; }
+    /// <summary>Optional contest PDF directory. Missing or empty keeps URL download.</summary>
+    public ChallengeFileConfig? Challenge { get; set; }
     /// <summary>Optional multi-machine OCR. Missing or <c>enabled: false</c> keeps single-node behavior.</summary>
     public ClusterFileConfig? Cluster { get; set; }
     /// <summary>Optional Nacos service discovery. Missing or <c>enabled: false</c> keeps static worker discovery.</summary>
     public NacosFileConfig? Nacos { get; set; }
+}
+
+/// <summary>
+/// <c>config.json</c> <c>challenge</c> section. Contest PDFs already on the deploy host.
+/// <c>MINIOCR_CHALLENGE_RESOURCE_DIR</c> overrides <see cref="ResourceDir"/>.
+/// </summary>
+public sealed class ChallengeFileConfig
+{
+    /// <summary>
+    /// Directory of contest PDFs named by <c>fileId</c> (<c>f1</c> → <c>f1.pdf</c>).
+    /// Empty keeps the URL download. The process only reads this directory.
+    /// </summary>
+    public string? ResourceDir { get; set; }
 }
 
 public sealed class LlmFileConfig

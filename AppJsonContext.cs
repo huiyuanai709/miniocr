@@ -22,6 +22,7 @@ namespace MiniOcr;
 [JsonSerializable(typeof(AppConfigFile))]
 [JsonSerializable(typeof(LlmFileConfig))]
 [JsonSerializable(typeof(OcrFileConfig))]
+[JsonSerializable(typeof(ChallengeFileConfig))]
 [JsonSerializable(typeof(ChatCompletionRequest))]
 [JsonSerializable(typeof(ChatResponseFormat))]
 [JsonSerializable(typeof(ChatCompletionResponse))]

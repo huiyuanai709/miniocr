@@ -430,6 +430,9 @@ public static class AppConfigStore
             "wechatConnectTimeoutSeconds": 20,
             "wechatRequestTimeoutSeconds": 60
           },
+          "challenge": {
+            "resourceDir": ""
+          },
           "cluster": {
             "enabled": false,
             "role": "coordinator",

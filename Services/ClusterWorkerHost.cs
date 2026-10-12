@@ -23,6 +23,7 @@ public sealed class ClusterWorkerHost : IHostedService
     private readonly ParallelPdfDownloader _downloader;
     private readonly ILogger<ClusterWorkerHost> _logger;
     private readonly OcrTraceLog? _trace;
+    private readonly string _resourceDir;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte[]> _pdfCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Task<byte[]>> _urlFetches = new(StringComparer.Ordinal);
@@ -44,7 +45,8 @@ public sealed class ClusterWorkerHost : IHostedService
         IHttpClientFactory httpFactory,
         ParallelPdfDownloader downloader,
         ILogger<ClusterWorkerHost> logger,
-        OcrTraceLog? trace = null)
+        OcrTraceLog? trace = null,
+        ChallengeRuntimeConfig? challenge = null)
     {
         _config = config;
         _self = self;
@@ -54,6 +56,7 @@ public sealed class ClusterWorkerHost : IHostedService
         _httpFactory = httpFactory;
         _downloader = downloader;
         _logger = logger;
+        _resourceDir = challenge?.ResourceDir ?? "";
     }
 
     private const int MaxCachedPdfs = 2;
@@ -311,7 +314,11 @@ public sealed class ClusterWorkerHost : IHostedService
         var stages = new WorkerStageTotals();
         try
         {
-            if (ClusterSharedPdf.TryResolve(_config.SharedDir, localPath, pdfLength, out string resolvedShared))
+            bool contestPdf = ChallengeResourceFiles.TryAdoptForCluster(
+                _resourceDir, localPath, pdfLength, out string resourceShared);
+            if (contestPdf)
+                sharedPdfPath = resourceShared;
+            else if (ClusterSharedPdf.TryResolve(_config.SharedDir, localPath, pdfLength, out string resolvedShared))
                 sharedPdfPath = resolvedShared;
             _logger.LogInformation(
                 "Cluster worker {NodeId} joining job {JobId} via {Coordinator} dpi={Dpi} pages={Pages} pdf={Source}",
@@ -320,7 +327,8 @@ public sealed class ClusterWorkerHost : IHostedService
                 coordinatorUrl,
                 dpi,
                 pageCount,
-                sharedPdfPath is not null ? "shared-file" : DescribePdfSource(sourceUrl));
+                contestPdf ? ChallengeResourceFiles.DownloadMode
+                    : sharedPdfPath is not null ? "shared-file" : DescribePdfSource(sourceUrl));
             bool cached = false;
             byte[]? pdf = null;
             Task<byte[]>? shared = null;
@@ -349,11 +357,12 @@ public sealed class ClusterWorkerHost : IHostedService
             if (sharedPdfPath is not null)
             {
                 _logger.LogInformation(
-                    "Cluster worker {NodeId} job {JobId} opened shared PDF bytes={Bytes} path={Path}",
+                    "Cluster worker {NodeId} job {JobId} opened PDF bytes={Bytes} path={Path} downloadMode={Mode}",
                     _self.NodeId,
                     jobId,
                     pdfLength,
-                    sharedPdfPath);
+                    sharedPdfPath,
+                    contestPdf ? ChallengeResourceFiles.DownloadMode : "shared-file");
             }
             else if (!cached)
             {

@@ -20,6 +20,9 @@
     "backend": "vulkan",
     "vulkanDevice": "0"
   },
+  "challenge": {
+    "resourceDir": ""
+  },
   "cluster": {
     "enabled": true,
     "token": "",

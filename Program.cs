@@ -70,6 +70,7 @@ bool configFileExisted = configLoad.ConfigFileExisted;
 LlmRuntimeConfig llmConfig = AppConfigStore.ResolveLlm(appConfig);
 OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromAppConfig(appConfig);
 ClusterRuntimeConfig clusterConfig = ClusterRuntimeConfig.Resolve(appConfig);
+ChallengeRuntimeConfig challengeConfig = ChallengeRuntimeConfig.Resolve(appConfig);
 
 if (OcrCompareRunner.IsRequested(args))
 {
@@ -227,6 +228,16 @@ else
 
 builder.Services.AddSingleton(runtimeConfig);
 builder.Services.AddSingleton(llmConfig);
+builder.Services.AddSingleton(challengeConfig);
+if (challengeConfig.Enabled)
+{
+    Console.WriteLine(
+        $"Challenge resource dir: {challengeConfig.ResourceDir} (read-only; fileId f1 opens f1.pdf, url optional)");
+}
+else
+{
+    Console.WriteLine("Challenge resource dir: unset (files require fileId + absolute http(s) url)");
+}
 if (engine is not null)
     builder.Services.AddSingleton(engine);
 if (wechatEngine is not null)
@@ -379,7 +390,8 @@ builder.Services.AddSingleton(sp => new ChallengeJobService(
     sp.GetRequiredService<IHttpClientFactory>(),
     sp.GetRequiredService<ILogger<ChallengeJobService>>(),
     sp.GetService<ClusterCoordinator>(),
-    sp.GetRequiredService<OcrTraceLog>()));
+    sp.GetRequiredService<OcrTraceLog>(),
+    sp.GetRequiredService<ChallengeRuntimeConfig>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChallengeJobService>());
 
 WebApplication app = builder.Build();
@@ -455,6 +467,7 @@ app.MapGet("/health", (IServiceProvider sp) =>
 async Task<IResult> HandleChallengeAsync(
     HttpRequest httpRequest,
     ChallengeJobService jobs,
+    ChallengeRuntimeConfig challenge,
     CancellationToken ct)
 {
     ChallengeRequest? body;
@@ -489,7 +502,7 @@ async Task<IResult> HandleChallengeAsync(
             new ChallengeAckResponse
             {
                 Ok = false,
-                Error = "Required: key, callbackUrl, files[] (each with fileId + url).",
+                Error = ChallengeResourceFiles.RequiredFieldsError(challenge.Enabled),
             },
             AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
@@ -506,22 +519,21 @@ async Task<IResult> HandleChallengeAsync(
 
     string traceEntry = httpRequest.Path.StartsWithSegments("/challenge") ? "challenge" : "root";
     string requestId = OcrTraceLog.NewRequestId();
+    string? resourceDir = challenge.Enabled ? challenge.ResourceDir : null;
     List<ChallengeFileRef> files = [];
     foreach (ChallengeFileRef f in body.Files)
     {
-        if (string.IsNullOrWhiteSpace(f.Url) || string.IsNullOrWhiteSpace(f.FileId))
+        if (!ChallengeResourceFiles.TryAcceptFile(resourceDir, f, out ChallengeFileRef accepted))
             continue;
-        if (!Uri.TryCreate(f.Url, UriKind.Absolute, out Uri? fu) ||
-            (fu.Scheme != Uri.UriSchemeHttp && fu.Scheme != Uri.UriSchemeHttps))
-            continue;
-        files.Add(f);
-        ocrTrace.Url(traceEntry, requestId, f.Url, f.FileId, body.TeamId);
+        files.Add(accepted);
+        if (accepted.Url is not null)
+            ocrTrace.Url(traceEntry, requestId, accepted.Url, accepted.FileId, body.TeamId);
     }
 
     if (files.Count == 0)
     {
         return Results.Json(
-            new ChallengeAckResponse { Ok = false, Error = "No valid files (need fileId + http(s) url)." },
+            new ChallengeAckResponse { Ok = false, Error = ChallengeResourceFiles.MissingFilesError(challenge.Enabled) },
             AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
@@ -580,6 +592,7 @@ app.MapPost("/ocr", async Task<IResult> (
     ParallelPdfDownloader downloader,
     PdfOcrPipeline pipeline,
     OcrRuntimeConfig config,
+    ChallengeRuntimeConfig challenge,
     IServiceProvider services,
     CancellationToken ct) =>
 {
@@ -608,18 +621,17 @@ app.MapPost("/ocr", async Task<IResult> (
     }
 
     string requestId = OcrTraceLog.NewRequestId();
+    string? resourceDir = challenge.Enabled ? challenge.ResourceDir : null;
     List<ChallengeFileRef> files = [];
     if (body.Files is { Count: > 0 })
     {
         foreach (ChallengeFileRef f in body.Files)
         {
-            if (string.IsNullOrWhiteSpace(f.Url) || string.IsNullOrWhiteSpace(f.FileId))
+            if (!ChallengeResourceFiles.TryAcceptFile(resourceDir, f, out ChallengeFileRef accepted))
                 continue;
-            if (!Uri.TryCreate(f.Url, UriKind.Absolute, out Uri? fu) ||
-                (fu.Scheme != Uri.UriSchemeHttp && fu.Scheme != Uri.UriSchemeHttps))
-                continue;
-            files.Add(f);
-            ocrTrace.Url("ocr", requestId, f.Url, f.FileId, body.TeamId);
+            files.Add(accepted);
+            if (accepted.Url is not null)
+                ocrTrace.Url("ocr", requestId, accepted.Url, accepted.FileId, body.TeamId);
         }
     }
     else if (!string.IsNullOrWhiteSpace(body.Url))
@@ -694,10 +706,13 @@ app.MapPost("/ocr", async Task<IResult> (
             new ChallengeAckResponse
             {
                 Ok = false,
-                Error =
-                    "Required: files[{fileId,url}] (competition shape), legacy { url, dpi? }, " +
-                    "or { path } (local PDF, non-ASCII paths ok). " +
-                    "Optional: teamId, key, callbackUrl (ignored for sync). Add ?verbose=1 for page text and ms/page.",
+                Error = challenge.Enabled
+                    ? "Required: files[{fileId}] (url optional when the challenge resource directory is set), " +
+                      "legacy { url, dpi? }, or { path } (local PDF, non-ASCII paths ok). " +
+                      "Optional: teamId, key, callbackUrl (ignored for sync). Add ?verbose=1 for page text and ms/page."
+                    : "Required: files[{fileId,url}] (competition shape), legacy { url, dpi? }, " +
+                      "or { path } (local PDF, non-ASCII paths ok). " +
+                      "Optional: teamId, key, callbackUrl (ignored for sync). Add ?verbose=1 for page text and ms/page.",
             },
             AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
@@ -710,29 +725,73 @@ app.MapPost("/ocr", async Task<IResult> (
         foreach (ChallengeFileRef file in files)
         {
             string fileId = file.FileId ?? "f1";
-            string url = file.Url!;
-            services.GetService<ClusterCoordinator>()?.BeginSourcePrefetch(url);
-            ParallelPdfDownloader.DownloadResult download =
-                await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+            ChallengeResourceFiles.SourceDecision decision =
+                ChallengeResourceFiles.Decide(resourceDir, file.FileId, file.Url);
+            if (decision.Kind == ChallengeResourceFiles.SourceKind.Missing)
+            {
+                logger.LogWarning(
+                    "Debug /ocr file has no PDF: fileId={FileId}, path={Path}, downloadMode={Mode}",
+                    fileId,
+                    decision.LocalPath,
+                    challenge.Enabled ? ChallengeResourceFiles.DownloadMode : "url");
+                results.Add(new ChallengeFileResult { FileId = fileId, Pages = [] });
+                continue;
+            }
+
+            ParallelPdfDownloader.DownloadResult download;
+            string? sourceUrl;
+            if (decision.Kind == ChallengeResourceFiles.SourceKind.Local)
+            {
+                logger.LogInformation(
+                    "Debug /ocr local resource: fileId={FileId}, path={Path}, downloadMode={Mode}",
+                    fileId,
+                    decision.LocalPath,
+                    ChallengeResourceFiles.DownloadMode);
+                ChallengeResourceFiles.LocalRead local = ChallengeResourceFiles.ReadLocal(decision.LocalPath!);
+                download = new ParallelPdfDownloader.DownloadResult(local.Buffer, local.Mode, local.ElapsedMs);
+                sourceUrl = decision.LocalPath;
+            }
+            else
+            {
+                string url = decision.Url!;
+                if (decision.LocalPath is not null)
+                {
+                    logger.LogInformation(
+                        "Debug /ocr file not in resource dir, downloading: fileId={FileId}, path={Path}, downloadMode=url-fallback",
+                        fileId,
+                        decision.LocalPath);
+                }
+
+                services.GetService<ClusterCoordinator>()?.BeginSourcePrefetch(url);
+                download = await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+                sourceUrl = url;
+            }
+
             using (download.Buffer)
             {
                 using IDisposable? traceScope = ocrTrace.Enabled
                     ? OcrTraceLog.BeginScope(requestId, "ocr", fileId, body.TeamId)
                     : null;
                 OcrResponse ocr = await pipeline
-                    .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi, url)
+                    .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi, sourceUrl)
                     .ConfigureAwait(false);
 
                 if (ocrTrace.Enabled)
                 {
                     ocrTrace.Text(
-                        "ocr", requestId, fileId, url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
-                        body.TeamId, download.Mode);
+                        "ocr", requestId, fileId, decision.Url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
+                        body.TeamId, download.Mode, path: decision.LocalPath);
                 }
 
                 if (files.Count == 1)
                     single = ocr;
                 results.Add(ChallengeResultMapper.BuildFileResult(fileId, ocr));
+                logger.LogInformation(
+                    "Debug /ocr file done: fileId={FileId}, path={Path}, pages={Pages}, downloadMode={Mode}",
+                    fileId,
+                    decision.LocalPath,
+                    results[^1].Pages.Count,
+                    download.Mode);
             }
         }
     }
@@ -752,6 +811,13 @@ app.MapPost("/ocr", async Task<IResult> (
             statusCode: StatusCodes.Status502BadGateway);
     }
     catch (InvalidOperationException ex)
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = ex.Message },
+            AppJsonContext.Relaxed.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+    catch (FileNotFoundException ex)
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = ex.Message },
@@ -921,9 +987,11 @@ app.MapGet("/", () => Results.Text(
     "MiniOcr AOT API\n" +
     "POST /challenge  ← competition serviceUrl (also POST /)\n" +
     "  {\"teamId\":123,\"key\":\"...\",\"callbackUrl\":\"https://...\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
+    "  With MINIOCR_CHALLENGE_RESOURCE_DIR set, url may be omitted: fileId f1 reads {dir}/f1.pdf (read-only).\n" +
     "  → HTTP 200 {\"ok\":true} immediately; results POSTed async to callbackUrl\n" +
     "POST /ocr        debug sync OCR (competition shapes; response = callback body)\n" +
     "  {\"teamId\":0,\"key\":\"debug\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
+    "  Same resource dir: files:[{fileId:\"f1\"}] opens {dir}/f1.pdf and does not download.\n" +
     "  or legacy {\"url\":\"https://.../file.pdf\"} or {\"path\":\"C:\\\\...\\\\file.pdf\"} / ?dpi=96\n" +
     "  ?verbose=1 (or ?text=1) returns text, ms/page, and ruleList for pages that have rules\n" +
     "POST /ocr/upload multipart file field, or form field path= (local PDF, Unicode paths ok)\n" +
@@ -932,6 +1000,7 @@ app.MapGet("/", () => Results.Text(
     $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} " +
     $"ocr.mode={runtimeConfig.Mode} wechat={wechatStatus} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
+    "Env CHALLENGE: MINIOCR_CHALLENGE_RESOURCE_DIR (empty = require fileId+url; set = read-only {dir}/{fileId}.pdf)\n" +
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_OCR_BACKEND MINIOCR_OCR_VULKAN_DEVICE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_REC_INTRA_OP_THREADS MINIOCR_USE_CLS MINIOCR_REMOVE_RED_SEAL MINIOCR_RASTER_WORKERS MINIOCR_RENDER_MODE MINIOCR_RENDER_PROCESSES\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
