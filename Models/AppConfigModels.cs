@@ -48,13 +48,15 @@ public sealed class LlmFileConfig
     /// <summary>Non-empty OCR pages per LLM NER request (clamped 1–2000). Default 10. Blank pages are skipped and do not count.</summary>
     public int PagesPerRequest { get; set; } = 10;
     /// <summary>
-    /// Per-key NER concurrency when <see cref="MaxConcurrencyPerKey"/> is unset (clamped 1–32). Default 8.
-    /// With N keys the process may run about N × this many NER calls at once.
+    /// Per-key NER concurrency when <see cref="MaxConcurrencyPerKey"/> is unset.
+    /// Values below 1 are raised to 1. There is no low ceiling. Default 8.
+    /// With N keys the process may run N × this many NER calls at once.
     /// </summary>
     public int MaxConcurrency { get; set; } = 8;
     /// <summary>
-    /// Max in-flight NER chat completions for each API key (clamped 1–32).
-    /// Null reuses <see cref="MaxConcurrency"/>. With N live keys, in-flight NER is about N × this value.
+    /// Max in-flight NER chat completions for each API key.
+    /// Values below 1 are raised to 1. There is no low ceiling.
+    /// Null reuses <see cref="MaxConcurrency"/>. With N live keys, in-flight NER is N × this value.
     /// </summary>
     public int? MaxConcurrencyPerKey { get; set; }
     /// <summary>Max parallel vision OCR page calls when ocr.mode=llm (clamped 1–256).</summary>
@@ -161,14 +163,27 @@ public sealed class OcrFileConfig
 /// <summary>Resolved LLM settings after file + env overrides (apiKey never logged).</summary>
 public sealed class LlmRuntimeConfig
 {
-    /// <summary>Same clamp the historical global <c>maxConcurrency</c> used. Applied per key.</summary>
-    public const int MaxPerKeyConcurrency = 32;
-
     /// <summary>Cap on the resolved key list so a huge config cannot open unbounded HTTP calls.</summary>
     public const int MaxApiKeys = 64;
 
-    /// <summary>Upper bound on in-flight NER chat completions and advertised NER consumers (keys × per-key).</summary>
-    public const int MaxTotalConcurrency = MaxPerKeyConcurrency * MaxApiKeys;
+    /// <summary>
+    /// Not a throughput policy. In-flight NER is live keys × per-key slots (per-key floor is 1; default 8).
+    /// This constant is <see cref="int.MaxValue"/> so that product can be stored in an <c>int</c>
+    /// and passed to <see cref="SemaphoreSlim"/> without overflowing.
+    /// </summary>
+    public const int MaxTotalConcurrency = int.MaxValue;
+
+    /// <summary>
+    /// Live keys × per-key slots, saturated at <see cref="MaxTotalConcurrency"/> only when the
+    /// product would overflow an <c>int</c>. A non-positive key count is 0.
+    /// </summary>
+    public static int ScaleInFlight(int perKey, int keyCount)
+    {
+        if (perKey <= 0 || keyCount <= 0)
+            return 0;
+        long product = (long)perKey * keyCount;
+        return product >= MaxTotalConcurrency ? MaxTotalConcurrency : (int)product;
+    }
 
     public bool Enabled { get; init; }
     public string BaseUrl { get; init; } = "https://api.openai.com";
@@ -184,9 +199,10 @@ public sealed class LlmRuntimeConfig
     /// <summary>
     /// Effective NER in-flight limit after resolve: live key count × <see cref="MaxConcurrencyPerKey"/>,
     /// or the per-key value when no key is configured. One key keeps the historical meaning of <c>maxConcurrency</c>.
+    /// Not reduced by a second global ceiling.
     /// </summary>
     public int MaxConcurrency { get; init; } = 8;
-    /// <summary>Per-key NER slot count (1–32). Zero on a hand-built config means "use <see cref="MaxConcurrency"/> as the per-key limit".</summary>
+    /// <summary>Per-key NER slot count (at least 1 when resolved). Zero on a hand-built config means "use <see cref="MaxConcurrency"/> as the per-key limit".</summary>
     public int MaxConcurrencyPerKey { get; init; }
     public int OcrConcurrency { get; init; } = 32;
     public int OcrMaxCharsHint { get; init; } = 8000;

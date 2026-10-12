@@ -38,10 +38,8 @@ public sealed class LlmKeyPool
         _redactOrder = _keys.OrderByDescending(key => key.Length).ToArray();
         _inUse = new int[_keys.Length];
         _disabled = new bool[_keys.Length];
-        _perKey = Math.Clamp(
-            perKey <= 0 ? 8 : perKey,
-            1,
-            LlmRuntimeConfig.MaxPerKeyConcurrency);
+        // Unset or non-positive means the historical default of 8. A positive K is kept.
+        _perKey = perKey <= 0 ? 8 : perKey;
     }
 
     /// <summary>
@@ -84,7 +82,7 @@ public sealed class LlmKeyPool
         get
         {
             lock (_gate)
-                return LiveCountLocked() * _perKey;
+                return LlmRuntimeConfig.ScaleInFlight(_perKey, LiveCountLocked());
         }
     }
 

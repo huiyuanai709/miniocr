@@ -138,7 +138,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 
 多个 key 用来提高 NER 并发。`llm.apiKeys` 是字符串数组。环境变量 `MINIOCR_LLM_API_KEYS` 用逗号、分号或换行分隔；设置后覆盖文件里的 `apiKeys`。`llm.apiKey` / `MINIOCR_LLM_API_KEY` 仍是单个 key：环境变量覆盖文件里的 `apiKey`，再并入密钥池，重复的只留一份。池里最多 64 个 key。
 
-每个 key 同时在途的 NER 请求默认 8（1–32），和原来的 `maxConcurrency` 含义相同。`llm.maxConcurrencyPerKey`（或 `MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY`）优先；没设时 `maxConcurrency` 就是每个 key 的上限。N 个可用 key 时，NER 同时在途大约是 N × 每 key 并发。某个 key 收到 HTTP 401 后，本进程停用它，还有别的 key 就换一个重试。日志只记槽位序号，不写 key。视觉 OCR 仍按 `ocrConcurrency` 限流，每次请求从同一个池里借一个未停用的 key，401 同样会停用。
+每个 key 同时在途的 NER 请求默认 8（至少 1，没有 32 这类低上限），和原来的 `maxConcurrency` 含义相同。`llm.maxConcurrencyPerKey`（或 `MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY`）优先；没设时 `maxConcurrency` 就是每个 key 的上限。N 个可用 key 时，NER 同时在途就是 N × 每 key 并发，不再被另一个全局上限压低。只有乘积超过 `int` 能表示的范围时，才会停在 `int.MaxValue`，以便信号量能建出来。某个 key 收到 HTTP 401 后，本进程停用它，还有别的 key 就换一个重试。日志只记槽位序号，不写 key。视觉 OCR 仍按 `ocrConcurrency` 限流，每次请求从同一个池里借一个未停用的 key，401 同样会停用。
 
 `wechat` 只在 Windows x64 上查找本机插件（`WeChatOCR.exe` 或 `wxocr.dll`，以及同目录的 `mmmojo_64.dll`）。路径留空时按常见安装位置和卸载注册表查找。找不到插件时默认回退 `local`。
 
@@ -171,8 +171,8 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_LLM_API_KEYS` | `llm.apiKeys` | 空 | 逗号、分号或换行分隔。设置后覆盖文件里的 `apiKeys`，再与单个 key 合并去重 |
 | `MINIOCR_LLM_BASE_URL` | `llm.baseUrl` | — | 覆盖 base URL |
 | `MINIOCR_LLM_MODEL` | `llm.model` | — | 覆盖模型名 |
-| `MINIOCR_LLM_MAX_CONCURRENCY` | `llm.maxConcurrency` | 8 | 未设置每 key 上限时，每个 key 的 NER 并发（1–32）。N 个 key 时在途大约是 N 倍 |
-| `MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY` | `llm.maxConcurrencyPerKey` | 未设置 | 每个 key 的 NER 并发，优先于 `maxConcurrency`。1–32 |
+| `MINIOCR_LLM_MAX_CONCURRENCY` | `llm.maxConcurrency` | 8 | 未设置每 key 上限时，每个 key 的 NER 并发（至少 1，无低上限）。N 个 key 时在途是 N 倍 |
+| `MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY` | `llm.maxConcurrencyPerKey` | 未设置 | 每个 key 的 NER 并发，优先于 `maxConcurrency`。至少 1，无低上限 |
 | `MINIOCR_LLM_PAGES_PER_REQUEST` | `llm.pagesPerRequest` | 10 | 每个文本请求的非空页数 |
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | 32 | 视觉识别页级并发 |
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | 70 | 视觉 JPEG 质量（40–95） |

@@ -195,10 +195,11 @@ public static class AppConfigStore
         int perKey = perKeySetting is int explicitPerKey && explicitPerKey > 0
             ? explicitPerKey
             : maxConcurrency;
-        perKey = Math.Clamp(perKey, 1, LlmRuntimeConfig.MaxPerKeyConcurrency);
+        // Floor only. A configured per-key limit is not reduced to a small constant.
+        perKey = Math.Max(1, perKey);
         int effectiveConcurrency = apiKeys.Count == 0
             ? perKey
-            : (int)Math.Min(LlmRuntimeConfig.MaxTotalConcurrency, (long)perKey * apiKeys.Count);
+            : LlmRuntimeConfig.ScaleInFlight(perKey, apiKeys.Count);
 
         int ocrConcurrency = llm.OcrConcurrency <= 0 ? 32 : llm.OcrConcurrency;
         string? envOcrConcurrency = Environment.GetEnvironmentVariable("MINIOCR_LLM_OCR_CONCURRENCY");

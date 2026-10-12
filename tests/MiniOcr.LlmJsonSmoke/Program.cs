@@ -633,14 +633,44 @@ try
 
     Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEY", null);
     Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEYS", null);
-    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", "100");
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", null);
     Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY", null);
-    LlmRuntimeConfig clamped = AppConfigStore.ResolveLlm(new AppConfigFile
+    LlmRuntimeConfig defaults = AppConfigStore.ResolveLlm(new AppConfigFile
     {
         Llm = new LlmFileConfig { ApiKeys = ["a", "b"] },
     });
-    Assert(clamped.MaxConcurrencyPerKey == 32 && clamped.MaxConcurrency == 64,
-        "per-key concurrency clamps at 32 and the effective limit is keys times that");
+    Assert(defaults.MaxConcurrencyPerKey == 8 && defaults.MaxConcurrency == 16,
+        "unset per-key concurrency stays 8, so two keys allow 16 in flight");
+
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", "100");
+    LlmRuntimeConfig scaled = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig { ApiKeys = ["a", "b"] },
+    });
+    Assert(scaled.MaxConcurrencyPerKey == 100 && scaled.MaxConcurrency == 200,
+        "per-key concurrency is not clamped at 32; the effective limit is keys times that");
+
+    var manyKeys = new List<string>(40);
+    for (int i = 0; i < 40; i++)
+        manyKeys.Add("key-" + i.ToString());
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", "80");
+    LlmRuntimeConfig wide = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig { ApiKeys = manyKeys },
+    });
+    Assert(wide.ApiKeyCount == 40 && wide.MaxConcurrencyPerKey == 80 && wide.MaxConcurrency == 3200,
+        "total NER in-flight is N×K and is not capped at 32×64");
+    LlmKeyPool widePool = LlmKeyPool.FromConfig(wide);
+    Assert(widePool.KeyCount == 40 && widePool.PerKey == 80 && widePool.MaxInFlight == 3200,
+        "the key pool exposes the same N×K slots with no global ceiling");
+
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", "0");
+    LlmRuntimeConfig floored = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig { ApiKey = "only" },
+    });
+    Assert(floored.MaxConcurrencyPerKey == 1 && floored.MaxConcurrency == 1,
+        "a non-positive concurrency is raised to 1");
 
     LlmKeyPool reused = LlmKeyPool.FromConfig(new LlmRuntimeConfig
     {
@@ -800,6 +830,40 @@ using (HttpClient overlapHttp = new(overlap) { BaseAddress = new Uri("http://llm
     string logs = string.Join("\n", overlapLog.Lines);
     Assert(!logs.Contains("k-one", StringComparison.Ordinal) && !logs.Contains("k-two", StringComparison.Ordinal),
         "overlap logs do not contain key material");
+}
+
+OverlapHandler wideOverlap = new(releaseAt: 40);
+using (HttpClient wideHttp = new(wideOverlap) { BaseAddress = new Uri("http://llm.test") })
+{
+    var widePages = new OcrPageResult[40];
+    for (int i = 0; i < widePages.Length; i++)
+        widePages[i] = new OcrPageResult { Page = i + 1, Text = "甲方北京华腾科技有限公司" };
+    LlmEntityExtractor wideExtractor = new(wideHttp, new LlmRuntimeConfig
+    {
+        Enabled = true,
+        BaseUrl = "http://llm.test",
+        ApiKeys = ["k-one", "k-two"],
+        Model = "test-model",
+        TimeoutSeconds = 30,
+        PagesPerRequest = 1,
+        MaxCharsPerRequest = 100_000,
+        MaxConcurrency = 20,
+        MaxConcurrencyPerKey = 20,
+        JsonObject = true,
+        NerMaxAttempts = 1,
+    }, new QuietLog());
+    Exception? wideError = null;
+    try
+    {
+        await wideExtractor.ExtractAsync(widePages, CancellationToken.None);
+    }
+    catch (Exception ex)
+    {
+        wideError = ex;
+    }
+
+    Assert(wideError is null && wideOverlap.Peak >= 40,
+        $"two keys at 20 each run 40 NER calls together (peak={wideOverlap.Peak}, {wideError?.Message})");
 }
 
 ListLog visionLog = new();
@@ -1096,10 +1160,13 @@ sealed class KeyFailoverHandler : HttpMessageHandler
 
 sealed class OverlapHandler : HttpMessageHandler
 {
+    private readonly int _releaseAt;
     private readonly TaskCompletionSource _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _inFlight;
     public int Peak { get; private set; }
     public List<string> Authorizations { get; } = [];
+
+    public OverlapHandler(int releaseAt = 2) => _releaseAt = releaseAt;
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
@@ -1112,7 +1179,7 @@ sealed class OverlapHandler : HttpMessageHandler
                 Peak = now;
         }
 
-        if (now >= 2)
+        if (now >= _releaseAt)
             _gate.TrySetResult();
         try
         {

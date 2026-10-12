@@ -50,10 +50,10 @@ public sealed class LlmEntityExtractor
         if (!IsUsable)
             throw new InvalidOperationException("LLM entity extraction is not configured.");
 
+        // Session gate matches the pool: live keys × per-key slots. No second global ceiling.
         int concurrency = _keys.MaxInFlight;
         if (concurrency <= 0)
             throw new InvalidOperationException("LLM entity extraction is not configured.");
-        concurrency = Math.Min(concurrency, LlmRuntimeConfig.MaxTotalConcurrency);
         _logger.LogInformation(
             "LLM NER streaming: pageCount={PageCount}, pagesPerRequest={PagesPerRequest}, maxCharsPerRequest={MaxChars}, maxConcurrency={MaxConcurrency}, perKey={PerKey}, apiKeyCount={ApiKeyCount}",
             pageCount,
