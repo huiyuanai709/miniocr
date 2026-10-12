@@ -30,10 +30,12 @@ public sealed class LlmVisionOcr
         "- persons: natural names only. Strip 先生/女士/经理. No roles alone (原告, 甲方, 法定代表人), no pronouns, no masked names (张某, 李某某). " +
         "Do not guess a person by one lookalike character (张纬 stays 张纬 unless the corrected name is also written on the page).\n" +
         "- companies: full legal names ending in 公司/集团/银行/事务所/合伙企业 or Inc/Ltd/LLC/Corp. " +
-        "If both a short name and the full name are visible, output only the full name. " +
+        "If both a legal full name and a short form are visible, output both when the short form still contains 公司 (for example 人才公司 together with its full name). " +
+        "Drop a short alias that does not contain 公司. " +
         "Keep a parent and its 分公司/分行 when both are visible. " +
         "Correct one OCR lookalike using the rest of the page, for example 公同/公可→公司, 技木→技术, 股分→股份. Do not turn one company into a different company.\n" +
         "- Do not output courts, procuratorates, governments, 公安/管理局/仲裁委员会, or universities/hospitals/schools unless the name contains 公司.\n" +
+        "- Do not output a department or internal unit that is not a registered company, such as 客户服务中心 or 商务服务中心, or a name ending in 中心 without a commercial suffix (公司/集团/银行/事务所).\n" +
         "- Do not output product names, addresses, or project titles.\n" +
         "- Join characters split by spaces or line breaks. Do not invent a name that is not on the page.\n" +
         "- count = number of occurrences on this page; originText length 10–100 chars each and must contain the corrected personName or companyName.\n" +
