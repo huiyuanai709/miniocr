@@ -184,6 +184,13 @@ public sealed class ClusterWorkerHost : IHostedService
             return false;
         }
 
+        if (GpuHeldByCurrentFile(req.JobId.Trim()))
+        {
+            // Acknowledge the poke. The dispatch poll starts this PDF once the GPU goes idle,
+            // so a busy tail is not split across two files.
+            return true;
+        }
+
         StartSession(
             req.JobId.Trim(),
             req.CoordinatorUrl.Trim().TrimEnd('/'),
@@ -220,7 +227,8 @@ public sealed class ClusterWorkerHost : IHostedService
                 try
                 {
                     ClusterDispatchResponse? dispatch = await DispatchAsync(ct).ConfigureAwait(false);
-                    if (dispatch is { Wait: false, JobId.Length: > 0, PdfPath.Length: > 0 })
+                    if (dispatch is { Wait: false, JobId.Length: > 0, PdfPath.Length: > 0 }
+                        && !GpuHeldByCurrentFile(dispatch.JobId))
                     {
                         StartSession(
                             dispatch.JobId,
@@ -260,6 +268,13 @@ public sealed class ClusterWorkerHost : IHostedService
         }
     }
 
+    /// <summary>True when another file still has pages on this GPU. The next PDF waits until that hits zero.</summary>
+    private bool GpuHeldByCurrentFile(string jobId) =>
+        jobId.Length > 0
+        && !_ocrSlots.ContainsKey(jobId)
+        && _ocrSlots.Count > 0
+        && !ClusterDispatchRules.CanOverlapNextPdf(Volatile.Read(ref _inFlight));
+
     private void StartSession(
         string jobId,
         string coordinatorUrl,
@@ -270,10 +285,11 @@ public sealed class ClusterWorkerHost : IHostedService
         int pdfLength,
         string traceEntry)
     {
-        if (!ClusterDispatchRules.CanStartOcrSession(_ocrSlots.Count, _sessions.ContainsKey(jobId)))
+        if (!ClusterDispatchRules.CanStartOcrSession(_ocrSlots.Count, _sessions.ContainsKey(jobId))
+            || GpuHeldByCurrentFile(jobId))
         {
             _logger.LogDebug(
-                "Cluster worker {NodeId} ignored job {JobId}: at session capacity",
+                "Cluster worker {NodeId} ignored job {JobId}: at session capacity or GPU still in another file",
                 _self.NodeId,
                 jobId);
             return;

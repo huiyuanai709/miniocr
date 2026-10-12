@@ -1225,6 +1225,38 @@ Console.WriteLine("=== dispatch rules ===");
     AssertTrue(
         ClusterDispatchRules.CanStartOcrSession(2, alreadyInJob: true),
         "a job the worker already joined is not rejected by the OCR cap");
+    AssertTrue(ClusterDispatchRules.CanOverlapNextPdf(0), "an idle GPU may open the next PDF");
+    AssertTrue(!ClusterDispatchRules.CanOverlapNextPdf(3), "a GPU still inside another file does not split");
+}
+
+Console.WriteLine("=== next PDF starts when the queue is empty and a GPU slot is free ===");
+{
+    ClusterPageScheduler full = NewScheduler(4, expectedNodes: 1, pagesPerBatch: 4);
+    full.SetCapacity("a", 4);
+    DateTimeOffset t0 = new(2026, 5, 1, 0, 0, 0, TimeSpan.Zero);
+    AssertTrue(!full.GpuHasRoom(), "a full pending queue does not release the next PDF");
+    ClusterClaim held = full.Claim("a", 4, t0);
+    AssertTrue(held.Kind == ClusterClaimKind.Batch && held.Pages.Length == 4, "one node takes every page");
+    AssertTrue(!full.GpuHasRoom(), "no spare slot while every leased page is still in flight");
+    AssertTrue(full.TryCommit(held.BatchId, held.Pages[0], t0), "the first page of the tail commits");
+    AssertTrue(full.GpuHasRoom(), "a free slot releases the next PDF while the tail is still running");
+
+    ClusterPageScheduler streaming = new(new ClusterScheduleOptions
+    {
+        PageCount = 8,
+        LocalNodeId = "a",
+        ExpectedNodes = 2,
+        DeferAdmission = true,
+        LeaseFloorMs = 60_000,
+        PageTimeoutMs = 60_000,
+        SpeculativeTailPages = 1,
+        SpeculativeStaleLeases = false,
+    });
+    streaming.SetCapacity("a", 4);
+    streaming.SetCapacity("b", 4);
+    AssertTrue(!streaming.GpuHasRoom(), "streaming classification does not release the next PDF");
+    streaming.AdmitPage(0);
+    AssertTrue(!streaming.GpuHasRoom(), "an open admission with a non-empty queue holds the next PDF");
 }
 
 Console.WriteLine("=== multi-file OCR overlaps the previous file's tail ===");
@@ -1261,6 +1293,44 @@ Console.WriteLine("=== multi-file OCR overlaps the previous file's tail ===");
     tail0.TrySetResult();
     await run.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
     AssertTrue(run.IsCompletedSuccessfully, "the batch returns after the overlapped tail");
+}
+
+Console.WriteLine("=== next PDF starts while the previous file's OCR is still running ===");
+{
+    TaskCompletionSource ocr0 = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    TaskCompletionSource release0 = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    TaskCompletionSource tail0 = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    TaskCompletionSource file1Started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    int started = 0;
+    Task run = SequentialPdfOverlap.RunAsync(
+        2,
+        (index, _) =>
+        {
+            Interlocked.Increment(ref started);
+            if (index == 0)
+            {
+                return Task.FromResult<SequentialPdfOverlap.Started?>(
+                    new SequentialPdfOverlap.Started(ocr0.Task, tail0.Task, release0.Task));
+            }
+
+            file1Started.TrySetResult();
+            return Task.FromResult<SequentialPdfOverlap.Started?>(
+                new SequentialPdfOverlap.Started(Task.CompletedTask, Task.CompletedTask));
+        },
+        continueAfterFailure: true,
+        CancellationToken.None);
+
+    await Task.Delay(80).ConfigureAwait(false);
+    AssertTrue(Volatile.Read(ref started) == 1, "file 2 waits until a GPU slot is released");
+    AssertTrue(!file1Started.Task.IsCompleted, "file 2 has not started before the release");
+    release0.TrySetResult();
+    await file1Started.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+    AssertTrue(!ocr0.Task.IsCompleted, "file 2 starts while file 1 OCR is still running");
+    AssertTrue(!run.IsCompleted, "the batch stays open until every tail finishes");
+    ocr0.TrySetResult();
+    tail0.TrySetResult();
+    await run.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+    AssertTrue(run.IsCompletedSuccessfully, "early release still joins the previous tail");
 }
 
 Console.WriteLine("=== earlier tails stay in flight while a later file starts OCR ===");

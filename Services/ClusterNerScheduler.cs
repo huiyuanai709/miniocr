@@ -1062,9 +1062,10 @@ public static class ClusterNerAssembler
     }
 
     /// <summary>
-    /// Direction A: turn the model's per-page ruleList into protocol hits. A page is kept
+    /// Direction A: turn the model's per-page rules into protocol hits. A page is kept
     /// only when it belongs to this group (a page number taken from the lookahead head is
-    /// dropped), and the model's own <c>count</c> / <c>originText</c> are preserved.
+    /// dropped). The model's own <c>count</c> is preserved. <c>originText</c> is whatever
+    /// the caller stored: the model snippet, or the locally rebuilt one.
     /// </summary>
     public static List<ClusterNerEntityHit> BuildFromPages(
         IReadOnlyList<OcrPageResult> groupPages,

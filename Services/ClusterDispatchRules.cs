@@ -27,6 +27,13 @@ public static class ClusterDispatchRules
         alreadyInJob || ocrSessions < MaxWorkerSessions;
 
     /// <summary>
+    /// A node that still has pages of another file on its GPU does not open the next PDF.
+    /// In-flight 0 means the claim loop is waiting, so that GPU can take the next file
+    /// while busier nodes finish the tail.
+    /// </summary>
+    public static bool CanOverlapNextPdf(int inFlightPages) => inFlightPages <= 0;
+
+    /// <summary>
     /// <paramref name="activeSessions"/> is the worker's OCR session count when it sent one.
     /// NER-only tails are not included. Older workers omit it; fall back to the number of job ids they listed.
     /// </summary>

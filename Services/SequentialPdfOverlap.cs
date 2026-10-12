@@ -1,9 +1,10 @@
 namespace MiniOcr.Services;
 
 /// <summary>
-/// Runs PDFs one GPU at a time. OCR of file N+1 starts when file N's OCR finishes.
-/// Each file's NER (or any other post-OCR work) stays in flight and is joined
-/// before <see cref="RunAsync"/> returns, so the combined result is complete.
+/// Runs PDFs one after another. File N+1 starts when <see cref="Started.ReleaseNext"/>
+/// completes — the cluster signals that as soon as file N's claim queue is empty and a
+/// GPU slot is free, otherwise when file N's OCR finishes. Each file's NER stays in
+/// flight and is joined before <see cref="RunAsync"/> returns.
 /// </summary>
 public static class SequentialPdfOverlap
 {
@@ -14,7 +15,10 @@ public static class SequentialPdfOverlap
     /// Completes when this file is fully done, including NER. Must not fault;
     /// the caller records per-file errors inside the task.
     /// </param>
-    public readonly record struct Started(Task OcrCompleted, Task Finished);
+    /// <param name="ReleaseNext">
+    /// Completes when the next PDF may take a free GPU. Null waits for <paramref name="OcrCompleted"/>.
+    /// </param>
+    public readonly record struct Started(Task OcrCompleted, Task Finished, Task? ReleaseNext = null);
 
     public static async Task RunAsync(
         int fileCount,
@@ -34,11 +38,15 @@ public static class SequentialPdfOverlap
                 if (started is null)
                     continue;
 
+                Started run = started.Value;
                 // Keep the tail even when OCR faults, so NER (and buffer release) still finishes.
-                finished.Add(started.Value.Finished);
+                finished.Add(run.Finished);
+                Task release = run.ReleaseNext ?? run.OcrCompleted;
+                if (run.ReleaseNext is not null)
+                    _ = Observe(run.OcrCompleted);
                 try
                 {
-                    await started.Value.OcrCompleted.ConfigureAwait(false);
+                    await release.ConfigureAwait(false);
                 }
                 catch (Exception) when (continueAfterFailure)
                 {
@@ -49,6 +57,19 @@ public static class SequentialPdfOverlap
         finally
         {
             await Task.WhenAll(finished).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task Observe(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch
+        {
+            // The overlap gate already decided whether to start the next file.
+            // The file's own tail records the OCR failure.
         }
     }
 }

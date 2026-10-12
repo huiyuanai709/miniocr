@@ -304,7 +304,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 加大 `MINIOCR_CLUSTER_LEASE_SECONDS` 或 `MINIOCR_CLUSTER_PAGE_TIMEOUT_SECONDS` **不会**减少这种日志，只会让卡死的批更晚回到队列（那一行是 `lease expired`）。join grace、自适应 batch、公平认领也不是这条日志的原因。`MINIOCR_CLUSTER_SPECULATIVE_TAIL=0` 会被夹成 1，最后一页的副本关不掉。
 
-8×4090、每进程 4 个引擎时，所有进程加上：
+8×4090、每进程 8 个引擎时，所有进程加上：
 
 ```bash
 MINIOCR_CLUSTER_SPECULATIVE_STALE=0
@@ -313,52 +313,99 @@ MINIOCR_CLUSTER_SPECULATIVE_TAIL=1
 
 健康的卡不再互相复制默认的队尾 4 页，也不再复制“只跑了 2.5 秒”的租约。最后 1 页仍会复制，用来盖住真正慢的那一页。某张卡没响应时，页要等该批租约到期才回队列（2 页默认 40 秒，一批最长 180 秒）；整次任务的后盾仍是 `jobDeadlineSeconds`（默认 300）。长文档的 `speculativeCopies` 接近 0 就保持这两项。若有一张卡稳定更慢、尾延迟变差，再把 `MINIOCR_CLUSTER_SPECULATIVE_STALE` 设回 `1`。
 
-`MINIOCR_CLUSTER_CAPACITY` 保持 `0`（跟引擎数走，这里是 4）。`renderAheadPages` 保持 4。不要把 capacity 设得比本进程引擎数更大，调度器会高估这张卡的并行度，更容易把还在排队的页当成已经超时。
+`MINIOCR_CLUSTER_CAPACITY` 保持 `0`（跟引擎数走，这里是 8）。`renderAheadPages` 保持 4。不要把 capacity 设得比本进程引擎数更大，调度器会高估这张卡的并行度，更容易把还在排队的页当成已经超时。
 
 上传的 PDF 没有可再次下载的地址时，协调进程把它写到 `MINIOCR_CLUSTER_SHARED_DIR`（compose 里是卷 `miniocr-jobs`，挂到 `/var/lib/miniocr/jobs`）。同机的工作进程直接打开这个文件。路径不存在或长度对不上时，仍向协调进程下载。任务结束后删除该文件；渲染进程先放开对它的映射。别的机器上看不到这个路径，所以还是走下载。
 
 比赛目录 `MINIOCR_CHALLENGE_RESOURCE_DIR` 里的 PDF 不走上面的复制：worker 就地只读打开原件，任务结束不删除。该目录不要指到 `sharedDir`。
 
-### 不用 Docker：本机脚本起 8 个进程（128 核 + 8×4090）
+### 不用 Docker：本机脚本起 8 个 GPU 进程 + 1 个 CPU 进程（128 核 + 8×4090）
 
 同一台机器上直接起 8 个 `MiniOcr` 进程时，每个进程都能看到全部 128 个核和 8 张卡，和容器里的情况不同，有几件事要在启动脚本里做：
 
 - **一卡一进程，并核对枚举顺序。** `MINIOCR_OCR_VULKAN_DEVICE=N` 是 Vulkan 的枚举序号，不一定等于 `nvidia-smi` 的序号（装了 lavapipe 之类软件设备时会错位）。起完后用 `nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv` 核对每张卡恰好一个进程；或者写设备名子串。
-- **按 NUMA 绑核绑内存。** 不绑的话 8 个进程各自按 128 核起线程池、GC 堆和 4 个渲染进程，互相抢核。`nvidia-smi topo -m` 里每张卡有所属的 NUMA 节点，用 `numactl --cpunodebind=<node> --membind=<node>`（或 `taskset -c` 给每进程 16 个核）把进程放到卡所在的节点上。进程内 `Environment.ProcessorCount` 跟着 cpuset 变小，`autoScaleFromCpu` 会据此收缩 raster / 渲染进程数。
+- **按 NUMA 绑核绑内存。** 不绑的话 8 个进程各自按 128 核起线程池、GC 堆和渲染进程，互相抢核。`nvidia-smi topo -m` 里每张卡有所属的 NUMA 节点。每个节点留出最后 2 个逻辑核给 CPU OCR 进程，其余核 `taskset` 给该卡的进程，再用 `numactl --membind` 绑内存。进程内 `Environment.ProcessorCount` 跟着 cpuset 变小，`autoScaleFromCpu` 会据此收缩 raster / 渲染进程数。
+- **第 9 个进程走 CPU 后端。** 绑在留出来的核上，`MINIOCR_OCR_BACKEND=cpu`。拉模式按它自己的 pages/s 领页，不会抢走 GPU 上的整批。AVX-512 上 ChineseV6Medium 是 fp32，精度不低于 GPU fp16。不要和 GPU 进程抢同一组核。
 - **渲染位图走 tmpfs。** 渲染进程用 `Path.GetTempPath()` 下的文件做内存映射传位图，默认落在磁盘 `/tmp`，会产生无意义的回写。每个进程设 `TMPDIR=/dev/shm/miniocr-gpuN`（先 `mkdir -p`）。
 - **三处路径所有进程一致。** `MINIOCR_CHALLENGE_RESOURCE_DIR`、`MINIOCR_CLUSTER_SHARED_DIR`、`MINIOCR_CONFIG_PATH` 用同一个绝对路径，worker 才能就地打开 PDF，而不是向协调进程下载。
 - **Vulkan 管线缓存每卡一份。** 8 个进程写同一个缓存文件会互相覆盖，`SIMD_OCR_VK_PIPELINE_CACHE=/var/cache/miniocr/vk-gpuN`。
 
-一个可直接套用的片段（`N` 为 0–7，`gpu0` 是协调进程）：
+一个可直接套用的片段（`gpu0` 是协调进程，`cpu0` 是第 9 个进程）。每个 NUMA 节点核数 ≤ 4 时不要再往外切核，CPU 进程也就不要起。
 
 ```bash
-N=0; NODE=$(nvidia-smi topo -m | awk -v g="GPU$N" '$1==g{print $NF}')
-mkdir -p /dev/shm/miniocr-gpu$N /var/cache/miniocr/vk-gpu$N
-MINIOCR_CONFIG_PATH=/opt/miniocr/config.json \
-MINIOCR_CLUSTER_ENABLED=1 \
-MINIOCR_CLUSTER_ROLE=$([ $N -eq 0 ] && echo coordinator || echo worker) \
-MINIOCR_CLUSTER_NODE_ID=gpu$N \
-MINIOCR_CLUSTER_ADVERTISE_URL=http://127.0.0.1:$((5080+N)) \
-MINIOCR_CLUSTER_COORDINATOR_URL=http://127.0.0.1:5080 \
-MINIOCR_CLUSTER_WORKERS=http://127.0.0.1:5081,http://127.0.0.1:5082,http://127.0.0.1:5083,http://127.0.0.1:5084,http://127.0.0.1:5085,http://127.0.0.1:5086,http://127.0.0.1:5087 \
-MINIOCR_CLUSTER_TOKEN=... MINIOCR_LLM_API_KEY=... \
-MINIOCR_OCR_BACKEND=vulkan MINIOCR_OCR_VULKAN_DEVICE=$N \
-MINIOCR_ENGINES=4 MINIOCR_LINE_WORKERS=4 MINIOCR_DET_THREADS=4 \
-MINIOCR_DPI=144 \
-MINIOCR_LLM_PAGES_PER_REQUEST=5 \
-MINIOCR_CLUSTER_SPECULATIVE_STALE=0 MINIOCR_CLUSTER_SPECULATIVE_TAIL=1 \
-MINIOCR_CHALLENGE_RESOURCE_DIR=/data/resource \
-MINIOCR_CLUSTER_SHARED_DIR=/var/lib/miniocr/jobs \
-TMPDIR=/dev/shm/miniocr-gpu$N \
-SIMD_OCR_VK_PIPELINE_CACHE=/var/cache/miniocr/vk-gpu$N \
-numactl --cpunodebind=$NODE --membind=$NODE ./MiniOcr --urls http://0.0.0.0:$((5080+N)) &
+expand_cpulist() {
+  awk -F, '{
+    for (i = 1; i <= NF; i++) {
+      n = split($i, a, "-")
+      if (n == 1) print a[1]
+      else for (c = a[1]; c <= a[2]; c++) print c
+    }
+  }' <<<"$1"
+}
+
+WORKERS=http://127.0.0.1:5081,http://127.0.0.1:5082,http://127.0.0.1:5083,http://127.0.0.1:5084,http://127.0.0.1:5085,http://127.0.0.1:5086,http://127.0.0.1:5087,http://127.0.0.1:5088
+CPU_CPUS=()
+for N in 0 1 2 3 4 5 6 7; do
+  NODE=$(nvidia-smi topo -m | awk -v g="GPU$N" '$1==g{print $NF}')
+  mapfile -t CPUS < <(expand_cpulist "$(cat /sys/devices/system/node/node${NODE}/cpulist)")
+  if [ "${#CPUS[@]}" -le 4 ]; then
+    GPU_CPUS=$(IFS=,; echo "${CPUS[*]}")
+  else
+    GPU_CPUS=$(IFS=,; echo "${CPUS[*]:0:${#CPUS[@]}-2}")
+    CPU_CPUS+=("${CPUS[@]: -2}")
+  fi
+  mkdir -p /dev/shm/miniocr-gpu$N /var/cache/miniocr/vk-gpu$N
+  MINIOCR_CONFIG_PATH=/opt/miniocr/config.json \
+  MINIOCR_CLUSTER_ENABLED=1 \
+  MINIOCR_CLUSTER_ROLE=$([ $N -eq 0 ] && echo coordinator || echo worker) \
+  MINIOCR_CLUSTER_NODE_ID=gpu$N \
+  MINIOCR_CLUSTER_ADVERTISE_URL=http://127.0.0.1:$((5080+N)) \
+  MINIOCR_CLUSTER_COORDINATOR_URL=http://127.0.0.1:5080 \
+  MINIOCR_CLUSTER_WORKERS=$WORKERS \
+  MINIOCR_CLUSTER_TOKEN=... MINIOCR_LLM_API_KEY=... \
+  MINIOCR_OCR_BACKEND=vulkan MINIOCR_OCR_VULKAN_DEVICE=$N \
+  MINIOCR_ENGINES=8 MINIOCR_LINE_WORKERS=4 MINIOCR_DET_THREADS=4 \
+  MINIOCR_DPI=144 \
+  MINIOCR_LLM_PAGES_PER_REQUEST=5 \
+  MINIOCR_CLUSTER_SPECULATIVE_STALE=0 MINIOCR_CLUSTER_SPECULATIVE_TAIL=1 \
+  MINIOCR_CHALLENGE_RESOURCE_DIR=/data/resource \
+  MINIOCR_CLUSTER_SHARED_DIR=/var/lib/miniocr/jobs \
+  TMPDIR=/dev/shm/miniocr-gpu$N \
+  SIMD_OCR_VK_PIPELINE_CACHE=/var/cache/miniocr/vk-gpu$N \
+  numactl --membind=$NODE taskset -c "$GPU_CPUS" ./MiniOcr --urls http://0.0.0.0:$((5080+N)) &
+done
+
+if [ "${#CPU_CPUS[@]}" -gt 0 ]; then
+  CPU_SET=$(IFS=,; echo "${CPU_CPUS[*]}")
+  mkdir -p /dev/shm/miniocr-cpu
+  MINIOCR_CONFIG_PATH=/opt/miniocr/config.json \
+  MINIOCR_CLUSTER_ENABLED=1 \
+  MINIOCR_CLUSTER_ROLE=worker \
+  MINIOCR_CLUSTER_NODE_ID=cpu0 \
+  MINIOCR_CLUSTER_ADVERTISE_URL=http://127.0.0.1:5088 \
+  MINIOCR_CLUSTER_COORDINATOR_URL=http://127.0.0.1:5080 \
+  MINIOCR_CLUSTER_WORKERS=$WORKERS \
+  MINIOCR_CLUSTER_TOKEN=... MINIOCR_LLM_API_KEY=... \
+  MINIOCR_OCR_BACKEND=cpu \
+  MINIOCR_ENGINES=8 MINIOCR_LINE_WORKERS=2 MINIOCR_DET_THREADS=2 \
+  MINIOCR_RASTER_WORKERS=4 MINIOCR_RENDER_PROCESSES=2 \
+  MINIOCR_DPI=144 \
+  MINIOCR_LLM_PAGES_PER_REQUEST=5 \
+  MINIOCR_CLUSTER_SPECULATIVE_STALE=0 MINIOCR_CLUSTER_SPECULATIVE_TAIL=1 \
+  MINIOCR_CHALLENGE_RESOURCE_DIR=/data/resource \
+  MINIOCR_CLUSTER_SHARED_DIR=/var/lib/miniocr/jobs \
+  TMPDIR=/dev/shm/miniocr-cpu \
+  taskset -c "$CPU_SET" ./MiniOcr --urls http://0.0.0.0:5088 &
+fi
 ```
 
 几项取值的理由：
 
+- `MINIOCR_ENGINES=8`：24GB 上原来的 4 个引擎占不满卡。提交之间 GPU 在等 CPU 做前后处理，多几个引擎把队列填上。`nvidia-smi dmon -s u` 若显存顶满或单页变慢，改回 6。`MINIOCR_CLUSTER_CAPACITY` 保持 0，认领上限跟着变成 8。
 - `MINIOCR_DPI=144`：96 DPI 下五号字只有约 14 px 高，识别器要把它放大到 48 px，形近字错得多。144 DPI 像素量约为 96 的 2.25 倍，渲染和裁剪多花 CPU（128 核有余量）；`MINIOCR_DET_LIMIT_SIDE` 默认跟着从 960 升到 1440，检测在 4090 上多出的仍是毫秒级；识别裁剪统一缩到 48 px 高，耗时基本不变。先用几份样本对比 96 / 144 的实体召回再定。
-- `MINIOCR_LINE_WORKERS=4 MINIOCR_DET_THREADS=4`：GPU 后端默认把这两项夹到 2，那是给 8 核机器留的。每张卡配 16 个核时，4 个引擎各 4 个行并发能把识别批填满，检测前处理也不再排队。
-- `MINIOCR_LLM_PAGES_PER_REQUEST=5`：`config.docker.json` 里是 20，一份 20 页以内的文件只会在 OCR 全部结束后发一个 NER 请求，模型要把所有页的 `count` 和 `originText` 逐条输出，这段纯串行的尾巴常常比 OCR 本身长。5 页一组时前面的组在 OCR 还没结束就开始跑，最后一组也只有 1/4 的输出量。代价是跨组的形近字互证少了，页边界的拼接仍由"下一页开头"保证。8 个进程各 16 并发，总并发 128，出口足够。
+- `MINIOCR_LINE_WORKERS=4 MINIOCR_DET_THREADS=4`：GPU 后端默认把这两项夹到 2，那是给 8 核机器留的。每张卡大约 14 个核时，8 个引擎各 4 个行并发能把识别批填满，检测前处理也不再排队。CPU 进程只有留出来的核，这两项用 2。
+- `MINIOCR_LLM_PAGES_PER_REQUEST=5`：`config.docker.json` 里是 20，一份 20 页以内的文件只会在 OCR 全部结束后发一个 NER 请求。模型现在只输出每页的名字和次数（`{"p":[{"n":1,"c":[["公司",2]],"r":[["姓名",1]]}]}`），`originText` 由本地按页正文截取，输出 token 大约只剩原来的两到三成。5 页一组时前面的组在 OCR 还没结束就开始跑。代价是跨组的形近字互证少了，页边界的拼接仍由"下一页开头"保证。9 个进程各 16 并发，出口足够。
+- 文件边界：上一份的待认领队列见底、还在飞的页数少于已参与节点的引擎容量之和时，下一份就会开始。空闲的卡去领下一份；还拿着页的卡不会把同一张 GPU 拆成两份 OCR。NER 仍和原来一样在 OCR 结束后继续跑。
 - 认领长轮询：`/cluster/jobs/{id}/claim` 没有可发的页时，协调进程先按 `MINIOCR_CLUSTER_CLAIM_HOLD_MS`（默认 150）等文本层流式分类放出新页或租约回收，再回答 `wait`，worker 不用睡满 `retryAfterMs`。设 `0` 回到立即返回。
 - 流式分类期间的认领不再被压成 1 页：调度器把分类器还没公布的页也算进"待办"，8 张卡在队列刚有 3 页时不会各拿 1 页然后空转，`renderAheadPages` 从第一批就生效。
 
@@ -371,7 +418,7 @@ docker compose build
 docker compose up
 ```
 
-健康检查：`curl -sS http://127.0.0.1:5080/health`（工作进程把端口换成 `5081`–`5087`）。GPU 预热较慢，compose 的 `start_period` 是 180 秒。
+健康检查：`curl -sS http://127.0.0.1:5080/health`（GPU 工作进程把端口换成 `5081`–`5087`，CPU 进程是 `5088`）。GPU 预热较慢，compose 的 `start_period` 是 180 秒。
 
 镜像里的二进制带 AVX-512。CPU 没有该指令集时进程会直接退出，改回 AVX2 再构建：
 
