@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -425,34 +426,129 @@ public sealed class LlmEntityExtractor
         }
     }
 
+    /// <summary>
+    /// One NER group. Parse failures and transient HTTP are retried up to
+    /// <see cref="LlmRuntimeConfig.NerMaxAttempts"/> (default 3). 401/403 fail on the first response.
+    /// The last failure is thrown unchanged so cluster NER requeues and the local pipeline can still return empty.
+    /// </summary>
     private async Task<BatchResult> CompleteBatchAsync(
         LlmPageGrouper.PageBatch batch,
         bool pagesMode,
         CancellationToken ct)
     {
-        Exception? parseError = null;
-        for (int attempt = 0; attempt < 2; attempt++)
+        int maxAttempts = NormalizeNerAttempts(_config.NerMaxAttempts);
+        string pages = string.Join(',', batch.PageNumbers);
+        Exception? last = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
             {
-                return await CompleteBatchOnceAsync(batch, pagesMode, ct).ConfigureAwait(false);
+                return await CompleteBatchOnceAsync(batch, pagesMode, attempt, maxAttempts, ct)
+                    .ConfigureAwait(false);
             }
-            catch (Exception ex) when (attempt == 0 && LlmJson.IsParseFailure(ex) && !ct.IsCancellationRequested)
+            catch (Exception ex) when (!ct.IsCancellationRequested)
             {
-                parseError = ex;
+                last = ex;
+                bool retry = attempt < maxAttempts && IsRetryableNerFailure(ex);
+                if (!retry)
+                {
+                    if (IsAuthFailure(ex))
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "LLM NER attempt {Attempt}/{MaxAttempts} failed for pages {Pages} ({Reason}); not retrying",
+                            attempt,
+                            maxAttempts,
+                            pages,
+                            DescribeRetry(ex));
+                    }
+
+                    throw;
+                }
+
                 _logger.LogWarning(
                     ex,
-                    "LLM NER JSON parse failed for pages {Pages}; retrying the group once",
-                    string.Join(',', batch.PageNumbers));
+                    "LLM NER attempt {Attempt}/{MaxAttempts} failed for pages {Pages} ({Reason}); retrying",
+                    attempt,
+                    maxAttempts,
+                    pages,
+                    DescribeRetry(ex));
+                await Task.Delay(RetryBackoffMs(attempt), ct).ConfigureAwait(false);
             }
         }
 
-        throw parseError ?? new InvalidOperationException("LLM NER JSON parse failed.");
+        throw last ?? new InvalidOperationException("LLM NER failed.");
+    }
+
+    /// <summary>Unset or non-positive becomes 3. Hard cap 8 so a bad config cannot loop.</summary>
+    internal static int NormalizeNerAttempts(int configured) =>
+        Math.Clamp(configured <= 0 ? 3 : configured, 1, 8);
+
+    /// <summary>200ms, 400ms, 800ms, then capped at 2s. <paramref name="attempt"/> is the failed attempt (1-based).</summary>
+    internal static int RetryBackoffMs(int attempt)
+    {
+        int shift = Math.Clamp(attempt - 1, 0, 4);
+        return Math.Min(2_000, 200 << shift);
+    }
+
+    /// <summary>
+    /// JSON that did not deserialize, HTTP 408/429/5xx, HttpClient timeouts, and transport errors.
+    /// 401/403 and other 4xx are not retried.
+    /// </summary>
+    internal static bool IsRetryableNerFailure(Exception ex)
+    {
+        if (LlmJson.IsParseFailure(ex))
+            return true;
+        if (ex is OperationCanceledException or TimeoutException)
+            return true;
+        if (ex is HttpRequestException http)
+            return IsTransientHttp(http);
+        return false;
+    }
+
+    internal static bool IsTransientHttp(HttpRequestException http)
+    {
+        if (http.StatusCode is { } status)
+        {
+            int code = (int)status;
+            if (code is 408 or 429)
+                return true;
+            return code is >= 500 and <= 599;
+        }
+
+        // No status: connection reset, DNS, or a timeout wrapped by HttpClient. Not an auth rejection.
+        return true;
+    }
+
+    private static bool IsAuthFailure(Exception ex) =>
+        ex is HttpRequestException
+        {
+            StatusCode: HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden,
+        };
+
+    private static string DescribeRetry(Exception ex)
+    {
+        if (LlmJson.IsParseFailure(ex))
+            return "json parse";
+        if (ex is OperationCanceledException or TimeoutException)
+            return "timeout";
+        if (ex is HttpRequestException http)
+        {
+            if (http.StatusCode is { } status)
+                return $"HTTP {(int)status}";
+            if (http.InnerException is OperationCanceledException or TimeoutException)
+                return "timeout";
+            return "transport";
+        }
+
+        return ex.GetType().Name;
     }
 
     private async Task<BatchResult> CompleteBatchOnceAsync(
         LlmPageGrouper.PageBatch batch,
         bool pagesMode,
+        int attempt,
+        int maxAttempts,
         CancellationToken ct)
     {
         string userText = batch.Text;
@@ -472,7 +568,9 @@ public sealed class LlmEntityExtractor
         };
 
         _logger.LogInformation(
-            "LLM NER request: model={Model}, chars={Chars}, pages={Pages}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}",
+            "LLM NER request: attempt={Attempt}/{MaxAttempts}, model={Model}, chars={Chars}, pages={Pages}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}",
+            attempt,
+            maxAttempts,
             _config.Model,
             userText.Length,
             string.Join(',', batch.PageNumbers),
@@ -624,23 +722,24 @@ public sealed class LlmEntityExtractor
                 .ConfigureAwait(false);
             raw = await retry.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!retry.IsSuccessStatusCode)
-            {
-                string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
-                throw new HttpRequestException(
-                    $"LLM chat completions failed HTTP {(int)retry.StatusCode}: {snippet}");
-            }
+                ThrowHttpFailure(retry.StatusCode, raw);
 
             return raw;
         }
 
         if (!response.IsSuccessStatusCode)
-        {
-            string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
-            throw new HttpRequestException(
-                $"LLM chat completions failed HTTP {(int)response.StatusCode}: {snippet}");
-        }
+            ThrowHttpFailure(response.StatusCode, raw);
 
         return raw;
+    }
+
+    private static void ThrowHttpFailure(HttpStatusCode status, string raw)
+    {
+        string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
+        throw new HttpRequestException(
+            $"LLM chat completions failed HTTP {(int)status}: {snippet}",
+            inner: null,
+            statusCode: status);
     }
 
     internal static OcrEntities MergeToEntities(

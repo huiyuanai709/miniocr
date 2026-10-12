@@ -82,6 +82,7 @@ Assert(callbackJson.Contains("北京华腾科技有限公司", StringComparison.
 Assert(callbackJson.Contains("公司名称", StringComparison.Ordinal), "callback rule name stays UTF-8");
 Assert(callbackJson.Contains("\"ruleName\":\"公司名称\"", StringComparison.Ordinal), "callback keeps camelCase ruleName");
 Assert(callbackJson.Contains("\"companyName\":\"北京华腾科技有限公司\"", StringComparison.Ordinal), "callback keeps camelCase companyName");
+Assert(callbackJson.Contains("\"count\":1", StringComparison.Ordinal), "callback count stays a JSON number");
 Assert(!callbackJson.Contains("\\u", StringComparison.Ordinal), "callback does not use \\u escapes");
 string defaultJson = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
     callback, AppJsonContext.Default.ChallengeCallbackBody));
@@ -263,6 +264,187 @@ Assert(RedSealFilter.Apply(colorPage) >= 1, "BGRA red seal pixel is replaced bef
 SKColor kept = colorPage.GetPixel(4, 4);
 Assert(kept.Red == 234 && kept.Green == 232 && kept.Blue == 230, "BGRA red becomes the page paper color");
 
+Console.WriteLine("string page / count coercion and NER retries");
+string stringPage = """{"pages":[{"page":"26","ruleList":[{"ruleCode":"B06","ruleItemList":[{"companyName":"甲公司","count":"2","originText":["甲公司"]}]}]}]}""";
+LlmPagesPayload? coerced = LlmJson.Deserialize<LlmPagesPayload>(stringPage);
+Assert(coerced?.Pages is { Count: 1 } && coerced.Pages[0].Page == 26, "string page coerces to int 26");
+Assert(coerced!.Pages![0].RuleList![0].RuleItemList[0].Count == 2, "string count coerces to int 2");
+string numericPage = """{"pages":[{"page":26,"ruleList":[{"ruleCode":"B04","ruleItemList":[{"personName":"张伟","count":3,"originText":["张伟"]}]}]}]}""";
+LlmPagesPayload? numeric = LlmJson.Deserialize<LlmPagesPayload>(numericPage);
+Assert(numeric?.Pages?[0].Page == 26 && numeric.Pages[0].RuleList?[0].RuleItemList[0].Count == 3,
+    "numeric page and count still deserialize");
+bool badPageThrew = false;
+try
+{
+    LlmJson.Deserialize<LlmPagesPayload>("""{"pages":[{"page":"abc"}]}""");
+}
+catch (JsonException)
+{
+    badPageThrew = true;
+}
+Assert(badPageThrew, "non-numeric page string still fails parse");
+
+string? prevAttempts = Environment.GetEnvironmentVariable("MINIOCR_LLM_NER_MAX_ATTEMPTS");
+try
+{
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_NER_MAX_ATTEMPTS", null);
+    LlmRuntimeConfig defaults = AppConfigStore.ResolveLlm(new AppConfigFile { Llm = new LlmFileConfig() });
+    Assert(defaults.NerMaxAttempts == 3, "default NER attempts is 3");
+    LlmRuntimeConfig fromFile = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig { NerMaxAttempts = 4 },
+    });
+    Assert(fromFile.NerMaxAttempts == 4, "config nerMaxAttempts is kept");
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_NER_MAX_ATTEMPTS", "5");
+    LlmRuntimeConfig fromEnv = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig { NerMaxAttempts = 4 },
+    });
+    Assert(fromEnv.NerMaxAttempts == 5, "MINIOCR_LLM_NER_MAX_ATTEMPTS overrides the file");
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_NER_MAX_ATTEMPTS", "99");
+    LlmRuntimeConfig clamped = AppConfigStore.ResolveLlm(new AppConfigFile { Llm = new LlmFileConfig() });
+    Assert(clamped.NerMaxAttempts == 8, "NER attempts clamp at 8");
+}
+finally
+{
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_NER_MAX_ATTEMPTS", prevAttempts);
+}
+
+const string StringPagePayload =
+    """{"pages":[{"page":"26","ruleList":[{"ruleCode":"B06","ruleName":"公司名称","ruleItemList":[{"companyName":"成都交子商圈物业服务有限公司","count":"2","originText":["正本成都交子商圈物业服务有限公司"]}]}]}]}""";
+ScriptedHandler distributed = new();
+distributed.EnqueueOk(Assistant(StringPagePayload));
+using (HttpClient distHttp = new(distributed) { BaseAddress = new Uri("http://llm.test") })
+{
+    LlmEntityExtractor distExtractor = MakeExtractor(distHttp, attempts: 3);
+    ClusterNerResultRequest distResult = await distExtractor.ExtractDistributedAsync(
+        new ClusterNerAssignment
+        {
+            Kind = ClusterNerClaimKind.Group,
+            GroupId = "g26",
+            Pages = [26],
+            Bodies = [new OcrPageResult { Page = 26, Text = "正本成都交子商圈物业服务有限公司" }],
+            PromptText = "--- page 26 ---\n正本成都交子商圈物业服务有限公司",
+        },
+        CancellationToken.None);
+    Assert(distributed.Calls == 1, "string page succeeds on the first distributed NER call");
+    Assert(distResult.Entities is { Count: 1 }
+        && distResult.Entities[0].Page == 26
+        && distResult.Entities[0].Count == 2
+        && distResult.Entities[0].Kind == "company",
+        "distributed NER keeps the coerced page and count");
+}
+
+ListLog parseLog = new();
+ScriptedHandler parseFails = new();
+string broken = Assistant("{");
+parseFails.EnqueueOk(broken);
+parseFails.EnqueueOk(broken);
+parseFails.EnqueueOk(broken);
+using (HttpClient parseHttp = new(parseFails) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? parseError = await TryExtract(MakeExtractor(parseHttp, attempts: 3, parseLog));
+    Assert(parseError is JsonException or InvalidOperationException,
+        $"truncated JSON still throws after retries ({parseError?.GetType().Name}: {parseError?.Message})");
+    Assert(parseFails.Calls == 3, $"parse failure uses 3 attempts (calls={parseFails.Calls})");
+    Assert(parseLog.Lines.Exists(l => l.Contains("attempt 1/3", StringComparison.Ordinal) && l.Contains("retrying", StringComparison.Ordinal)),
+        "attempt 1/3 is logged before the retry");
+    Assert(parseLog.Lines.Exists(l => l.Contains("attempt 2/3", StringComparison.Ordinal) && l.Contains("retrying", StringComparison.Ordinal)),
+        "attempt 2/3 is logged before the retry");
+    Assert(parseLog.Lines.Exists(l => l.Contains("attempt=3/3", StringComparison.Ordinal)),
+        "the last request logs attempt 3/3");
+    Assert(!parseLog.Lines.Exists(l => l.Contains("attempt 3/3", StringComparison.Ordinal) && l.Contains("retrying", StringComparison.Ordinal)),
+        "the exhausted attempt is not logged as another retry");
+}
+
+ScriptedHandler oneShot = new();
+oneShot.EnqueueOk(Assistant("{"));
+using (HttpClient oneHttp = new(oneShot) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? once = await TryExtract(MakeExtractor(oneHttp, attempts: 1));
+    Assert(once is not null && oneShot.Calls == 1, $"NerMaxAttempts=1 does not retry a parse failure (calls={oneShot.Calls})");
+}
+
+ListLog authLog = new();
+ScriptedHandler forbidden = new();
+forbidden.EnqueueStatus(HttpStatusCode.Forbidden, "{\"error\":\"bad key\"}");
+using (HttpClient forbidHttp = new(forbidden) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? auth = await TryExtract(MakeExtractor(forbidHttp, attempts: 3, authLog));
+    Assert(forbidden.Calls == 1, $"403 is not retried (calls={forbidden.Calls})");
+    Assert(auth is HttpRequestException { StatusCode: HttpStatusCode.Forbidden },
+        $"403 throws with status ({auth?.GetType().Name}: {auth?.Message})");
+    Assert(authLog.Lines.Exists(l => l.Contains("not retrying", StringComparison.Ordinal) && l.Contains("403", StringComparison.Ordinal)),
+        "403 log says not retrying");
+}
+
+ScriptedHandler unauthorized = new();
+unauthorized.EnqueueStatus(HttpStatusCode.Unauthorized, "{\"error\":\"no\"}");
+using (HttpClient unauthHttp = new(unauthorized) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? auth = await TryExtract(MakeExtractor(unauthHttp, attempts: 3));
+    Assert(unauthorized.Calls == 1 && auth is HttpRequestException { StatusCode: HttpStatusCode.Unauthorized },
+        $"401 is not retried (calls={unauthorized.Calls}, {auth?.Message})");
+}
+
+ScriptedHandler badRequest = new();
+badRequest.EnqueueStatus(HttpStatusCode.BadRequest, "{\"error\":\"model not found\"}");
+using (HttpClient badHttp = new(badRequest) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? bad = await TryExtract(MakeExtractor(badHttp, attempts: 3));
+    Assert(badRequest.Calls == 1 && bad is HttpRequestException { StatusCode: HttpStatusCode.BadRequest },
+        $"400 is not retried (calls={badRequest.Calls}, {bad?.Message})");
+}
+
+string emptyEntities = Assistant("""{"companies":[],"persons":[]}""");
+ScriptedHandler rateLimit = new();
+rateLimit.EnqueueStatus(HttpStatusCode.TooManyRequests, "{\"error\":\"slow down\"}");
+rateLimit.EnqueueOk(emptyEntities);
+using (HttpClient rateHttp = new(rateLimit) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? rate = await TryExtract(MakeExtractor(rateHttp, attempts: 3));
+    Assert(rate is null && rateLimit.Calls == 2, $"429 is retried once (calls={rateLimit.Calls}, {rate?.Message})");
+}
+
+ScriptedHandler timeoutStatus = new();
+timeoutStatus.EnqueueStatus(HttpStatusCode.RequestTimeout, "{\"error\":\"slow\"}");
+timeoutStatus.EnqueueOk(emptyEntities);
+using (HttpClient timeoutHttp = new(timeoutStatus) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? timeout = await TryExtract(MakeExtractor(timeoutHttp, attempts: 3));
+    Assert(timeout is null && timeoutStatus.Calls == 2, $"408 is retried (calls={timeoutStatus.Calls}, {timeout?.Message})");
+}
+
+ScriptedHandler server = new();
+server.EnqueueStatus(HttpStatusCode.InternalServerError, "{\"error\":\"boom\"}");
+server.EnqueueStatus(HttpStatusCode.BadGateway, "{\"error\":\"gw\"}");
+server.EnqueueOk(emptyEntities);
+using (HttpClient serverHttp = new(server) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? serverError = await TryExtract(MakeExtractor(serverHttp, attempts: 3));
+    Assert(serverError is null && server.Calls == 3, $"5xx is retried through the third attempt (calls={server.Calls}, {serverError?.Message})");
+}
+
+ScriptedHandler always500 = new();
+always500.EnqueueStatus(HttpStatusCode.InternalServerError, "{\"error\":\"boom\"}");
+always500.EnqueueStatus(HttpStatusCode.InternalServerError, "{\"error\":\"boom\"}");
+always500.EnqueueStatus(HttpStatusCode.InternalServerError, "{\"error\":\"boom\"}");
+using (HttpClient alwaysHttp = new(always500) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? serverError = await TryExtract(MakeExtractor(alwaysHttp, attempts: 3));
+    Assert(always500.Calls == 3 && serverError is HttpRequestException { StatusCode: HttpStatusCode.InternalServerError },
+        $"exhausted 5xx still throws (calls={always500.Calls}, {serverError?.GetType().Name}: {serverError?.Message})");
+}
+
+ScriptedHandler timedOut = new();
+timedOut.EnqueueThrow(new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout of 30 seconds."));
+timedOut.EnqueueOk(emptyEntities);
+using (HttpClient timedHttp = new(timedOut) { BaseAddress = new Uri("http://llm.test") })
+{
+    Exception? timed = await TryExtract(MakeExtractor(timedHttp, attempts: 3));
+    Assert(timed is null && timedOut.Calls == 2, $"HttpClient timeout is retried (calls={timedOut.Calls}, {timed?.Message})");
+}
+
 if (failed > 0)
 {
     Console.WriteLine($"FAILED {failed}");
@@ -272,12 +454,93 @@ if (failed > 0)
 Console.WriteLine("ALL PASSED");
 return 0;
 
+static string Assistant(string payload) =>
+    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":" + JsonSerializer.Serialize(payload) + "}}]}";
+
+static LlmEntityExtractor MakeExtractor(HttpClient http, int attempts, ILogger<LlmEntityExtractor>? log = null) =>
+    new(http, new LlmRuntimeConfig
+    {
+        Enabled = true,
+        BaseUrl = "http://llm.test",
+        ApiKey = "test-key",
+        Model = "test-model",
+        TimeoutSeconds = 30,
+        PagesPerRequest = 1,
+        MaxCharsPerRequest = 100_000,
+        MaxConcurrency = 1,
+        JsonObject = true,
+        NerMaxAttempts = attempts,
+    }, log ?? new QuietLog());
+
+static async Task<Exception?> TryExtract(LlmEntityExtractor extractor)
+{
+    try
+    {
+        await extractor.ExtractAsync(
+            [new OcrPageResult { Page = 1, Text = "甲方北京华腾科技有限公司" }],
+            CancellationToken.None);
+        return null;
+    }
+    catch (Exception ex)
+    {
+        return ex is AggregateException { InnerExceptions.Count: 1 } agg ? agg.InnerExceptions[0] : ex;
+    }
+}
+
 static string UserText(string body)
 {
     ChatCompletionRequest? request = JsonSerializer.Deserialize(body, AppJsonContext.Default.ChatCompletionRequest);
     if (request is null || request.Messages.Count == 0)
         return body;
     return request.Messages[^1].Content ?? body;
+}
+
+sealed class ScriptedHandler : HttpMessageHandler
+{
+    private readonly Queue<Func<HttpResponseMessage>> _steps = new();
+
+    public int Calls { get; private set; }
+
+    public void EnqueueOk(string json) => EnqueueStatus(HttpStatusCode.OK, json);
+
+    public void EnqueueStatus(HttpStatusCode status, string body)
+    {
+        _steps.Enqueue(() => new HttpResponseMessage(status)
+        {
+            Content = new StringContent(body, Encoding.UTF8, "application/json"),
+        });
+    }
+
+    public void EnqueueThrow(Exception ex) => _steps.Enqueue(() => throw ex);
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        if (request.Content is not null)
+            await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        Calls++;
+        if (_steps.Count == 0)
+            throw new InvalidOperationException($"unexpected LLM call {Calls}");
+        return _steps.Dequeue()();
+    }
+}
+
+sealed class ListLog : ILogger<LlmEntityExtractor>
+{
+    public List<string> Lines { get; } = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        Lines.Add(formatter(state, exception));
+    }
 }
 
 sealed class CaptureHandler : HttpMessageHandler
