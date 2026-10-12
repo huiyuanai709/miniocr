@@ -47,3 +47,6 @@ samples/sample-200.pdf
 
 # local docker secrets (see .env.example)
 .env
+
+# async OCR trace (see MINIOCR_OCR_TRACE_PATH). Default file sits beside config.json.
+ocr-trace.jsonl

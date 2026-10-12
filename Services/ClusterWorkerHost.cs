@@ -22,6 +22,7 @@ public sealed class ClusterWorkerHost : IHostedService
     private readonly IHttpClientFactory _httpFactory;
     private readonly ParallelPdfDownloader _downloader;
     private readonly ILogger<ClusterWorkerHost> _logger;
+    private readonly OcrTraceLog? _trace;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte[]> _pdfCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Task<byte[]>> _urlFetches = new(StringComparer.Ordinal);
@@ -42,12 +43,14 @@ public sealed class ClusterWorkerHost : IHostedService
         LlmEntityExtractor llm,
         IHttpClientFactory httpFactory,
         ParallelPdfDownloader downloader,
-        ILogger<ClusterWorkerHost> logger)
+        ILogger<ClusterWorkerHost> logger,
+        OcrTraceLog? trace = null)
     {
         _config = config;
         _self = self;
         _pipeline = pipeline;
         _llm = llm;
+        _trace = trace;
         _httpFactory = httpFactory;
         _downloader = downloader;
         _logger = logger;
@@ -183,7 +186,8 @@ public sealed class ClusterWorkerHost : IHostedService
             req.PageCount,
             req.SourceUrl,
             req.LocalPath,
-            req.PdfLength);
+            req.PdfLength,
+            "cluster-notify");
         return true;
     }
 
@@ -220,7 +224,8 @@ public sealed class ClusterWorkerHost : IHostedService
                             dispatch.PageCount,
                             dispatch.SourceUrl,
                             dispatch.LocalPath,
-                            dispatch.PdfLength);
+                            dispatch.PdfLength,
+                            "cluster-dispatch");
                     }
                     else
                         ClusterJobLog.DispatchWait(_logger, _config.VerboseDispatch, _self.NodeId);
@@ -257,7 +262,8 @@ public sealed class ClusterWorkerHost : IHostedService
         int pageCount,
         string? sourceUrl,
         string? localPath,
-        int pdfLength)
+        int pdfLength,
+        string traceEntry)
     {
         if (_sessions.Count >= ClusterDispatchRules.MaxWorkerSessions && !_sessions.ContainsKey(jobId))
         {
@@ -274,6 +280,9 @@ public sealed class ClusterWorkerHost : IHostedService
             sessionCts.Dispose();
             return;
         }
+
+        if (!string.IsNullOrWhiteSpace(sourceUrl))
+            _trace?.Url(traceEntry, requestId: "", sourceUrl, jobId: jobId, nodeId: _self.NodeId);
 
         _recentlyLeft.TryRemove(jobId, out _);
         _ = Task.Run(
@@ -942,6 +951,7 @@ public sealed class ClusterWorkerHost : IHostedService
             "Cluster worker {NodeId} prefetching source PDF {Source}",
             _self.NodeId,
             DescribePdfSource(url));
+        _trace?.Url("cluster-prefetch", requestId: "", url, nodeId: _self.NodeId);
         _ = GetOrStartUrlFetch(url);
     }
 

@@ -77,6 +77,11 @@ if (OcrCompareRunner.IsRequested(args))
     return;
 }
 
+string traceDirectory = Path.GetDirectoryName(Path.GetFullPath(configPath)) ?? Directory.GetCurrentDirectory();
+OcrTraceLog ocrTrace = OcrTraceLog.Create(bootstrapLogger, directory: traceDirectory);
+builder.Services.AddSingleton(ocrTrace);
+builder.Services.AddHostedService(sp => sp.GetRequiredService<OcrTraceLog>());
+
 // ocr.mode=llm needs a usable LLM; otherwise fall back to local with a clear warning.
 if (runtimeConfig.IsLlmMode && !llmConfig.IsUsable)
 {
@@ -373,7 +378,8 @@ builder.Services.AddSingleton(sp => new ChallengeJobService(
     sp.GetRequiredService<PdfOcrPipeline>(),
     sp.GetRequiredService<IHttpClientFactory>(),
     sp.GetRequiredService<ILogger<ChallengeJobService>>(),
-    sp.GetService<ClusterCoordinator>()));
+    sp.GetService<ClusterCoordinator>(),
+    sp.GetRequiredService<OcrTraceLog>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChallengeJobService>());
 
 WebApplication app = builder.Build();
@@ -498,6 +504,8 @@ async Task<IResult> HandleChallengeAsync(
             statusCode: StatusCodes.Status400BadRequest);
     }
 
+    string traceEntry = httpRequest.Path.StartsWithSegments("/challenge") ? "challenge" : "root";
+    string requestId = OcrTraceLog.NewRequestId();
     List<ChallengeFileRef> files = [];
     foreach (ChallengeFileRef f in body.Files)
     {
@@ -507,6 +515,7 @@ async Task<IResult> HandleChallengeAsync(
             (fu.Scheme != Uri.UriSchemeHttp && fu.Scheme != Uri.UriSchemeHttps))
             continue;
         files.Add(f);
+        ocrTrace.Url(traceEntry, requestId, f.Url, f.FileId, body.TeamId);
     }
 
     if (files.Count == 0)
@@ -523,6 +532,8 @@ async Task<IResult> HandleChallengeAsync(
         Key = body.Key.Trim(),
         CallbackUrl = body.CallbackUrl.Trim(),
         Files = files,
+        RequestId = requestId,
+        TraceEntry = traceEntry,
     };
 
     // Non-blocking enqueue when possible; if queue full, brief wait then still ack
@@ -596,6 +607,7 @@ app.MapPost("/ocr", async Task<IResult> (
             statusCode: StatusCodes.Status400BadRequest);
     }
 
+    string requestId = OcrTraceLog.NewRequestId();
     List<ChallengeFileRef> files = [];
     if (body.Files is { Count: > 0 })
     {
@@ -607,6 +619,7 @@ app.MapPost("/ocr", async Task<IResult> (
                 (fu.Scheme != Uri.UriSchemeHttp && fu.Scheme != Uri.UriSchemeHttps))
                 continue;
             files.Add(f);
+            ocrTrace.Url("ocr", requestId, f.Url, f.FileId, body.TeamId);
         }
     }
     else if (!string.IsNullOrWhiteSpace(body.Url))
@@ -622,6 +635,7 @@ app.MapPost("/ocr", async Task<IResult> (
         }
 
         files.Add(new ChallengeFileRef { FileId = "f1", Url = body.Url.Trim() });
+        ocrTrace.Url("ocr", requestId, body.Url, "f1", body.TeamId);
     }
 
     int? dpi = body.Dpi;
@@ -641,9 +655,20 @@ app.MapPost("/ocr", async Task<IResult> (
         {
             byte[] pdf = LocalPdfFile.ReadAllBytes(body.Path);
             using RentedBuffer buffer = LocalPdfFile.RentCopy(pdf);
+            using IDisposable? traceScope = ocrTrace.Enabled
+                ? OcrTraceLog.BeginScope(requestId, "ocr", "f1", body.TeamId)
+                : null;
             OcrResponse ocr = await pipeline
                 .ProcessAsync(buffer, downloadMs: 0, downloadMode: "local-file", ct, dpi)
                 .ConfigureAwait(false);
+
+            if (ocrTrace.Enabled)
+            {
+                ocrTrace.Text(
+                    "ocr", requestId, "f1", url: null, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
+                    body.TeamId, "local-file", path: body.Path);
+            }
+
             return FinishDebug(body.TeamId, body.Key, "f1", ocr, verbose, config.Mode);
         }
         catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or InvalidOperationException)
@@ -691,9 +716,20 @@ app.MapPost("/ocr", async Task<IResult> (
                 await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
             using (download.Buffer)
             {
+                using IDisposable? traceScope = ocrTrace.Enabled
+                    ? OcrTraceLog.BeginScope(requestId, "ocr", fileId, body.TeamId)
+                    : null;
                 OcrResponse ocr = await pipeline
                     .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi, url)
                     .ConfigureAwait(false);
+
+                if (ocrTrace.Enabled)
+                {
+                    ocrTrace.Text(
+                        "ocr", requestId, fileId, url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
+                        body.TeamId, download.Mode);
+                }
+
                 if (files.Count == 1)
                     single = ocr;
                 results.Add(ChallengeResultMapper.BuildFileResult(fileId, ocr));
@@ -791,6 +827,9 @@ app.MapPost("/ocr/upload", async Task<IResult> (
 
     dpi ??= config.DefaultDpi;
     bool verbose = WantsVerbose(httpRequest);
+    string requestId = OcrTraceLog.NewRequestId();
+    string? uploadName = null;
+    string? uploadPath = null;
 
     try
     {
@@ -817,6 +856,7 @@ app.MapPost("/ocr/upload", async Task<IResult> (
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
+            uploadName = file.FileName;
             logger.LogInformation(
                 "OCR upload: fileName={Name} bytes={Bytes}",
                 file.FileName,
@@ -825,7 +865,8 @@ app.MapPost("/ocr/upload", async Task<IResult> (
         else if (form.TryGetValue("path", out Microsoft.Extensions.Primitives.StringValues pathVal) &&
                  !string.IsNullOrWhiteSpace(pathVal.FirstOrDefault()))
         {
-            pdf = LocalPdfFile.ReadAllBytes(pathVal.ToString());
+            uploadPath = pathVal.ToString();
+            pdf = LocalPdfFile.ReadAllBytes(uploadPath);
         }
         else
         {
@@ -836,14 +877,25 @@ app.MapPost("/ocr/upload", async Task<IResult> (
         }
 
         using RentedBuffer buffer = LocalPdfFile.RentCopy(pdf);
-        OcrResponse ocr = await pipeline
-            .ProcessAsync(buffer, downloadMs: 0, downloadMode: "upload", ct, dpi)
-            .ConfigureAwait(false);
         string fileId = "f1";
         if (form.TryGetValue("fileId", out Microsoft.Extensions.Primitives.StringValues idVal) &&
             !string.IsNullOrWhiteSpace(idVal.FirstOrDefault()))
         {
             fileId = idVal.ToString();
+        }
+
+        using IDisposable? traceScope = ocrTrace.Enabled
+            ? OcrTraceLog.BeginScope(requestId, "ocr-upload", fileId)
+            : null;
+        OcrResponse ocr = await pipeline
+            .ProcessAsync(buffer, downloadMs: 0, downloadMode: "upload", ct, dpi)
+            .ConfigureAwait(false);
+
+        if (ocrTrace.Enabled)
+        {
+            ocrTrace.Text(
+                "ocr-upload", requestId, fileId, url: null, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
+                downloadMode: "upload", path: uploadPath, fileName: uploadName);
         }
 
         return FinishDebug(teamId: 0, key: "debug", fileId, ocr, verbose, config.Mode);
@@ -884,10 +936,18 @@ app.MapGet("/", () => Results.Text(
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
     "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH MINIOCR_CLUSTER_DISTRIBUTED_NER\n" +
+    $"OCR trace: {(ocrTrace.Enabled ? "on" : "off")} path={ocrTrace.Path} maxCharsPerPage={ocrTrace.MaxCharsPerPage} queue={ocrTrace.QueueCapacity}\n" +
+    "  MINIOCR_OCR_TRACE=0 turns it off (default on). MINIOCR_OCR_TRACE_PATH sets the JSONL file. MINIOCR_OCR_TRACE_MAX_CHARS caps each page (0 keeps page metadata and omits the text). File URLs and OCR text are queued; a full queue drops events and does not fail or block OCR.\n" +
     "  Each claim, heartbeat, batch completion, and empty poll is Debug unless MINIOCR_CLUSTER_VERBOSE_DISPATCH=1 (or cluster.verboseDispatch). Progress summaries stay Information. Logging__LogLevel__MiniOcr.Services.ClusterCoordinator=Debug (and ClusterWorkerHost) shows the same detail. Per-request framework logs default to Warning; raise Logging__LogLevel__Microsoft.AspNetCore and Logging__LogLevel__System.Net.Http.HttpClient to see them.\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));
+logger.LogInformation(
+    "OCR trace {State}: path={Path}, maxCharsPerPage={MaxChars}, queue={Queue}",
+    ocrTrace.Enabled ? "on" : "off",
+    ocrTrace.Path,
+    ocrTrace.MaxCharsPerPage,
+    ocrTrace.QueueCapacity);
 logger.LogInformation(
     "MiniOcr ready — mode={Mode}, ProcessorCount={Cores}, engines={Engines}, lineWorkers={LineWorkers}, det={Det}, raster={Raster}, dpi={Dpi}, useCls={UseCls}, llmUsable={Llm}, ocrConcurrency={OcrConc}, listening={Urls}",
     runtimeConfig.Mode,

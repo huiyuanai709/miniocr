@@ -22,6 +22,7 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<ChallengeJobService> _logger;
     private readonly ClusterCoordinator? _cluster;
+    private readonly OcrTraceLog? _trace;
     private readonly CancellationTokenSource _cts = new();
     private Task? _worker;
     private readonly SemaphoreSlim _jobGate = new(MaxConcurrentJobs, MaxConcurrentJobs);
@@ -31,13 +32,15 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         PdfOcrPipeline pipeline,
         IHttpClientFactory httpClientFactory,
         ILogger<ChallengeJobService> logger,
-        ClusterCoordinator? cluster = null)
+        ClusterCoordinator? cluster = null,
+        OcrTraceLog? trace = null)
     {
         _downloader = downloader;
         _pipeline = pipeline;
         _httpClientFactory = httpClientFactory;
         _logger = logger;
         _cluster = cluster;
+        _trace = trace;
         _channel = Channel.CreateBounded<ChallengeJob>(new BoundedChannelOptions(32)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -157,9 +160,22 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
                     await _downloader.DownloadAsync(url, ct).ConfigureAwait(false);
                 using (download.Buffer)
                 {
+                    string requestId = string.IsNullOrEmpty(job.RequestId) ? "" : job.RequestId;
+                    string entry = string.IsNullOrEmpty(job.TraceEntry) ? "challenge" : job.TraceEntry;
+                    using IDisposable? traceScope = _trace is { Enabled: true }
+                        ? OcrTraceLog.BeginScope(requestId, entry, fileId, job.TeamId)
+                        : null;
                     OcrResponse ocr = await _pipeline
                         .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, sourceUrl: url)
                         .ConfigureAwait(false);
+
+                    if (_trace is { Enabled: true })
+                    {
+                        _trace.Text(
+                            entry, requestId, fileId, url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
+                            job.TeamId, download.Mode);
+                    }
+
                     ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(fileId, ocr);
                     results.Add(mapped);
                     _logger.LogInformation(
@@ -277,4 +293,8 @@ public sealed class ChallengeJob
     public required string Key { get; init; }
     public required string CallbackUrl { get; init; }
     public required List<ChallengeFileRef> Files { get; init; }
+    /// <summary>Correlates the accept-time URL line with the OCR text line. Empty for older callers.</summary>
+    public string RequestId { get; init; } = "";
+    /// <summary><c>challenge</c> or <c>root</c>, matching the HTTP path that accepted the job.</summary>
+    public string TraceEntry { get; init; } = "challenge";
 }

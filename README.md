@@ -200,6 +200,23 @@ curl -sS -X POST http://127.0.0.1:5080/ocr/upload \
 
 `?verbose=1` 时响应带有规则的页的文本、耗时和 `ruleList`，没有规则的页不出现，页码保持不变。本机文件用 `{"path":"/absolute/path/to/file.pdf"}`。
 
+### 识别追踪日志
+
+默认开启。每条进来的文件 URL，以及该次任务识别出的文本，写到一份 JSONL。不经过控制台，也不在 OCR 或集群认领循环里写盘。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MINIOCR_OCR_TRACE` | 开 | `0` / `off` / `false` 关闭 |
+| `MINIOCR_OCR_TRACE_PATH` | 与 `config.json` 同目录的 `ocr-trace.jsonl` | 绝对路径。Docker 里配置在 `/opt/miniocr/config.docker.json` 时，默认就是 `/opt/miniocr/ocr-trace.jsonl` |
+| `MINIOCR_OCR_TRACE_MAX_CHARS` | `8192` | 每页正文上限。超出只保留前缀，并记下原始 `chars` 和 `truncated`。`0` 只记页码和字数，不写正文 |
+| `MINIOCR_OCR_TRACE_QUEUE` | `32` | 后台队列长度。满了丢弃新事件，任务照常成功 |
+
+`requestId` 把同一次 HTTP 请求的 URL 和分页文本对上；`fileId` 区分请求里的多个文件。文本按页各写一行，对应管道已经留下的页（空白页本来就不会进入结果）。集群任务另有一行 `kind=job`，用同一个 `requestId` 带上集群 `jobId`。Worker 收到下发的 `sourceUrl` 时记 `cluster-notify`、`cluster-dispatch` 或 `cluster-prefetch`，用 `jobId` 和上面那行对上。页文本只在跑完 `ProcessAsync` 的进程写一次，worker 不把同一份正文再写一遍。
+
+文件 URL 按请求里的原始字符串写入，query、userinfo 和 fragment 都保留，方便对照得分。challenge 的 `key`、callback 全量地址和 LLM API key 仍然不写进这个文件。
+
+进程被直接杀掉时，队列里还没落盘的几条会丢。这不影响识别结果。多个进程不要追加同一个文件。
+
 ## SIMD 档位（x64 Native AOT）
 
 指令集在编译期写入二进制。默认 `avx2`（Haswell 及以后）。不设档位时会退回 SSE2，识别会变慢。linux-x64 的两个档位都在 Ubuntu 20.04（glibc 2.31）上编译。
