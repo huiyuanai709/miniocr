@@ -145,9 +145,21 @@ public static class AppConfigStore
             Environment.GetEnvironmentVariable("MINIOCR_LLM_BASE_URL"),
             llm.BaseUrl) ?? "https://api.openai.com";
 
-        string apiKey = FirstNonEmpty(
+        var apiKeys = new List<string>();
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+        string? envKeyList = Environment.GetEnvironmentVariable("MINIOCR_LLM_API_KEYS");
+        if (!string.IsNullOrWhiteSpace(envKeyList))
+            AddDelimitedKeys(apiKeys, seenKeys, envKeyList);
+        else
+            AddKeyList(apiKeys, seenKeys, llm.ApiKeys);
+
+        // Single-key env still replaces the file's apiKey, then that one value is merged into the pool.
+        string? singleKey = FirstNonEmpty(
             Environment.GetEnvironmentVariable("MINIOCR_LLM_API_KEY"),
-            llm.ApiKey) ?? "";
+            llm.ApiKey);
+        AddKey(apiKeys, seenKeys, singleKey);
+        if (apiKeys.Count > LlmRuntimeConfig.MaxApiKeys)
+            apiKeys.RemoveRange(LlmRuntimeConfig.MaxApiKeys, apiKeys.Count - LlmRuntimeConfig.MaxApiKeys);
 
         string model = FirstNonEmpty(
             Environment.GetEnvironmentVariable("MINIOCR_LLM_MODEL"),
@@ -168,6 +180,25 @@ public static class AppConfigStore
         {
             maxConcurrency = parsedConcurrency;
         }
+
+        // maxConcurrencyPerKey wins. When it is unset, maxConcurrency is the per-key limit
+        // (one key keeps today's global cap; N keys allow about N × that many in flight).
+        int? perKeySetting = llm.MaxConcurrencyPerKey;
+        string? envPerKey = Environment.GetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY");
+        if (!string.IsNullOrWhiteSpace(envPerKey) &&
+            int.TryParse(envPerKey.Trim(), out int parsedPerKey) &&
+            parsedPerKey > 0)
+        {
+            perKeySetting = parsedPerKey;
+        }
+
+        int perKey = perKeySetting is int explicitPerKey && explicitPerKey > 0
+            ? explicitPerKey
+            : maxConcurrency;
+        perKey = Math.Clamp(perKey, 1, LlmRuntimeConfig.MaxPerKeyConcurrency);
+        int effectiveConcurrency = apiKeys.Count == 0
+            ? perKey
+            : (int)Math.Min(LlmRuntimeConfig.MaxTotalConcurrency, (long)perKey * apiKeys.Count);
 
         int ocrConcurrency = llm.OcrConcurrency <= 0 ? 32 : llm.OcrConcurrency;
         string? envOcrConcurrency = Environment.GetEnvironmentVariable("MINIOCR_LLM_OCR_CONCURRENCY");
@@ -216,13 +247,15 @@ public static class AppConfigStore
         {
             Enabled = llm.Enabled,
             BaseUrl = baseUrl.TrimEnd('/'),
-            ApiKey = apiKey,
+            ApiKey = apiKeys.Count == 0 ? "" : apiKeys[0],
+            ApiKeys = apiKeys.ToArray(),
             Model = model,
             TimeoutSeconds = Math.Clamp(llm.TimeoutSeconds <= 0 ? 120 : llm.TimeoutSeconds, 5, 600),
             MaxCharsPerRequest = Math.Clamp(
                 llm.MaxCharsPerRequest <= 0 ? 300_000 : llm.MaxCharsPerRequest, 1000, 2_000_000),
             PagesPerRequest = Math.Clamp(pagesPerRequest, 1, 2000),
-            MaxConcurrency = Math.Clamp(maxConcurrency, 1, 32),
+            MaxConcurrency = effectiveConcurrency,
+            MaxConcurrencyPerKey = perKey,
             OcrConcurrency = Math.Clamp(ocrConcurrency, 1, 256),
             OcrMaxCharsHint = Math.Clamp(ocrMaxChars, 500, 100_000),
             OcrJpegQuality = Math.Clamp(ocrJpegQuality, 40, 95),
@@ -398,6 +431,30 @@ public static class AppConfigStore
         return null;
     }
 
+    private static void AddDelimitedKeys(List<string> keys, HashSet<string> seen, string raw)
+    {
+        string[] parts = raw.Split([',', ';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        AddKeyList(keys, seen, parts);
+    }
+
+    private static void AddKeyList(List<string> keys, HashSet<string> seen, IEnumerable<string>? raw)
+    {
+        if (raw is null)
+            return;
+        foreach (string item in raw)
+            AddKey(keys, seen, item);
+    }
+
+    private static void AddKey(List<string> keys, HashSet<string> seen, string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return;
+        string key = raw.Trim();
+        if (key.Length == 0 || !seen.Add(key))
+            return;
+        keys.Add(key);
+    }
+
     private static string BuildSampleJson() =>
         """
         {
@@ -405,6 +462,7 @@ public static class AppConfigStore
             "enabled": true,
             "baseUrl": "https://api.openai.com",
             "apiKey": "",
+            "apiKeys": [],
             "model": "gpt-4o-mini",
             "timeoutSeconds": 120,
             "maxCharsPerRequest": 300000,

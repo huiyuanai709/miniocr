@@ -34,15 +34,29 @@ public sealed class LlmFileConfig
 {
     public bool Enabled { get; set; } = true;
     public string BaseUrl { get; set; } = "https://api.openai.com";
+    /// <summary>Single key. Merged into <see cref="ApiKeys"/> and de-duplicated. Env <c>MINIOCR_LLM_API_KEY</c> overrides this value, then the result is still merged.</summary>
     public string ApiKey { get; set; } = "";
+    /// <summary>
+    /// Extra API keys. Env <c>MINIOCR_LLM_API_KEYS</c> (comma, semicolon, or newline separated)
+    /// replaces this list when set. The single <see cref="ApiKey"/> is then merged in and duplicates are dropped.
+    /// </summary>
+    public List<string>? ApiKeys { get; set; }
     public string Model { get; set; } = "gpt-4o-mini";
     public int TimeoutSeconds { get; set; } = 120;
     /// <summary>Safety cap on OCR text chars per LLM NER request (clamped 1000–2_000_000). A pages-per-request group that would exceed this is split. Default 300000.</summary>
     public int MaxCharsPerRequest { get; set; } = 300000;
     /// <summary>Non-empty OCR pages per LLM NER request (clamped 1–2000). Default 10. Blank pages are skipped and do not count.</summary>
     public int PagesPerRequest { get; set; } = 10;
-    /// <summary>Max parallel LLM NER batch completions (clamped 1–32). Default 8.</summary>
+    /// <summary>
+    /// Per-key NER concurrency when <see cref="MaxConcurrencyPerKey"/> is unset (clamped 1–32). Default 8.
+    /// With N keys the process may run about N × this many NER calls at once.
+    /// </summary>
     public int MaxConcurrency { get; set; } = 8;
+    /// <summary>
+    /// Max in-flight NER chat completions for each API key (clamped 1–32).
+    /// Null reuses <see cref="MaxConcurrency"/>. With N live keys, in-flight NER is about N × this value.
+    /// </summary>
+    public int? MaxConcurrencyPerKey { get; set; }
     /// <summary>Max parallel vision OCR page calls when ocr.mode=llm (clamped 1–256).</summary>
     public int OcrConcurrency { get; set; } = 32;
     /// <summary>Hint for max chars of page text the vision model should return.</summary>
@@ -64,7 +78,8 @@ public sealed class LlmFileConfig
     /// Chat-completion attempts per NER group, including the first call (clamped 1–8).
     /// JSON parse failures spend the remaining attempts on a thinking-on correction that
     /// quotes the bad reply. HTTP 403, 408, 429, 5xx, timeouts, and transport errors retry
-    /// the same request with a short backoff. 401 is not retried. Default 3.
+    /// the same request with a short backoff. HTTP 401 disables that key and tries another
+    /// live key; it is not retried once none remain. Default 3.
     /// Env <c>MINIOCR_LLM_NER_MAX_ATTEMPTS</c> overrides this.
     /// </summary>
     public int NerMaxAttempts { get; set; } = 3;
@@ -146,15 +161,33 @@ public sealed class OcrFileConfig
 /// <summary>Resolved LLM settings after file + env overrides (apiKey never logged).</summary>
 public sealed class LlmRuntimeConfig
 {
+    /// <summary>Same clamp the historical global <c>maxConcurrency</c> used. Applied per key.</summary>
+    public const int MaxPerKeyConcurrency = 32;
+
+    /// <summary>Cap on the resolved key list so a huge config cannot open unbounded HTTP calls.</summary>
+    public const int MaxApiKeys = 64;
+
+    /// <summary>Upper bound on in-flight NER chat completions and advertised NER consumers (keys × per-key).</summary>
+    public const int MaxTotalConcurrency = MaxPerKeyConcurrency * MaxApiKeys;
+
     public bool Enabled { get; init; }
     public string BaseUrl { get; init; } = "https://api.openai.com";
+    /// <summary>First resolved key, for callers that still read a single key. Empty when the pool is empty. Never log this.</summary>
     public string ApiKey { get; init; } = "";
+    /// <summary>De-duplicated keys, single <see cref="ApiKey"/> included. Empty when LLM auth is not configured.</summary>
+    public IReadOnlyList<string> ApiKeys { get; init; } = [];
     public string Model { get; init; } = "gpt-4o-mini";
     public int TimeoutSeconds { get; init; } = 120;
     public int MaxCharsPerRequest { get; init; } = 300000;
     /// <summary>Non-empty pages sent to one NER request. Default 10.</summary>
     public int PagesPerRequest { get; init; } = 10;
+    /// <summary>
+    /// Effective NER in-flight limit after resolve: live key count × <see cref="MaxConcurrencyPerKey"/>,
+    /// or the per-key value when no key is configured. One key keeps the historical meaning of <c>maxConcurrency</c>.
+    /// </summary>
     public int MaxConcurrency { get; init; } = 8;
+    /// <summary>Per-key NER slot count (1–32). Zero on a hand-built config means "use <see cref="MaxConcurrency"/> as the per-key limit".</summary>
+    public int MaxConcurrencyPerKey { get; init; }
     public int OcrConcurrency { get; init; } = 32;
     public int OcrMaxCharsHint { get; init; } = 8000;
     /// <summary>JPEG quality for vision page images (40–95). Default 70.</summary>
@@ -167,7 +200,8 @@ public sealed class LlmRuntimeConfig
 
     /// <summary>
     /// Attempts per NER group, including the first call. Default 3.
-    /// Parse failures become a thinking correction; HTTP 403 and other transient HTTP retry the same request. 401 does not.
+    /// Parse failures become a thinking correction; HTTP 403 and other transient HTTP retry the same request.
+    /// HTTP 401 disables that key and tries another; it is not retried once no live key remains.
     /// </summary>
     public int NerMaxAttempts { get; init; } = 3;
 
@@ -177,9 +211,51 @@ public sealed class LlmRuntimeConfig
 
     public bool IsUsable =>
         Enabled &&
-        !string.IsNullOrWhiteSpace(ApiKey) &&
+        HasAnyKey &&
         !string.IsNullOrWhiteSpace(BaseUrl) &&
         !string.IsNullOrWhiteSpace(Model);
+
+    /// <summary>Keys that would be merged into the pool. Does not log secrets.</summary>
+    public int ApiKeyCount
+    {
+        get
+        {
+            int count = 0;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            if (ApiKeys is not null)
+            {
+                foreach (string key in ApiKeys)
+                {
+                    if (string.IsNullOrWhiteSpace(key))
+                        continue;
+                    if (seen.Add(key.Trim()))
+                        count++;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(ApiKey) && seen.Add(ApiKey.Trim()))
+                count++;
+            return count;
+        }
+    }
+
+    private bool HasAnyKey
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(ApiKey))
+                return true;
+            if (ApiKeys is null)
+                return false;
+            foreach (string key in ApiKeys)
+            {
+                if (!string.IsNullOrWhiteSpace(key))
+                    return true;
+            }
+
+            return false;
+        }
+    }
 }
 
 /// <summary>OpenAI chat completions request (AOT source-gen) — string message content (NER).</summary>

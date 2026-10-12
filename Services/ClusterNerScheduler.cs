@@ -181,7 +181,7 @@ public sealed class ClusterNerScheduler
             return;
         lock (_gate)
         {
-            _caps[nodeId] = Math.Clamp(concurrency, 0, 32);
+            _caps[nodeId] = Math.Clamp(concurrency, 0, LlmRuntimeConfig.MaxTotalConcurrency);
             SignalCore();
         }
     }

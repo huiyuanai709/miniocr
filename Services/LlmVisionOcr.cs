@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using System.Net.Http.Headers;
+using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using MiniOcr.Models;
@@ -42,21 +42,23 @@ public sealed class LlmVisionOcr
 
     private readonly HttpClient _http;
     private readonly LlmRuntimeConfig _config;
+    private readonly LlmKeyPool _keys;
     private readonly ILogger<LlmVisionOcr> _logger;
     private int _jsonObjectEnabled = 1;
 
     public LlmVisionOcr(
         HttpClient http,
         LlmRuntimeConfig config,
-        ILogger<LlmVisionOcr> logger)
+        ILogger<LlmVisionOcr> logger,
+        LlmKeyPool? keys = null)
     {
         _http = http;
         _config = config;
         _logger = logger;
+        _keys = keys ?? LlmKeyPool.FromConfig(config);
         _http.Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds);
-        if (!string.IsNullOrEmpty(config.ApiKey))
-            _http.DefaultRequestHeaders.Authorization =
-                new AuthenticationHeaderValue("Bearer", config.ApiKey);
+        // Auth is per request so vision calls share the NER key pool (and its 401 disablement).
+        _http.DefaultRequestHeaders.Remove("Authorization");
     }
 
     public LlmRuntimeConfig Config => _config;
@@ -81,7 +83,7 @@ public sealed class LlmVisionOcr
         CancellationToken ct)
     {
         if (!IsUsable)
-            throw new InvalidOperationException("LLM vision OCR is not configured (need enabled + apiKey).");
+            throw new InvalidOperationException("LLM vision OCR is not configured (need enabled + apiKey or apiKeys).");
 
         Stopwatch sw = Stopwatch.StartNew();
         string dataUrl = "data:image/jpeg;base64," + Convert.ToBase64String(jpegBytes);
@@ -169,15 +171,7 @@ public sealed class LlmVisionOcr
             ],
         };
 
-        _logger.LogInformation(
-            "LLM vision OCR request: page={Page}, model={Model}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}",
-            pageNumber,
-            _config.Model,
-            body.Thinking?.Type ?? "(null)",
-            jsonMode,
-            url);
-
-        string raw = await PostVisionAsync(url, body, jsonMode, ct).ConfigureAwait(false);
+        string raw = await PostVisionAsync(url, body, jsonMode, pageNumber, ct).ConfigureAwait(false);
         ChatCompletionResponse? parsed =
             JsonSerializer.Deserialize(raw, AppJsonContext.Default.ChatCompletionResponse);
         string? content = parsed?.Choices?.FirstOrDefault()?.Message?.Content;
@@ -193,42 +187,113 @@ public sealed class LlmVisionOcr
         string url,
         VisionChatCompletionRequest body,
         bool jsonMode,
+        int pageNumber,
         CancellationToken ct)
     {
-        using HttpResponseMessage response = await _http
-            .PostAsJsonAsync(url, body, AppJsonContext.Default.VisionChatCompletionRequest, ct)
-            .ConfigureAwait(false);
-        string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode
-            && jsonMode
-            && LlmJson.IsFormatRejected((int)response.StatusCode, raw))
+        int hops = Math.Max(1, _keys.KeyCount);
+        string lastBody = "";
+        HttpStatusCode lastStatus = HttpStatusCode.Unauthorized;
+        for (int hop = 0; hop < hops; hop++)
         {
-            Volatile.Write(ref _jsonObjectEnabled, 0);
-            _logger.LogWarning(
-                "LLM vision rejected response_format=json_object; disabling it and retrying without the field");
-            body.ResponseFormat = null;
-            using HttpResponseMessage retry = await _http
-                .PostAsJsonAsync(url, body, AppJsonContext.Default.VisionChatCompletionRequest, ct)
-                .ConfigureAwait(false);
-            raw = await retry.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            if (!retry.IsSuccessStatusCode)
+            if (!_keys.TryBorrow(out LlmKeyPool.LlmKeyLease lease))
+                throw new InvalidOperationException("LLM vision OCR is not configured (need enabled + apiKey or apiKeys).");
+            using (lease)
             {
-                string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
-                throw new HttpRequestException(
-                    $"LLM vision OCR failed HTTP {(int)retry.StatusCode}: {snippet}");
+                _logger.LogInformation(
+                    "LLM vision OCR request: page={Page}, model={Model}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}, keySlot={KeySlot}",
+                    pageNumber,
+                    _config.Model,
+                    body.Thinking?.Type ?? "(null)",
+                    jsonMode && body.ResponseFormat is not null,
+                    url,
+                    lease.Slot);
+
+                (HttpStatusCode status, string raw) = await SendVisionAsync(url, body, lease, ct).ConfigureAwait(false);
+                lastStatus = status;
+                lastBody = raw;
+                if (status == HttpStatusCode.Unauthorized)
+                {
+                    if (Failover(lease) && hop + 1 < hops)
+                        continue;
+                    ThrowVisionFailure(status, raw);
+                }
+
+                if (!IsHttpSuccess(status)
+                    && jsonMode
+                    && LlmJson.IsFormatRejected((int)status, raw))
+                {
+                    Volatile.Write(ref _jsonObjectEnabled, 0);
+                    _logger.LogWarning(
+                        "LLM vision rejected response_format=json_object; disabling it and retrying without the field");
+                    body.ResponseFormat = null;
+                    (HttpStatusCode retryStatus, string retryRaw) = await SendVisionAsync(url, body, lease, ct)
+                        .ConfigureAwait(false);
+                    lastStatus = retryStatus;
+                    lastBody = retryRaw;
+                    if (retryStatus == HttpStatusCode.Unauthorized)
+                    {
+                        if (Failover(lease) && hop + 1 < hops)
+                            continue;
+                        ThrowVisionFailure(retryStatus, retryRaw);
+                    }
+
+                    if (!IsHttpSuccess(retryStatus))
+                        ThrowVisionFailure(retryStatus, retryRaw);
+                    return retryRaw;
+                }
+
+                if (!IsHttpSuccess(status))
+                    ThrowVisionFailure(status, raw);
+                return raw;
             }
-
-            return raw;
         }
 
-        if (!response.IsSuccessStatusCode)
+        ThrowVisionFailure(lastStatus, lastBody);
+        throw new InvalidOperationException("LLM vision OCR failed.");
+    }
+
+    /// <summary>Disables the key. Returns true when another live key can take the retry. Does not log the secret.</summary>
+    private bool Failover(LlmKeyPool.LlmKeyLease lease)
+    {
+        if (_keys.Disable(lease.Slot))
         {
-            string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
-            throw new HttpRequestException(
-                $"LLM vision OCR failed HTTP {(int)response.StatusCode}: {snippet}");
+            _logger.LogWarning(
+                "LLM API key slot {Slot} returned HTTP 401 and was disabled for this process; liveKeys={Live}",
+                lease.Slot,
+                _keys.LiveCount);
         }
 
-        return raw;
+        return _keys.LiveCount > 0;
+    }
+
+    private async Task<(HttpStatusCode Status, string Body)> SendVisionAsync(
+        string url,
+        VisionChatCompletionRequest body,
+        LlmKeyPool.LlmKeyLease lease,
+        CancellationToken ct)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Post, url);
+        lease.Apply(request);
+        request.Content = JsonContent.Create(body, AppJsonContext.Default.VisionChatCompletionRequest);
+        using HttpResponseMessage response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        return (response.StatusCode, raw);
+    }
+
+    private void ThrowVisionFailure(HttpStatusCode status, string raw)
+    {
+        string safe = _keys.Redact(raw);
+        string snippet = safe.Length > 240 ? safe[..240] + "…" : safe;
+        throw new HttpRequestException(
+            $"LLM vision OCR failed HTTP {(int)status}: {snippet}",
+            inner: null,
+            statusCode: status);
+    }
+
+    private static bool IsHttpSuccess(HttpStatusCode status)
+    {
+        int code = (int)status;
+        return code is >= 200 and <= 299;
     }
 
     /// <summary>

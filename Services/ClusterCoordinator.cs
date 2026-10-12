@@ -528,7 +528,7 @@ public sealed class ClusterCoordinator : IHostedService
         if (distributeNer && _config.DistributedNer)
         {
             int leaseMs = Math.Clamp((_llm.Config.TimeoutSeconds + 15) * 1000, 20_000, 600_000);
-            localNerCap = _llm.IsUsable ? Math.Clamp(_llm.Config.MaxConcurrency, 1, 32) : 0;
+            localNerCap = _llm.IsUsable ? Math.Clamp(_llm.Config.MaxConcurrency, 1, LlmRuntimeConfig.MaxTotalConcurrency) : 0;
             ner = new ClusterNerScheduler(new ClusterNerOptions
             {
                 PageCount = pageCount,
@@ -1227,7 +1227,7 @@ public sealed class ClusterCoordinator : IHostedService
     {
         if (configured is not bool on || string.IsNullOrWhiteSpace(nodeId))
             return;
-        int cap = on && concurrency is int n && n > 0 ? Math.Clamp(n, 1, 32) : 0;
+        int cap = on && concurrency is int n && n > 0 ? Math.Clamp(n, 1, LlmRuntimeConfig.MaxTotalConcurrency) : 0;
         foreach (ClusterJob job in _jobs.Values)
             job.Ner?.SetNerCapacity(nodeId, cap);
     }

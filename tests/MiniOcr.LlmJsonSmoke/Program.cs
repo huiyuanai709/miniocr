@@ -470,6 +470,11 @@ using (HttpClient unauthHttp = new(unauthorized) { BaseAddress = new Uri("http:/
         $"401 is not retried (calls={unauthorized.Calls}, {auth?.Message})");
     Assert(authLog.Lines.Exists(l => l.Contains("not retrying", StringComparison.Ordinal) && l.Contains("401", StringComparison.Ordinal)),
         "401 log says not retrying");
+    Assert(unauthorized.Authorizations.Count == 1 && unauthorized.Authorizations[0] == "Bearer test-key",
+        "single key is still sent as a Bearer token");
+    Assert(auth?.Message?.Contains("test-key", StringComparison.Ordinal) != true
+        && !authLog.Lines.Exists(l => l.Contains("test-key", StringComparison.Ordinal)),
+        "401 failure does not log the api key");
 }
 
 ScriptedHandler badRequest = new();
@@ -528,6 +533,315 @@ using (HttpClient timedHttp = new(timedOut) { BaseAddress = new Uri("http://llm.
 {
     Exception? timed = await TryExtract(MakeExtractor(timedHttp, attempts: 3));
     Assert(timed is null && timedOut.Calls == 2, $"HttpClient timeout is retried (calls={timedOut.Calls}, {timed?.Message})");
+}
+
+Console.WriteLine("multi-key pool");
+string? prevApiKey = Environment.GetEnvironmentVariable("MINIOCR_LLM_API_KEY");
+string? prevApiKeys = Environment.GetEnvironmentVariable("MINIOCR_LLM_API_KEYS");
+string? prevConcurrency = Environment.GetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY");
+string? prevPerKey = Environment.GetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY");
+try
+{
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEY", null);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEYS", null);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", null);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY", null);
+
+    AppConfigFile? keyFile = JsonSerializer.Deserialize(
+        """{"llm":{"apiKey":"file-one","apiKeys":["k2","k1"],"maxConcurrencyPerKey":6}}""",
+        AppJsonContext.Default.AppConfigFile);
+    Assert(keyFile?.Llm?.ApiKeys is ["k2", "k1"] && keyFile.Llm.MaxConcurrencyPerKey == 6,
+        "config json reads apiKeys and maxConcurrencyPerKey");
+
+    LlmRuntimeConfig single = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig { ApiKey = "only-key", MaxConcurrency = 4 },
+    });
+    Assert(single.ApiKey == "only-key" && single.ApiKeyCount == 1 && single.ApiKeys.Count == 1,
+        "single apiKey still resolves to a one-key pool");
+    Assert(single.MaxConcurrencyPerKey == 4 && single.MaxConcurrency == 4,
+        "one key keeps maxConcurrency as the effective NER limit");
+    Assert(!single.IsUsable || single.ApiKey == "only-key", "single-key config stays usable when enabled");
+    Assert(single.IsUsable, "enabled + apiKey + default baseUrl and model is usable");
+
+    LlmRuntimeConfig merged = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig
+        {
+            ApiKey = " k1 ",
+            ApiKeys = ["", "  ", "k2", "k1", "k2"],
+            MaxConcurrency = 4,
+        },
+    });
+    Assert(merged.ApiKeys.Count == 2 && merged.ApiKeys[0] == "k2" && merged.ApiKeys[1] == "k1",
+        "file apiKeys and apiKey are trimmed, merged, and de-duplicated");
+    Assert(merged.ApiKey == "k2", "ApiKey is the first pooled key and is not logged by resolve");
+    Assert(merged.MaxConcurrencyPerKey == 4 && merged.MaxConcurrency == 8,
+        "unset maxConcurrencyPerKey reuses maxConcurrency per key, so two keys allow 8 in flight");
+
+    LlmRuntimeConfig preferred = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig
+        {
+            ApiKeys = ["k1", "k2"],
+            MaxConcurrency = 4,
+            MaxConcurrencyPerKey = 6,
+        },
+    });
+    Assert(preferred.MaxConcurrencyPerKey == 6 && preferred.MaxConcurrency == 12,
+        "maxConcurrencyPerKey wins over maxConcurrency");
+
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEYS", "k3;k4\nk3");
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEY", "k1");
+    LlmRuntimeConfig fromEnv = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig
+        {
+            ApiKey = "ignored-file",
+            ApiKeys = ["ignored"],
+            MaxConcurrency = 9,
+            MaxConcurrencyPerKey = 3,
+        },
+    });
+    Assert(fromEnv.ApiKeys.Count == 3
+        && fromEnv.ApiKeys[0] == "k3"
+        && fromEnv.ApiKeys[1] == "k4"
+        && fromEnv.ApiKeys[2] == "k1",
+        "MINIOCR_LLM_API_KEYS replaces the file list; MINIOCR_LLM_API_KEY is merged and de-duplicated");
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEYS", null);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEY", "env-one");
+    LlmRuntimeConfig envSingle = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig { ApiKey = "file-one" },
+    });
+    Assert(envSingle.ApiKey == "env-one" && envSingle.ApiKeyCount == 1,
+        "MINIOCR_LLM_API_KEY still overrides the file apiKey");
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEY", null);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", "9");
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY", "7");
+    LlmRuntimeConfig perKeyEnv = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig
+        {
+            ApiKeys = ["k1", "k2"],
+            MaxConcurrency = 4,
+            MaxConcurrencyPerKey = 3,
+        },
+    });
+    Assert(perKeyEnv.MaxConcurrencyPerKey == 7 && perKeyEnv.MaxConcurrency == 14,
+        "MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY overrides the file and maxConcurrency");
+
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEY", null);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEYS", null);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", "100");
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY", null);
+    LlmRuntimeConfig clamped = AppConfigStore.ResolveLlm(new AppConfigFile
+    {
+        Llm = new LlmFileConfig { ApiKeys = ["a", "b"] },
+    });
+    Assert(clamped.MaxConcurrencyPerKey == 32 && clamped.MaxConcurrency == 64,
+        "per-key concurrency clamps at 32 and the effective limit is keys times that");
+
+    LlmKeyPool reused = LlmKeyPool.FromConfig(new LlmRuntimeConfig
+    {
+        ApiKeys = ["a", "b"],
+        MaxConcurrency = 1,
+    });
+    Assert(reused.PerKey == 1 && reused.MaxInFlight == 2 && reused.KeyCount == 2,
+        "without maxConcurrencyPerKey, maxConcurrency is the per-key slot count");
+    LlmKeyPool explicitPool = LlmKeyPool.FromConfig(new LlmRuntimeConfig
+    {
+        ApiKey = "a",
+        ApiKeys = ["a", "b"],
+        MaxConcurrency = 1,
+        MaxConcurrencyPerKey = 4,
+    });
+    Assert(explicitPool.KeyCount == 2 && explicitPool.PerKey == 4 && explicitPool.MaxInFlight == 8,
+        "maxConcurrencyPerKey is the slot count even when maxConcurrency is smaller");
+    LlmKeyPool redactor = new(["sk-live-secret-aaa", "sk-live-secret-aa"], 1);
+    Assert(redactor.Redact("bad sk-live-secret-aaa") == "bad ***", "redact removes a key and prefers the longer match");
+
+    LlmKeyPool slots = new(["k1", "k2"], 1);
+    LlmKeyPool.LlmKeyLease first = await slots.AcquireAsync(CancellationToken.None);
+    LlmKeyPool.LlmKeyLease second = await slots.AcquireAsync(CancellationToken.None);
+    Assert(first.Slot == 0 && first.Key == "k1" && second.Slot == 1 && second.Key == "k2",
+        "idle keys are handed out round-robin");
+    using CancellationTokenSource blocked = new(TimeSpan.FromMilliseconds(200));
+    bool waited = false;
+    try
+    {
+        await slots.AcquireAsync(blocked.Token);
+    }
+    catch (OperationCanceledException)
+    {
+        waited = true;
+    }
+
+    Assert(waited, "a third acquire waits while both per-key slots are taken");
+    first.Dispose();
+    LlmKeyPool.LlmKeyLease reusedSlot = await slots.AcquireAsync(CancellationToken.None);
+    Assert(reusedSlot.Key == "k1", "a freed slot is preferred over a busier key");
+    Assert(slots.Disable(second.Slot) && !slots.Disable(second.Slot), "disable is sticky for the process");
+    reusedSlot.Dispose();
+    second.Dispose();
+    LlmKeyPool.LlmKeyLease afterDisable = await slots.AcquireAsync(CancellationToken.None);
+    Assert(afterDisable.Key == "k1" && slots.LiveCount == 1, "a disabled key is not issued again");
+    afterDisable.Dispose();
+    Assert(first.ToString() == "LlmKeyLease(slot=0)", "lease text is the slot index and not the key");
+}
+finally
+{
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEY", prevApiKey);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_API_KEYS", prevApiKeys);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY", prevConcurrency);
+    Environment.SetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY", prevPerKey);
+}
+
+const string SecretA = "sk-live-secret-aaa";
+const string SecretB = "sk-live-secret-bbb";
+ListLog failoverLog = new();
+KeyFailoverHandler failover = new() { Reject = [SecretA] };
+using (HttpClient failoverHttp = new(failover) { BaseAddress = new Uri("http://llm.test") })
+{
+    LlmKeyPool pool = new([SecretA, SecretB], perKey: 2);
+    LlmEntityExtractor failoverExtractor = new(failoverHttp, new LlmRuntimeConfig
+    {
+        Enabled = true,
+        BaseUrl = "http://llm.test",
+        ApiKey = SecretA,
+        ApiKeys = [SecretA, SecretB],
+        Model = "test-model",
+        TimeoutSeconds = 30,
+        PagesPerRequest = 1,
+        MaxCharsPerRequest = 100_000,
+        MaxConcurrency = 2,
+        MaxConcurrencyPerKey = 2,
+        JsonObject = true,
+        NerMaxAttempts = 3,
+    }, failoverLog, pool);
+    Exception? failoverError = await TryExtract(failoverExtractor);
+    Assert(failoverError is null && failover.Calls == 2, $"401 on one key retries another (calls={failover.Calls}, {failoverError?.Message})");
+    Assert(failover.Authorizations.Count == 2
+        && failover.Authorizations[0] == "Bearer " + SecretA
+        && failover.Authorizations[1] == "Bearer " + SecretB,
+        "the retry uses the next live key");
+    Assert(pool.LiveCount == 1, "the rejected key stays disabled");
+    string logs = string.Join("\n", failoverLog.Lines);
+    Assert(!logs.Contains(SecretA, StringComparison.Ordinal) && !logs.Contains(SecretB, StringComparison.Ordinal),
+        "NER failover logs do not contain key material");
+}
+
+ListLog exhaustedLog = new();
+KeyFailoverHandler exhausted = new() { RejectAll = true };
+using (HttpClient exhaustedHttp = new(exhausted) { BaseAddress = new Uri("http://llm.test") })
+{
+    LlmEntityExtractor exhaustedExtractor = new(exhaustedHttp, new LlmRuntimeConfig
+    {
+        Enabled = true,
+        BaseUrl = "http://llm.test",
+        ApiKeys = [SecretA, SecretB],
+        Model = "test-model",
+        TimeoutSeconds = 30,
+        PagesPerRequest = 1,
+        MaxCharsPerRequest = 100_000,
+        MaxConcurrencyPerKey = 1,
+        JsonObject = true,
+        NerMaxAttempts = 3,
+    }, exhaustedLog);
+    Exception? exhaustedError = await TryExtract(exhaustedExtractor);
+    Assert(exhausted.Calls == 2 && exhaustedError is HttpRequestException { StatusCode: HttpStatusCode.Unauthorized },
+        $"401 on every key fails the attempt once (calls={exhausted.Calls}, {exhaustedError?.Message})");
+    string message = exhaustedError?.ToString() ?? "";
+    string logs = string.Join("\n", exhaustedLog.Lines);
+    Assert(!message.Contains(SecretA, StringComparison.Ordinal)
+        && !message.Contains(SecretB, StringComparison.Ordinal)
+        && !logs.Contains(SecretA, StringComparison.Ordinal)
+        && !logs.Contains(SecretB, StringComparison.Ordinal),
+        "exhausted 401 does not echo the key from the response body");
+}
+
+ListLog overlapLog = new();
+OverlapHandler overlap = new();
+using (HttpClient overlapHttp = new(overlap) { BaseAddress = new Uri("http://llm.test") })
+{
+    LlmEntityExtractor overlapExtractor = new(overlapHttp, new LlmRuntimeConfig
+    {
+        Enabled = true,
+        BaseUrl = "http://llm.test",
+        ApiKeys = ["k-one", "k-two"],
+        Model = "test-model",
+        TimeoutSeconds = 30,
+        PagesPerRequest = 1,
+        MaxCharsPerRequest = 100_000,
+        MaxConcurrency = 1,
+        MaxConcurrencyPerKey = 1,
+        JsonObject = true,
+        NerMaxAttempts = 1,
+    }, overlapLog);
+    using CancellationTokenSource overlapCancel = new(TimeSpan.FromSeconds(5));
+    Exception? overlapError = null;
+    try
+    {
+        await overlapExtractor.ExtractAsync(
+            [
+                new OcrPageResult { Page = 1, Text = "甲方北京华腾科技有限公司" },
+                new OcrPageResult { Page = 2, Text = "法定代表人张伟签署本合同" },
+            ],
+            overlapCancel.Token);
+    }
+    catch (Exception ex)
+    {
+        overlapError = ex;
+    }
+
+    Assert(overlapError is null && overlap.Peak >= 2, $"two keys run two NER calls together (peak={overlap.Peak}, {overlapError?.Message})");
+    Assert(overlap.Authorizations.Contains("Bearer k-one") && overlap.Authorizations.Contains("Bearer k-two"),
+        "overlapping calls use different keys");
+    string logs = string.Join("\n", overlapLog.Lines);
+    Assert(!logs.Contains("k-one", StringComparison.Ordinal) && !logs.Contains("k-two", StringComparison.Ordinal),
+        "overlap logs do not contain key material");
+}
+
+ListLog visionLog = new();
+KeyFailoverHandler visionFailover = new() { Reject = [SecretA] };
+using (HttpClient visionHttp = new(visionFailover) { BaseAddress = new Uri("http://llm.test") })
+{
+    LlmKeyPool visionPool = new([SecretA, SecretB], perKey: 1);
+    LlmVisionOcr vision = new(visionHttp, new LlmRuntimeConfig
+    {
+        Enabled = true,
+        BaseUrl = "http://llm.test",
+        ApiKeys = [SecretA, SecretB],
+        Model = "test-model",
+        TimeoutSeconds = 30,
+        JsonObject = true,
+    }, new QuietVisionLog(), visionPool);
+    OcrPageResult page = await vision.RecognizePageAsync(1, 8, 8, [1, 2, 3], 0, CancellationToken.None);
+    Assert(page.Text == "hello" && visionFailover.Calls == 2, "vision OCR retries a 401 on the next key");
+    Assert(visionFailover.Authorizations.Count == 2 && visionFailover.Authorizations[1] == "Bearer " + SecretB,
+        "vision OCR sends the failover key");
+    Assert(visionPool.LiveCount == 1, "vision 401 disables the key for the shared pool");
+    Exception? nerAfter = await TryExtract(new LlmEntityExtractor(
+        new HttpClient(visionFailover, disposeHandler: false) { BaseAddress = new Uri("http://llm.test") },
+        new LlmRuntimeConfig
+        {
+            Enabled = true,
+            BaseUrl = "http://llm.test",
+            ApiKeys = [SecretA, SecretB],
+            Model = "test-model",
+            TimeoutSeconds = 30,
+            PagesPerRequest = 1,
+            MaxConcurrencyPerKey = 1,
+            JsonObject = true,
+            NerMaxAttempts = 1,
+        },
+        visionLog,
+        visionPool));
+    Assert(nerAfter is null && visionFailover.Authorizations[^1] == "Bearer " + SecretB,
+        "NER uses the pool after vision disables the bad key");
+    string logs = string.Join("\n", visionLog.Lines);
+    Assert(!logs.Contains(SecretA, StringComparison.Ordinal) && !logs.Contains(SecretB, StringComparison.Ordinal),
+        "shared-pool NER logs do not contain key material");
 }
 
 if (failed > 0)
@@ -605,6 +919,8 @@ sealed class ScriptedHandler : HttpMessageHandler
 
     public int Calls { get; private set; }
 
+    public List<string> Authorizations { get; } = [];
+
     public IReadOnlyList<string> RequestBodies => _requestBodies;
 
     public void EnqueueOk(string json) => EnqueueStatus(HttpStatusCode.OK, json);
@@ -625,6 +941,7 @@ sealed class ScriptedHandler : HttpMessageHandler
             ? ""
             : await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         _requestBodies.Add(requestBody);
+        Authorizations.Add(request.Headers.Authorization?.ToString() ?? "");
         Calls++;
         if (_steps.Count == 0)
             throw new InvalidOperationException($"unexpected LLM call {Calls}");
@@ -727,5 +1044,90 @@ sealed class QuietLog : ILogger<LlmEntityExtractor>
         Exception? exception,
         Func<TState, Exception?, string> formatter)
     {
+    }
+}
+
+sealed class QuietVisionLog : ILogger<LlmVisionOcr>
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => false;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+    }
+}
+
+sealed class KeyFailoverHandler : HttpMessageHandler
+{
+    public bool RejectAll { get; init; }
+    public List<string> Reject { get; init; } = [];
+    public int Calls { get; private set; }
+    public List<string> Authorizations { get; } = [];
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        Calls++;
+        string auth = request.Headers.Authorization?.ToString() ?? "";
+        Authorizations.Add(auth);
+        string token = request.Headers.Authorization?.Parameter ?? "";
+        bool reject = RejectAll || Reject.Contains(token);
+        if (reject)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = new StringContent("{\"error\":\"bad " + token + "\"}", Encoding.UTF8, "application/json"),
+            });
+        }
+
+        string payload = """{"text":"hello","companies":[],"persons":[]}""";
+        string json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":" + JsonSerializer.Serialize(payload) + "}}]}";
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        });
+    }
+}
+
+sealed class OverlapHandler : HttpMessageHandler
+{
+    private readonly TaskCompletionSource _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _inFlight;
+    public int Peak { get; private set; }
+    public List<string> Authorizations { get; } = [];
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        lock (Authorizations)
+            Authorizations.Add(request.Headers.Authorization?.ToString() ?? "");
+        int now = Interlocked.Increment(ref _inFlight);
+        lock (this)
+        {
+            if (now > Peak)
+                Peak = now;
+        }
+
+        if (now >= 2)
+            _gate.TrySetResult();
+        try
+        {
+            await _gate.Task.WaitAsync(TimeSpan.FromSeconds(4), cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _inFlight);
+        }
+
+        string payload = """{"companies":[],"persons":[]}""";
+        string json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":" + JsonSerializer.Serialize(payload) + "}}]}";
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
     }
 }

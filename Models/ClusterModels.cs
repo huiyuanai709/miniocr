@@ -114,7 +114,7 @@ public sealed class ClusterNodeHealth
     public int Dpi { get; set; }
     /// <summary>This node has <c>llm.enabled</c> and an API key, so it can run text NER.</summary>
     public bool LlmConfigured { get; set; }
-    /// <summary>This node's <c>llm.maxConcurrency</c>. Zero when no key is configured.</summary>
+    /// <summary>This node's effective NER concurrency (keys × per-key limit). Zero when no key is configured.</summary>
     public int NerConcurrency { get; set; }
     public string? Warning { get; set; }
 }

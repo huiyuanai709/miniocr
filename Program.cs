@@ -87,7 +87,7 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<OcrTraceLog>());
 if (runtimeConfig.IsLlmMode && !llmConfig.IsUsable)
 {
     bootstrapLogger.LogWarning(
-        "ocr.mode=llm but LLM is not usable (need llm.enabled + apiKey + baseUrl + model); falling back to local Paddle OCR");
+        "ocr.mode=llm but LLM is not usable (need llm.enabled + apiKey/apiKeys + baseUrl + model); falling back to local Paddle OCR");
     runtimeConfig = runtimeConfig.WithMode("local");
 }
 
@@ -158,7 +158,7 @@ if (runtimeConfig.IsParallelRender)
     (runtimeConfig, parallelRenderer) = await PdfParallelStartup.ProbeAsync(runtimeConfig, bootstrapLogger);
 }
 
-string apiKeyStatus = string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)";
+string apiKeyStatus = llmConfig.ApiKeyCount == 0 ? "(empty)" : "(set)";
 bool llmOcrMode = runtimeConfig.IsLlmMode;
 
 Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
@@ -179,7 +179,7 @@ Console.WriteLine(
 Console.WriteLine(
     $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
-    $"maxConcurrency={llmConfig.MaxConcurrency}, pagesPerRequest={llmConfig.PagesPerRequest}, " +
+    $"maxConcurrency={llmConfig.MaxConcurrency}, maxConcurrencyPerKey={llmConfig.MaxConcurrencyPerKey}, apiKeyCount={llmConfig.ApiKeyCount}, pagesPerRequest={llmConfig.PagesPerRequest}, " +
     $"nerMaxAttempts={llmConfig.NerMaxAttempts}, " +
     $"maxCharsPerRequest={llmConfig.MaxCharsPerRequest}, " +
     $"ocrConcurrency={llmConfig.OcrConcurrency}, ocrJpegQuality={llmConfig.OcrJpegQuality}, " +
@@ -245,6 +245,9 @@ if (engine is not null)
 if (wechatEngine is not null)
     builder.Services.AddSingleton(wechatEngine);
 
+LlmKeyPool llmKeys = LlmKeyPool.FromConfig(llmConfig);
+builder.Services.AddSingleton(llmKeys);
+
 builder.Services.AddHttpClient(nameof(LlmEntityExtractor), (sp, client) =>
 {
     LlmRuntimeConfig cfg = sp.GetRequiredService<LlmRuntimeConfig>();
@@ -258,7 +261,8 @@ builder.Services.AddSingleton<LlmEntityExtractor>(sp =>
     return new LlmEntityExtractor(
         http,
         sp.GetRequiredService<LlmRuntimeConfig>(),
-        sp.GetRequiredService<ILogger<LlmEntityExtractor>>());
+        sp.GetRequiredService<ILogger<LlmEntityExtractor>>(),
+        sp.GetRequiredService<LlmKeyPool>());
 });
 
 builder.Services.AddHttpClient(nameof(LlmVisionOcr), (sp, client) =>
@@ -274,7 +278,8 @@ builder.Services.AddSingleton<LlmVisionOcr>(sp =>
     return new LlmVisionOcr(
         http,
         sp.GetRequiredService<LlmRuntimeConfig>(),
-        sp.GetRequiredService<ILogger<LlmVisionOcr>>());
+        sp.GetRequiredService<ILogger<LlmVisionOcr>>(),
+        sp.GetRequiredService<LlmKeyPool>());
 });
 
 if (clusterConfig.Enabled)
@@ -1053,7 +1058,7 @@ app.MapGet("/", () => Results.Text(
     "Env CHALLENGE: MINIOCR_CHALLENGE_RESOURCE_DIR (empty = require fileId+url; set = read-only {dir}/{fileId}.pdf)\n" +
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_OCR_BACKEND MINIOCR_OCR_VULKAN_DEVICE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_REC_INTRA_OP_THREADS MINIOCR_USE_CLS MINIOCR_REMOVE_RED_SEAL MINIOCR_RASTER_WORKERS MINIOCR_RENDER_MODE MINIOCR_RENDER_PROCESSES\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
-    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_NER_MAX_ATTEMPTS MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
+    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_API_KEYS MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_NER_MAX_ATTEMPTS MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
     "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH MINIOCR_CLUSTER_DISTRIBUTED_NER\n" +
     $"OCR trace: {(ocrTrace.Enabled ? "on" : "off")} path={ocrTrace.Path} maxCharsPerPage={ocrTrace.MaxCharsPerPage} queue={ocrTrace.QueueCapacity}\n" +
     "  MINIOCR_OCR_TRACE=0 turns it off (default on). MINIOCR_OCR_TRACE_PATH sets the JSONL file. MINIOCR_OCR_TRACE_MAX_CHARS caps each page (0 keeps page metadata and omits the text). File URLs and OCR text are queued; a full queue drops events and does not fail or block OCR.\n" +
