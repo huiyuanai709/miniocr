@@ -339,7 +339,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
 
         // Encode is CPU; scale with raster workers (vision is IO so CPU free for PDFium+JPEG).
-        int encodeWorkers = Math.Clamp(_rasterWorkers, 1, 8);
+        int encodeWorkers = InProcessRasterWorkers(_rasterWorkers, pageCount);
         Task[] encoders = Enumerable.Range(0, encodeWorkers)
             .Select(_ => EncodeConsumerAsync())
             .ToArray();
@@ -1770,6 +1770,12 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         response.OcrPageCount = ocr;
     }
 
+    /// <summary>
+    /// In-process raster or JPEG-encode threads. The upper bound is the page count.
+    /// </summary>
+    private static int InProcessRasterWorkers(int requested, int pageCount) =>
+        Math.Clamp(requested, 1, Math.Max(1, pageCount));
+
     private Task ProduceParallelAsync(
         byte[] pdfBytes,
         int pdfLength,
@@ -1806,7 +1812,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         string mode = _config.IsParallelRender ? "parallel" : "inprocess";
         int workers = _config.IsParallelRender
             ? _config.RenderProcessCount
-            : Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, pageIndices.Length)), 1, 8);
+            : InProcessRasterWorkers(_rasterWorkers, pageIndices.Length);
         HashSet<int> written = new();
         try
         {
@@ -1827,7 +1833,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     AbandonParallel();
                     mode = "parallel-fallback-inprocess";
                     int[] remaining = RemainingIndices(pageIndices, written);
-                    workers = Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, remaining.Length)), 1, 8);
+                    workers = InProcessRasterWorkers(_rasterWorkers, remaining.Length);
                     if (remaining.Length > 0)
                     {
                         byte[] fallback = BytesForInProcess(pdfBytes, pdfLength, sharedPdfPath);
@@ -1965,7 +1971,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         if (pageIndices.Length == 0)
             return;
 
-        int workers = Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, pageIndices.Length)), 1, 8);
+        int workers = InProcessRasterWorkers(_rasterWorkers, pageIndices.Length);
         Task[] tasks = new Task[workers];
         for (int w = 0; w < workers; w++)
         {

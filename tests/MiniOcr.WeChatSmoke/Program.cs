@@ -231,6 +231,7 @@ string? prevRenderMode = Environment.GetEnvironmentVariable("MINIOCR_RENDER_MODE
 string? prevRenderProcesses = Environment.GetEnvironmentVariable("MINIOCR_RENDER_PROCESSES");
 string? prevTextLayer = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
 string? prevRemoveRed = Environment.GetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL");
+string? prevRaster = Environment.GetEnvironmentVariable("MINIOCR_RASTER_WORKERS");
 try
 {
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "wechat");
@@ -297,10 +298,14 @@ try
     AutoScaleDefaults fourCore = OcrRuntimeConfig.ComputeWorkersForEngines(4, 2);
     AssertEqual("2", fourCore.LineWorkers.ToString(), "4 cores keep 2 line workers");
     AssertEqual("2", fourCore.DetThreads.ToString(), "4 cores fill detection with 2 threads per engine");
+    AssertEqual("2", fourCore.RasterWorkers.ToString(), "4 cores keep 2 raster workers");
     AutoScaleDefaults twelveThread = OcrRuntimeConfig.ComputeWorkersForEngines(12, 6);
     AssertEqual("2", twelveThread.LineWorkers.ToString(), "12 logical CPUs keep 2 line workers");
     AssertEqual("2", twelveThread.DetThreads.ToString(), "12 logical CPUs fill detection with 2 threads per engine");
+    AssertEqual("6", twelveThread.RasterWorkers.ToString(), "12 logical CPUs use 6 raster workers");
     AssertEqual("1", OcrRuntimeConfig.ComputeWorkersForEngines(1, 1).DetThreads.ToString(), "1 core stays at 1 detection thread");
+    AssertEqual("16", OcrRuntimeConfig.ComputeWorkersForEngines(32, 16).RasterWorkers.ToString(), "32 cores and 16 engines use 16 raster workers");
+    AssertEqual("16", OcrRuntimeConfig.ComputeAutoScale(64).RasterWorkers.ToString(), "64-core auto raster follows engines");
     AssertEqual("6", OcrRuntimeConfig.ComputeAutoScale(12).Engines.ToString(), "12 logical CPUs use 6 engines");
     int gpuLine = 4, gpuDet = 6;
     OcrRuntimeConfig.ApplyGpuThreadBudget(gpu: true, lineExplicit: false, detExplicit: false, ref gpuLine, ref gpuDet);
@@ -400,6 +405,22 @@ try
     AssertEqual("True", forcedOn.RemoveRedSeal.ToString(), "env overrides file removeRedSeal");
     AssertEqual("True", forcedOn.WithMode("llm").RemoveRedSeal.ToString(), "mode copy keeps removeRedSeal");
     Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", null);
+
+    int cores = Math.Max(1, Environment.ProcessorCount);
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "llm");
+    Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", null);
+    OcrRuntimeConfig llmRaster = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { Mode = "llm", AutoScaleFromCpu = false },
+    });
+    AssertEqual(cores.ToString(), llmRaster.RasterWorkerCount.ToString(), "llm raster default follows logical processors");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "local");
+    Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", "32");
+    int explicitRaster = OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RasterWorkerCount;
+    AssertEqual(Math.Min(32, cores).ToString(), explicitRaster.ToString(), "explicit raster workers clamp to logical processors");
+    Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", "0");
+    AssertEqual("1", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).RasterWorkerCount.ToString(), "raster workers clamp to 1");
+    Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", null);
 }
 finally
 {
@@ -411,6 +432,7 @@ finally
     Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", prevTextLayer);
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
     Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", prevRemoveRed);
+    Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", prevRaster);
 }
 
 Console.WriteLine("=== red seal filter ===");

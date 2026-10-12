@@ -109,22 +109,23 @@ public sealed class OcrRuntimeConfig
         bool useCls = ReadBool("MINIOCR_USE_CLS", useClsFile);
         bool removeRedSeal = ReadBool("MINIOCR_REMOVE_RED_SEAL", ocr.RemoveRedSeal);
 
-        // Vision OCR is IO-bound: leave CPU free for PDFium — default raster workers = min(8, cores).
+        // Vision OCR is IO-bound, so the llm default uses every logical processor.
+        // Explicit values use the same ceiling: the logical processor count.
         bool llmMode = string.Equals(mode, "llm", StringComparison.OrdinalIgnoreCase);
         int rasterDefault;
         if (llmMode)
-            rasterDefault = Math.Clamp(Math.Min(8, cores), 1, 8);
+            rasterDefault = cores;
         else if (autoScale)
             rasterDefault = forEngines.RasterWorkers;
         else
-            rasterDefault = Math.Clamp(Math.Min(engines, 4), 1, 8);
+            rasterDefault = Math.Max(1, Math.Min(engines, 4));
         int raster = ResolveInt(
             "MINIOCR_RASTER_WORKERS",
             ocr.RasterWorkers,
             rasterDefault,
             autoScale || llmMode,
             rasterDefault);
-        raster = Math.Clamp(raster, 1, 8);
+        raster = Math.Clamp(raster, 1, cores);
 
         string renderMode = ResolveRenderMode(ocr.RenderMode);
         int renderAuto = ComputeRenderProcesses(cores, engines);
@@ -241,7 +242,7 @@ public sealed class OcrRuntimeConfig
     /// Line workers stay on the old 1.0–1.5× shared budget (typically 2).
     /// Detection runs before recognition, so det threads are
     /// Clamp(ceil(cores/engines), 1, 8) and are not subtracted from that budget.
-    /// raster = Clamp(min(engines, cores/2), 1, 8).
+    /// raster = min(engines, max(1, cores/2)).
     /// </summary>
     public static AutoScaleDefaults ComputeAutoScale(int cores)
     {
@@ -281,7 +282,7 @@ public sealed class OcrRuntimeConfig
 
         det = Math.Clamp((cores + engines - 1) / engines, 1, 8);
 
-        int raster = Math.Clamp(Math.Min(engines, Math.Max(1, cores / 2)), 1, 8);
+        int raster = Math.Min(engines, Math.Max(1, cores / 2));
 
         return new AutoScaleDefaults
         {
