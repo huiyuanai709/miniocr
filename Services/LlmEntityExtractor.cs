@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using MiniOcr.Models;
@@ -18,21 +17,23 @@ public sealed class LlmEntityExtractor
 
     private readonly HttpClient _http;
     private readonly LlmRuntimeConfig _config;
+    private readonly LlmKeyPool _keys;
     private readonly ILogger<LlmEntityExtractor> _logger;
     private int _jsonObjectEnabled = 1;
 
     public LlmEntityExtractor(
         HttpClient http,
         LlmRuntimeConfig config,
-        ILogger<LlmEntityExtractor> logger)
+        ILogger<LlmEntityExtractor> logger,
+        LlmKeyPool? keys = null)
     {
         _http = http;
         _config = config;
         _logger = logger;
+        _keys = keys ?? LlmKeyPool.FromConfig(config);
         _http.Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds);
-        if (!string.IsNullOrEmpty(config.ApiKey))
-            _http.DefaultRequestHeaders.Authorization =
-                new AuthenticationHeaderValue("Bearer", config.ApiKey);
+        // Auth is per request so each in-flight call can use a different key.
+        _http.DefaultRequestHeaders.Remove("Authorization");
     }
 
     public LlmRuntimeConfig Config => _config;
@@ -41,7 +42,7 @@ public sealed class LlmEntityExtractor
     /// <summary>
     /// Start a streaming NER session. Call <see cref="LlmExtractionSession.Add"/>
     /// as each page finishes OCR (any order); groups of non-empty pages are
-    /// sent under <see cref="LlmRuntimeConfig.MaxConcurrency"/> without waiting
+    /// sent under the key pool (about keys × per-key concurrency) without waiting
     /// for the rest of the document. Then <see cref="LlmExtractionSession.CompleteAsync"/>.
     /// </summary>
     public LlmExtractionSession Begin(int pageCount, CancellationToken ct)
@@ -49,13 +50,18 @@ public sealed class LlmEntityExtractor
         if (!IsUsable)
             throw new InvalidOperationException("LLM entity extraction is not configured.");
 
-        int concurrency = Math.Clamp(_config.MaxConcurrency, 1, 32);
+        // Session gate matches the pool: live keys × per-key slots. No second global ceiling.
+        int concurrency = _keys.MaxInFlight;
+        if (concurrency <= 0)
+            throw new InvalidOperationException("LLM entity extraction is not configured.");
         _logger.LogInformation(
-            "LLM NER streaming: pageCount={PageCount}, pagesPerRequest={PagesPerRequest}, maxCharsPerRequest={MaxChars}, maxConcurrency={MaxConcurrency}",
+            "LLM NER streaming: pageCount={PageCount}, pagesPerRequest={PagesPerRequest}, maxCharsPerRequest={MaxChars}, maxConcurrency={MaxConcurrency}, perKey={PerKey}, apiKeyCount={ApiKeyCount}",
             pageCount,
             _config.PagesPerRequest,
             _config.MaxCharsPerRequest,
-            concurrency);
+            concurrency,
+            _keys.PerKey,
+            _keys.KeyCount);
         return new LlmExtractionSession(this, pageCount, concurrency, ct);
     }
 
@@ -432,7 +438,8 @@ public sealed class LlmEntityExtractor
     /// One NER group, up to <see cref="LlmRuntimeConfig.NerMaxAttempts"/> chat completions (default 3).
     /// A payload that is missing, truncated, or the wrong JSON type spends the remaining attempts on a
     /// thinking-on correction that quotes the bad reply. HTTP 403/408/429/5xx, timeouts, and transport
-    /// errors retry that same request. 401 fails on the first response.
+    /// errors retry that same request. HTTP 401 disables the key that was used and retries the same
+    /// attempt on another live key; when none remain, 401 fails without another attempt.
     /// The last failure is thrown unchanged so cluster NER requeues and the local pipeline can still return empty.
     /// </summary>
     private async Task<BatchResult> CompleteBatchAsync(
@@ -516,7 +523,8 @@ public sealed class LlmEntityExtractor
 
     /// <summary>
     /// JSON that did not deserialize, HTTP 403/408/429/5xx, HttpClient timeouts, and transport errors.
-    /// 401 and other 4xx are not retried. Parse failures are retried as a thinking correction, not the same prompt.
+    /// 401 and other 4xx are not retried at this layer. A 401 has already failed over to any other live key.
+    /// Parse failures are retried as a thinking correction, not the same prompt.
     /// </summary>
     internal static bool IsRetryableNerFailure(Exception ex)
     {
@@ -622,19 +630,16 @@ public sealed class LlmEntityExtractor
             Messages = BuildMessages(pagesMode, userText, repairBody),
         };
 
-        _logger.LogInformation(
-            "LLM NER request: attempt={Attempt}/{MaxAttempts}, correction={Correction}, model={Model}, chars={Chars}, pages={Pages}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}",
+        string raw = await PostChatAsync(
+            url,
+            body,
+            jsonMode,
             attempt,
             maxAttempts,
-            correction ? "yes" : "no",
-            _config.Model,
-            userText.Length,
             string.Join(',', batch.PageNumbers),
-            body.Thinking?.Type ?? "(null)",
-            jsonMode,
-            url);
-
-        string raw = await PostChatAsync(url, body, jsonMode, ct).ConfigureAwait(false);
+            userText.Length,
+            correction,
+            ct).ConfigureAwait(false);
         return ParseCompletion(raw);
     }
 
@@ -860,39 +865,120 @@ public sealed class LlmEntityExtractor
         string url,
         ChatCompletionRequest body,
         bool jsonMode,
+        int attempt,
+        int maxAttempts,
+        string pages,
+        int chars,
+        bool correction,
         CancellationToken ct)
     {
-        using HttpResponseMessage response = await _http
-            .PostAsJsonAsync(url, body, AppJsonContext.Default.ChatCompletionRequest, ct)
-            .ConfigureAwait(false);
-        string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode
-            && jsonMode
-            && LlmJson.IsFormatRejected((int)response.StatusCode, raw))
+        int hops = Math.Max(1, _keys.KeyCount);
+        string lastBody = "";
+        HttpStatusCode lastStatus = HttpStatusCode.Unauthorized;
+        for (int hop = 0; hop < hops; hop++)
         {
-            Volatile.Write(ref _jsonObjectEnabled, 0);
-            _logger.LogWarning(
-                "LLM rejected response_format=json_object; disabling it and retrying without the field");
-            body.ResponseFormat = null;
-            using HttpResponseMessage retry = await _http
-                .PostAsJsonAsync(url, body, AppJsonContext.Default.ChatCompletionRequest, ct)
-                .ConfigureAwait(false);
-            raw = await retry.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            if (!retry.IsSuccessStatusCode)
-                ThrowHttpFailure(retry.StatusCode, raw);
+            LlmKeyPool.LlmKeyLease lease = await _keys.AcquireAsync(ct).ConfigureAwait(false);
+            try
+            {
+                _logger.LogInformation(
+                    "LLM NER request: attempt={Attempt}/{MaxAttempts}, correction={Correction}, model={Model}, chars={Chars}, pages={Pages}, thinking={Thinking}, jsonObject={JsonObject}, url={Url}, keySlot={KeySlot}",
+                    attempt,
+                    maxAttempts,
+                    correction ? "yes" : "no",
+                    _config.Model,
+                    chars,
+                    pages,
+                    body.Thinking?.Type ?? "(null)",
+                    jsonMode && body.ResponseFormat is not null,
+                    url,
+                    lease.Slot);
 
-            return raw;
+                (HttpStatusCode status, string raw) = await SendChatAsync(url, body, lease, ct).ConfigureAwait(false);
+                lastStatus = status;
+                lastBody = raw;
+                if (status == HttpStatusCode.Unauthorized)
+                {
+                    if (Failover(lease) && hop + 1 < hops)
+                        continue;
+                    ThrowHttpFailure(status, raw);
+                }
+
+                if (!IsHttpSuccess(status)
+                    && jsonMode
+                    && LlmJson.IsFormatRejected((int)status, raw))
+                {
+                    Volatile.Write(ref _jsonObjectEnabled, 0);
+                    _logger.LogWarning(
+                        "LLM rejected response_format=json_object; disabling it and retrying without the field");
+                    body.ResponseFormat = null;
+                    (HttpStatusCode retryStatus, string retryRaw) = await SendChatAsync(url, body, lease, ct)
+                        .ConfigureAwait(false);
+                    lastStatus = retryStatus;
+                    lastBody = retryRaw;
+                    if (retryStatus == HttpStatusCode.Unauthorized)
+                    {
+                        if (Failover(lease) && hop + 1 < hops)
+                            continue;
+                        ThrowHttpFailure(retryStatus, retryRaw);
+                    }
+
+                    if (!IsHttpSuccess(retryStatus))
+                        ThrowHttpFailure(retryStatus, retryRaw);
+                    return retryRaw;
+                }
+
+                if (!IsHttpSuccess(status))
+                    ThrowHttpFailure(status, raw);
+                return raw;
+            }
+            finally
+            {
+                lease.Dispose();
+            }
         }
 
-        if (!response.IsSuccessStatusCode)
-            ThrowHttpFailure(response.StatusCode, raw);
-
-        return raw;
+        ThrowHttpFailure(lastStatus, lastBody);
+        throw new InvalidOperationException("LLM chat completions failed.");
     }
 
-    private static void ThrowHttpFailure(HttpStatusCode status, string raw)
+    /// <summary>Disables the key. Returns true when another live key can take the retry. Does not log the secret.</summary>
+    private bool Failover(LlmKeyPool.LlmKeyLease lease)
     {
-        string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
+        if (_keys.Disable(lease.Slot))
+        {
+            _logger.LogWarning(
+                "LLM API key slot {Slot} returned HTTP 401 and was disabled for this process; liveKeys={Live}",
+                lease.Slot,
+                _keys.LiveCount);
+        }
+
+        return _keys.LiveCount > 0;
+    }
+
+    private async Task<(HttpStatusCode Status, string Body)> SendChatAsync(
+        string url,
+        ChatCompletionRequest body,
+        LlmKeyPool.LlmKeyLease lease,
+        CancellationToken ct)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Post, url);
+        lease.Apply(request);
+        request.Content = JsonContent.Create(body, AppJsonContext.Default.ChatCompletionRequest);
+        using HttpResponseMessage response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        return (response.StatusCode, raw);
+    }
+
+    private static bool IsHttpSuccess(HttpStatusCode status)
+    {
+        int code = (int)status;
+        return code is >= 200 and <= 299;
+    }
+
+    private void ThrowHttpFailure(HttpStatusCode status, string raw)
+    {
+        string safe = _keys.Redact(raw);
+        string snippet = safe.Length > 240 ? safe[..240] + "…" : safe;
         throw new HttpRequestException(
             $"LLM chat completions failed HTTP {(int)status}: {snippet}",
             inner: null,

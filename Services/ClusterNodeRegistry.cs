@@ -44,7 +44,7 @@ public sealed class ClusterNodeRegistry
             Dpi = self.Dpi,
             Url = string.IsNullOrWhiteSpace(self.AdvertiseUrl) ? null : self.AdvertiseUrl,
             LlmConfigured = self.LlmConfigured,
-            NerConcurrency = self.LlmConfigured ? Math.Clamp(self.NerConcurrency, 0, 32) : 0,
+            NerConcurrency = self.LlmConfigured ? Math.Clamp(self.NerConcurrency, 0, LlmRuntimeConfig.MaxTotalConcurrency) : 0,
         };
     }
 
@@ -391,7 +391,7 @@ public sealed class ClusterNodeRegistry
         }
 
         if (concurrency is int n)
-            node.NerConcurrency = n > 0 ? Math.Clamp(n, 1, 32) : 0;
+            node.NerConcurrency = n > 0 ? Math.Clamp(n, 1, LlmRuntimeConfig.MaxTotalConcurrency) : 0;
     }
 
     private static bool UrlEquals(string? a, string? b) =>

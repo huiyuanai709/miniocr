@@ -4,6 +4,7 @@
     "enabled": true,
     "baseUrl": "https://tianqu.yzw.cn",
     "apiKey": "",
+    "apiKeys": [],
     "model": "deepseek-flash",
     "timeoutSeconds": 120,
     "pagesPerRequest": 20,

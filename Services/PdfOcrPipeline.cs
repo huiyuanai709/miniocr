@@ -61,7 +61,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         {
             if (vision is null || !vision.IsUsable)
                 throw new InvalidOperationException(
-                    "ocr.mode=llm requires a usable LLM (enabled + apiKey + baseUrl + model).");
+                    "ocr.mode=llm requires a usable LLM (enabled + apiKey or apiKeys + baseUrl + model).");
             _pageWindow = Math.Max(4, Math.Min(vision.OcrConcurrency, 64));
         }
         else if (config.IsWeChatMode)

@@ -8,6 +8,7 @@ namespace MiniOcr;
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(AppConfigFile))]
 [JsonSerializable(typeof(LlmFileConfig))]
+[JsonSerializable(typeof(List<string>))]
 [JsonSerializable(typeof(OcrFileConfig))]
 [JsonSerializable(typeof(ChallengeFileConfig))]
 internal partial class AppJsonContext : JsonSerializerContext;

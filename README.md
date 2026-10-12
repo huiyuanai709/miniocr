@@ -95,6 +95,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
     "enabled": true,
     "baseUrl": "https://api.openai.com",
     "apiKey": "",
+    "apiKeys": [],
     "model": "gpt-4o-mini",
     "timeoutSeconds": 120,
     "maxCharsPerRequest": 300000,
@@ -133,7 +134,11 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 }
 ```
 
-`baseUrl` 不要带 `/v1` 后缀，客户端请求 `{baseUrl}/v1/chat/completions`。`llm` 模式需要 `enabled`、非空 `apiKey`、`baseUrl` 和 `model`，否则启动时回退到 `local`。
+`baseUrl` 不要带 `/v1` 后缀，客户端请求 `{baseUrl}/v1/chat/completions`。`llm` 模式需要 `enabled`、至少一个 key、`baseUrl` 和 `model`，否则启动时回退到 `local`。
+
+多个 key 用来提高 NER 并发。`llm.apiKeys` 是字符串数组。环境变量 `MINIOCR_LLM_API_KEYS` 用逗号、分号或换行分隔；设置后覆盖文件里的 `apiKeys`。`llm.apiKey` / `MINIOCR_LLM_API_KEY` 仍是单个 key：环境变量覆盖文件里的 `apiKey`，再并入密钥池，重复的只留一份。池里最多 64 个 key。
+
+每个 key 同时在途的 NER 请求默认 8（至少 1，没有 32 这类低上限），和原来的 `maxConcurrency` 含义相同。`llm.maxConcurrencyPerKey`（或 `MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY`）优先；没设时 `maxConcurrency` 就是每个 key 的上限。N 个可用 key 时，NER 同时在途就是 N × 每 key 并发，不再被另一个全局上限压低。只有乘积超过 `int` 能表示的范围时，才会停在 `int.MaxValue`，以便信号量能建出来。某个 key 收到 HTTP 401 后，本进程停用它，还有别的 key 就换一个重试。日志只记槽位序号，不写 key。视觉 OCR 仍按 `ocrConcurrency` 限流，每次请求从同一个池里借一个未停用的 key，401 同样会停用。
 
 `wechat` 只在 Windows x64 上查找本机插件（`WeChatOCR.exe` 或 `wxocr.dll`，以及同目录的 `mmmojo_64.dll`）。路径留空时按常见安装位置和卸载注册表查找。找不到插件时默认回退 `local`。
 
@@ -162,16 +167,18 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_TEXT_LAYER_MAX_UNKNOWN_RATIO` | `ocr.textLayerMaxUnknownRatio` | 0.02 | 未知字符比例上限 |
 | `MINIOCR_TEXT_LAYER_IMAGE_COVERAGE` | `ocr.textLayerImageCoverage` | 0.55 | 视为扫描页的图片面积占比 |
 | `MINIOCR_TEXT_LAYER_IMAGE_MIN_CHARS` | `ocr.textLayerImageMinChars` | 200 | 扫描页或隐形文本层的最短字符 |
-| `MINIOCR_LLM_API_KEY` | `llm.apiKey` | 空 | 覆盖文件中的 key |
+| `MINIOCR_LLM_API_KEY` | `llm.apiKey` | 空 | 覆盖文件中的单个 key，再并入密钥池 |
+| `MINIOCR_LLM_API_KEYS` | `llm.apiKeys` | 空 | 逗号、分号或换行分隔。设置后覆盖文件里的 `apiKeys`，再与单个 key 合并去重 |
 | `MINIOCR_LLM_BASE_URL` | `llm.baseUrl` | — | 覆盖 base URL |
 | `MINIOCR_LLM_MODEL` | `llm.model` | — | 覆盖模型名 |
-| `MINIOCR_LLM_MAX_CONCURRENCY` | `llm.maxConcurrency` | 8 | 文本抽取并发 |
+| `MINIOCR_LLM_MAX_CONCURRENCY` | `llm.maxConcurrency` | 8 | 未设置每 key 上限时，每个 key 的 NER 并发（至少 1，无低上限）。N 个 key 时在途是 N 倍 |
+| `MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY` | `llm.maxConcurrencyPerKey` | 未设置 | 每个 key 的 NER 并发，优先于 `maxConcurrency`。至少 1，无低上限 |
 | `MINIOCR_LLM_PAGES_PER_REQUEST` | `llm.pagesPerRequest` | 10 | 每个文本请求的非空页数 |
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | 32 | 视觉识别页级并发 |
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | 70 | 视觉 JPEG 质量（40–95） |
 | `MINIOCR_LLM_THINKING` | `llm.thinking` | false | 思考模式。默认发送 `thinking.type=disabled` |
 | `MINIOCR_LLM_JSON_OBJECT` | `llm.jsonObject` | true | `response_format.type=json_object` |
-| `MINIOCR_LLM_NER_MAX_ATTEMPTS` | `llm.nerMaxAttempts` | 3 | 每组 NER 的 chat completion 次数（含首次，1–8）。JSON 缺失、截断或类型错误时，剩余次数改为强制 `thinking=enabled` 的纠正请求，并带回错误输出，不再原样重发同一条提示。403 / 408 / 429 / 5xx / 超时 / 连接失败按刚才那次请求短退避重试；401 不重试 |
+| `MINIOCR_LLM_NER_MAX_ATTEMPTS` | `llm.nerMaxAttempts` | 3 | 每组 NER 的 chat completion 次数（含首次，1–8）。JSON 缺失、截断或类型错误时，剩余次数改为强制 `thinking=enabled` 的纠正请求，并带回错误输出，不再原样重发同一条提示。403 / 408 / 429 / 5xx / 超时 / 连接失败按刚才那次请求短退避重试。401 停用该 key；还有其它 key 则换 key 重试同一次请求，没有剩余 key 时不再重试 |
 | `MINIOCR_WECHAT_OCR_PATH` | `ocr.wechatOcrPath` | 空 | 插件可执行文件或 dll |
 | `MINIOCR_WECHAT_DIR` | `ocr.wechatDir` | 空 | 含 `mmmojo_64.dll` 的目录 |
 | `MINIOCR_WECHAT_INSTANCES` | `ocr.wechatInstances` | 1–3 | 插件进程数 |
@@ -288,6 +295,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 | 变量 | 作用 |
 | --- | --- |
 | `MINIOCR_LLM_API_KEY` | 覆盖 `config.docker.json` 里空的 `llm.apiKey` |
+| `MINIOCR_LLM_API_KEYS` | 可选。逗号、分号或换行分隔的多个 key，与上面的单个 key 合并去重。每个 key 的 NER 并发是 `maxConcurrency`（镜像里是 16）；两个 key 时单个进程的 NER 在途大约是 32 |
 | `MINIOCR_CLUSTER_TOKEN` | 覆盖空的 `cluster.token`。为空时集群保持关闭 |
 
 `llm.timeoutSeconds`、`maxCharsPerRequest`、`fallbackToHeuristics` 没有对应环境变量，写在 `config.docker.json`。OCR 为 Vulkan、4 个引擎、DPI 96、关闭方向分类。识别批大小不设 `MINIOCR_REC_BATCH`，24GB 显卡会保持较大的批。8 个进程各自的 `maxConcurrency` 是 16；出口压力大时用 `MINIOCR_LLM_MAX_CONCURRENCY` 调低。

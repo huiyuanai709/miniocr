@@ -67,7 +67,7 @@ public sealed class ClusterWorkerHost : IHostedService
     private bool RunsDistributedNer => _config.DistributedNer && _llm.IsUsable;
 
     private int AdvertisedNerConcurrency =>
-        RunsDistributedNer ? Math.Clamp(_llm.Config.MaxConcurrency, 1, 32) : 0;
+        RunsDistributedNer ? Math.Clamp(_llm.Config.MaxConcurrency, 1, LlmRuntimeConfig.MaxTotalConcurrency) : 0;
 
     public int ActiveSessions => _sessions.Count;
     public int PagesDone => Volatile.Read(ref _pagesDone);
