@@ -41,6 +41,11 @@ public sealed class ClusterFileConfig
     /// </summary>
     public int RenderAheadPages { get; set; } = 4;
     /// <summary>
+    /// Milliseconds the coordinator holds an empty claim open before answering <c>wait</c>.
+    /// Null = 150. 0 answers at once.
+    /// </summary>
+    public int? ClaimHoldMs { get; set; }
+    /// <summary>
     /// When null, a stale primary lease can be copied once the pending queue is empty,
     /// even if more than <see cref="SpeculativeTailPages"/> pages are still out.
     /// Set false to keep only the small-tail copy.

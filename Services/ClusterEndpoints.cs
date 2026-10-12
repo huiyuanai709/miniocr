@@ -244,7 +244,9 @@ public static partial class ClusterEndpoints
 
             if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
                 return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
-            ClusterClaimResponse claim = coordinator.Claim(job!, body.NodeId.Trim(), body.MaxPages);
+            ClusterClaimResponse claim = await coordinator
+                .ClaimAsync(job!, body.NodeId.Trim(), body.MaxPages, cfg.ClaimHoldMs, ct)
+                .ConfigureAwait(false);
             return Results.Json(claim, AppJsonContext.Relaxed.ClusterClaimResponse);
         });
 

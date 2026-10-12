@@ -28,6 +28,11 @@ public sealed class ClusterRuntimeConfig
     /// <summary>Pages leased beyond OCR capacity so render stays ahead. 0 disables. Default 4.</summary>
     public int RenderAheadPages { get; init; } = 4;
     /// <summary>
+    /// How long <c>/cluster/jobs/{id}/claim</c> holds a request that has nothing to hand out,
+    /// waiting for an admitted page or a released lease. 0 answers <c>wait</c> at once. Default 150.
+    /// </summary>
+    public int ClaimHoldMs { get; init; } = 150;
+    /// <summary>
     /// Copy a primary lease that has run past its expected remaining time once nothing
     /// is pending. Default on. <c>MINIOCR_CLUSTER_SPECULATIVE_STALE=0</c> disables it.
     /// </summary>
@@ -131,6 +136,9 @@ public sealed class ClusterRuntimeConfig
         int renderAhead = Math.Clamp(
             ReadInt(env, "MINIOCR_CLUSTER_RENDER_AHEAD", section.RenderAheadPages),
             0, 16);
+        int claimHold = Math.Clamp(
+            ReadInt(env, "MINIOCR_CLUSTER_CLAIM_HOLD_MS", section.ClaimHoldMs ?? 150),
+            0, 5_000);
         bool staleLeases = section.SpeculativeStaleLeases ?? true;
         string? envStale = env("MINIOCR_CLUSTER_SPECULATIVE_STALE");
         if (!string.IsNullOrWhiteSpace(envStale))
@@ -202,6 +210,7 @@ public sealed class ClusterRuntimeConfig
             JoinGraceMs = joinGrace,
             SpeculativeTailPages = tail,
             RenderAheadPages = renderAhead,
+            ClaimHoldMs = claimHold,
             SpeculativeStaleLeases = staleLeases,
             PipelineOcr = pipelineOcr,
             VerboseDispatch = verboseDispatch,

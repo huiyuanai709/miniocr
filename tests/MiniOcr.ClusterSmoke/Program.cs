@@ -1453,6 +1453,52 @@ AssertTrue(deferred.TryCommit(onlyAdmitted.BatchId, 2), "the OCR commit still wi
 AssertTrue(deferred.AdmitPage(2) && deferred.AdmitPage(3), "the rest of the book can still be admitted");
 AssertTrue(!deferred.AdmitPage(2), "an admitted page is not queued twice");
 
+Console.WriteLine("=== streaming admission does not shrink the first claims to one page ===");
+{
+    ClusterPageScheduler streaming = new(new ClusterScheduleOptions
+    {
+        PageCount = 40,
+        LocalNodeId = "local",
+        DeferAdmission = true,
+        ExpectedNodes = 8,
+        PagesPerBatch = 4,
+        SpeculativeTailPages = 1,
+    });
+    streaming.SetCapacity("w1", 4);
+    for (int i = 0; i < 4; i++)
+        AssertTrue(streaming.AdmitPage(i), $"page {i + 1} admitted while the classifier is still running");
+    ClusterClaim early = streaming.Claim("w1", 4, DateTimeOffset.UtcNow);
+    AssertTrue(
+        early.Kind == ClusterClaimKind.Batch && early.Pages.Length == 4,
+        $"four admitted pages with 36 still unclassified lease as one batch of 4 (got {early.Pages.Length})");
+
+    ClusterPageScheduler sealedTail = new(new ClusterScheduleOptions
+    {
+        PageCount = 40,
+        LocalNodeId = "local",
+        DeferAdmission = true,
+        ExpectedNodes = 8,
+        PagesPerBatch = 4,
+        SpeculativeTailPages = 1,
+    });
+    sealedTail.SetCapacity("w1", 4);
+    for (int i = 0; i < 36; i++)
+        sealedTail.CompleteWithoutOcr(i);
+    for (int i = 36; i < 40; i++)
+        sealedTail.AdmitPage(i);
+    sealedTail.SealAdmission();
+    ClusterClaim tailClaim = sealedTail.Claim("w1", 4, DateTimeOffset.UtcNow);
+    AssertTrue(
+        tailClaim.Kind == ClusterClaimKind.Batch && tailClaim.Pages.Length == 1,
+        "once every page is classified, four pending pages across eight nodes still shrink to 1");
+
+    long before = sealedTail.Version;
+    sealedTail.SetCapacity("w1", 4);
+    AssertTrue(sealedTail.Version == before, "unchanged capacity does not bump the version (claim long-poll stays armed)");
+    sealedTail.SetCapacity("w1", 5);
+    AssertTrue(sealedTail.Version == before + 1, "changed capacity bumps the version once");
+}
+
 Console.WriteLine("=== large jobs drop the download hold after grace ===");
 DateTimeOffset holdNow = DateTimeOffset.UtcNow;
 var shortJob = new ClusterJob("short", NewScheduler(5), new byte[4], 4, 5, 96, "http://files.example/short.pdf");

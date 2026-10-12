@@ -1725,6 +1725,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     ocrCount++;
             }
 
+            job.Scheduler.SealAdmission();
             sw.Stop();
             _logger.LogInformation(
                 "Text layer summary: mode={Mode} textLayer={TextLayer} ocr={Ocr} analyzeMs={Analyze:F1}",

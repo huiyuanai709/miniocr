@@ -110,6 +110,13 @@ public sealed class ClusterPageScheduler
     private bool _holdLocalWindow;
     /// <summary>0-based page that blocks the next NER group. -1 when NER is not waiting on a hole.</summary>
     private int _nerBlocker = -1;
+    /// <summary>
+    /// Streaming classification is still deciding pages. While true, <see cref="Shrink"/> counts the
+    /// pages it has not seen yet as likely work, so the first claims are not cut to one page each
+    /// just because the queue is only a few pages ahead of the classifier.
+    /// </summary>
+    private bool _admissionOpen;
+    private int _invisible;
 
     public ClusterPageScheduler(ClusterScheduleOptions options)
     {
@@ -148,10 +155,15 @@ public sealed class ClusterPageScheduler
             }
 
             if (options.DeferAdmission)
+            {
+                _invisible++;
                 continue;
+            }
             _pending.Enqueue(i);
             _pages[i].Queued = true;
         }
+
+        _admissionOpen = options.DeferAdmission && _invisible > 0;
     }
 
     /// <summary>Text-layer pass: this page needs raster + OCR. No-op if it was already admitted or finished.</summary>
@@ -166,8 +178,36 @@ public sealed class ClusterPageScheduler
                 return false;
             _pending.Enqueue(zeroBased);
             page.Queued = true;
+            NoteAdmitted();
             SignalCore();
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Streaming classification has decided every page. Pages that were never admitted stay
+    /// invisible to claims; <see cref="Shrink"/> stops counting them.
+    /// </summary>
+    public void SealAdmission()
+    {
+        lock (_gate)
+        {
+            if (!_admissionOpen)
+                return;
+            _admissionOpen = false;
+            _invisible = 0;
+            SignalCore();
+        }
+    }
+
+    private void NoteAdmitted()
+    {
+        if (!_admissionOpen)
+            return;
+        if (--_invisible <= 0)
+        {
+            _invisible = 0;
+            _admissionOpen = false;
         }
     }
 
@@ -186,6 +226,7 @@ public sealed class ClusterPageScheduler
                 return false;
             page.Done = true;
             _done++;
+            NoteAdmitted();
             SignalCore();
             return true;
         }
@@ -220,7 +261,10 @@ public sealed class ClusterPageScheduler
             return;
         lock (_gate)
         {
-            _caps[nodeId] = Math.Max(1, capacity);
+            int next = Math.Max(1, capacity);
+            if (_caps.TryGetValue(nodeId, out int current) && current == next)
+                return;
+            _caps[nodeId] = next;
             SignalCore();
         }
     }
@@ -870,10 +914,14 @@ public sealed class ClusterPageScheduler
         int pending = _pending.Count;
         if (pending <= 0)
             return want;
+        // Pages the classifier has not published yet will mostly turn into OCR work, so
+        // they count toward the outlook. Without this, eight nodes claiming while the queue
+        // holds three admitted pages would each get one page and renderAhead never starts.
+        int outlook = pending + (_admissionOpen ? Math.Max(0, _invisible) : 0);
         int nodes = Math.Max(1, _expectedNodes);
-        if (pending <= nodes)
+        if (outlook <= nodes)
             return 1;
-        if (pending <= nodes * 2)
+        if (outlook <= nodes * 2)
             return Math.Min(want, 2);
         return want;
     }
