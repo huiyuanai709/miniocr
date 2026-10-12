@@ -958,7 +958,7 @@ public sealed class ClusterNerScheduler
     }
 }
 
-/// <summary>Builds the distributed NER user message. The group text matches single-node grouping; the next-page head is context for a split name.</summary>
+/// <summary>Builds the distributed NER user message. The group text matches single-node grouping; the next-page head is context for a name split or garbled at the page boundary.</summary>
 public static class ClusterNerPrompt
 {
     public static string Head(string? text)
@@ -975,7 +975,7 @@ public static class ClusterNerPrompt
         if (string.IsNullOrEmpty(lookahead))
             return groupText;
         return groupText +
-            "--- 下一页开头（仅用于接上被页边界拆开的名字，不要单独收录只出现在这里的名字） page " +
+            "--- 下一页开头（联系上下文：用来接上被页边界拆开的名字，并纠正本段末尾的 OCR 错字；不要单独收录只出现在这里的名字） page " +
             lookaheadPage.ToString(System.Globalization.CultureInfo.InvariantCulture) +
             " ---\n" +
             lookahead +

@@ -165,7 +165,7 @@ public static class ChallengeResultMapper
         {
             if (string.IsNullOrWhiteSpace(name) || !seen.Add(name))
                 continue;
-            List<string> origins = BuildOriginTexts(text, name, lookahead, names);
+            List<string> origins = BuildOriginTexts(text, name, lookahead, names, allowOcrConfusion: true);
             if (origins.Count == 0)
                 continue;
             items.Add(new ChallengeRuleItem
@@ -183,7 +183,9 @@ public static class ChallengeResultMapper
     /// For each occurrence of <paramref name="name"/> in <paramref name="pageText"/>,
     /// emit one excerpt of length in [10, 100] centered on the match when possible.
     /// Intra-CJK spaces are folded the same way as the reported name, so the excerpt
-    /// contains that name. <paramref name="lookahead"/> is the start of the next
+    /// contains that name. When <paramref name="allowOcrConfusion"/> is set, a company
+    /// that differs by one OCR lookalike is accepted and the excerpt is rewritten to
+    /// the corrected name. <paramref name="lookahead"/> is the start of the next
     /// non-empty page, used when a name is split by the page break.
     /// Hits covered by a longer name in <paramref name="coverNames"/> are skipped.
     /// </summary>
@@ -191,18 +193,22 @@ public static class ChallengeResultMapper
         string pageText,
         string name,
         string? lookahead = null,
-        IReadOnlyList<string>? coverNames = null)
+        IReadOnlyList<string>? coverNames = null,
+        bool allowOcrConfusion = false)
     {
         List<string> texts = [];
         if (string.IsNullOrEmpty(pageText) || string.IsNullOrEmpty(name))
             return texts;
 
         EntityText.PageIndex index = EntityText.PageIndex.Build(pageText, lookahead);
-        foreach (EntityText.Hit hit in index.Find(name))
+        List<EntityText.Hit> hits = allowOcrConfusion ? index.FindWithOcrConfusion(name) : index.Find(name);
+        foreach (EntityText.Hit hit in hits)
         {
             if (IsCovered(index, hit, name, coverNames))
                 continue;
             string snippet = EntityText.Excerpt(index.Source, hit.OriginStart, hit.OriginEnd);
+            if (allowOcrConfusion)
+                snippet = EntityText.PreferCorrected(snippet, name);
             if (snippet.Length == 0)
                 continue;
             if (snippet.Length > OriginMaxLen)

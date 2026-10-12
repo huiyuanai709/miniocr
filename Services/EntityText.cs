@@ -1,3 +1,4 @@
+using System.Text;
 using MiniOcr.Models;
 
 namespace MiniOcr.Services;
@@ -6,7 +7,10 @@ namespace MiniOcr.Services;
 /// Repairs noisy OCR enough to match a name back to the page it came from.
 /// Fullwidth ASCII folds to halfwidth. Whitespace that sits between Chinese
 /// characters (or between a Chinese character and a bracket / middle dot / digit)
-/// is removed, including line breaks. No other characters are inserted or replaced.
+/// is removed, including line breaks. <see cref="Repair"/> does not substitute
+/// characters. Company alignment may still accept one known OCR confusion via
+/// <see cref="PageIndex.FindWithOcrConfusion"/>; the reported name is the corrected form.
+/// Person names stay exact, because one character often distinguishes two people.
 /// </summary>
 public static class EntityText
 {
@@ -151,23 +155,153 @@ public static class EntityText
                 int idx = Norm.IndexOf(needle, from, StringComparison.Ordinal);
                 if (idx < 0)
                     break;
-                int originStart = Origin[idx];
-                int last = idx + needle.Length - 1;
-                int originEnd = Origin[last] + 1;
-                if (originEnd < Source.Length &&
-                    Fold(Source[originEnd]) == '.' &&
-                    EndsWithAbbrevToken(needle))
-                {
-                    originEnd++;
-                }
-
-                if (originStart < PageLength)
-                    hits.Add(new Hit(idx, idx + needle.Length, originStart, originEnd));
+                if (TryMakeHit(idx, needle, out Hit hit))
+                    hits.Add(hit);
                 from = idx + needle.Length;
             }
 
             return hits;
         }
+
+        /// <summary>
+        /// Exact matches, or — when the corrected company never occurs verbatim —
+        /// spans that differ by exactly one known OCR lookalike.
+        /// Names shorter than 6 characters stay exact.
+        /// </summary>
+        public List<Hit> FindWithOcrConfusion(string? name)
+        {
+            List<Hit> exact = Find(name);
+            string needle = Repair(name);
+            if (exact.Count > 0 || needle.Length < 6 || Norm.Length < needle.Length)
+                return exact;
+
+            List<Hit> hits = [];
+            for (int i = 0; i <= Norm.Length - needle.Length; i++)
+            {
+                if (!IsSingleOcrConfusion(Norm.AsSpan(i, needle.Length), needle.AsSpan()))
+                    continue;
+                if (TryMakeHit(i, needle, out Hit hit))
+                    hits.Add(hit);
+                i += needle.Length - 1;
+            }
+
+            return hits;
+        }
+
+        private bool TryMakeHit(int idx, string needle, out Hit hit)
+        {
+            hit = default;
+            int last = idx + needle.Length - 1;
+            if ((uint)last >= (uint)Origin.Length)
+                return false;
+            int originStart = Origin[idx];
+            int originEnd = Origin[last] + 1;
+            if (originEnd < Source.Length &&
+                Fold(Source[originEnd]) == '.' &&
+                EndsWithAbbrevToken(needle))
+            {
+                originEnd++;
+            }
+
+            if (originStart >= PageLength)
+                return false;
+            hit = new Hit(idx, idx + needle.Length, originStart, originEnd);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// True when <paramref name="surface"/> and <paramref name="corrected"/> have the
+    /// same length (at least 6) and differ by exactly one OCR lookalike pair.
+    /// </summary>
+    internal static bool IsSingleOcrConfusion(string surface, string corrected) =>
+        surface.Length == corrected.Length &&
+        IsSingleOcrConfusion(surface.AsSpan(), corrected.AsSpan());
+
+    private static bool IsSingleOcrConfusion(ReadOnlySpan<char> surface, ReadOnlySpan<char> corrected)
+    {
+        if (surface.Length != corrected.Length || surface.Length < 6)
+            return false;
+        int diffs = 0;
+        for (int i = 0; i < surface.Length; i++)
+        {
+            if (surface[i] == corrected[i])
+                continue;
+            if (diffs == 1 || !IsOcrConfusion(surface[i], corrected[i]))
+                return false;
+            diffs = 1;
+        }
+
+        return diffs == 1;
+    }
+
+    /// <summary>
+    /// Rewrites lookalike windows in an origin snippet so it contains the corrected name.
+    /// </summary>
+    internal static string PreferCorrected(string snippet, string corrected)
+    {
+        if (string.IsNullOrEmpty(snippet) || string.IsNullOrEmpty(corrected))
+            return snippet;
+        string needle = Repair(corrected);
+        if (needle.Length < 6 || snippet.Contains(needle, StringComparison.Ordinal) || snippet.Length < needle.Length)
+            return snippet;
+
+        StringBuilder sb = new(snippet.Length);
+        int i = 0;
+        bool any = false;
+        while (i <= snippet.Length - needle.Length)
+        {
+            if (IsSingleOcrConfusion(snippet.AsSpan(i, needle.Length), needle.AsSpan()))
+            {
+                sb.Append(needle);
+                i += needle.Length;
+                any = true;
+                continue;
+            }
+
+            sb.Append(snippet[i]);
+            i++;
+        }
+
+        if (!any)
+            return snippet;
+        if (i < snippet.Length)
+            sb.Append(snippet.AsSpan(i));
+        return sb.ToString();
+    }
+
+    private static bool IsOcrConfusion(char a, char b) =>
+        a != b && OcrConfusions.Contains(Pack(a, b));
+
+    private static int Pack(char a, char b) => ((int)a << 16) | b;
+
+    /// <summary>
+    /// Lookalike pairs that company alignment may treat as one OCR error.
+    /// 北/上 and 张/王 are different names and are not in this set.
+    /// </summary>
+    private static readonly string[] OcrConfusionPairs =
+    [
+        "司同", "司可",
+        "术木", "份分", "技枝",
+        "己已", "己巳", "已巳",
+        "日曰", "未末", "人入", "土士", "干千",
+        "微徵", "拨拔",
+        "戊戌", "戊戍", "戌戍",
+        "银很", "行形", "有右", "厂广", "大太",
+    ];
+
+    private static readonly HashSet<int> OcrConfusions = CreateOcrConfusions();
+
+    private static HashSet<int> CreateOcrConfusions()
+    {
+        HashSet<int> set = [];
+        foreach (string pair in OcrConfusionPairs)
+        {
+            set.Add(Pack(pair[0], pair[1]));
+            set.Add(Pack(pair[1], pair[0]));
+        }
+
+        return set;
     }
 
     private static string WindowContaining(string text, string name, int minLen, int maxLen)

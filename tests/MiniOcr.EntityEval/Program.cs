@@ -163,6 +163,49 @@ static void RunUnitChecks(Action<bool, string> assert)
     (_, List<string> commented) = ParsePayload("""{ /*keep*/ "companies": [ ], "persons": ["李娜"] }""");
     assert(commented.Count == 1 && commented[0] == "李娜", "json comments are skipped");
     assert(NerPrompt.Text.Contains("json", StringComparison.OrdinalIgnoreCase), "NER prompt mentions json");
+    assert(NerPrompt.Text.Contains("联系上下文", StringComparison.Ordinal), "NER prompt says to use context");
+    assert(NerPrompt.Text.Contains("自动修正", StringComparison.Ordinal), "NER prompt says to correct OCR");
+    assert(NerPrompt.Text.Contains("后处理说明", StringComparison.Ordinal), "NER prompt states how alignment keeps a correction");
+    assert(!NerPrompt.Text.Contains("不要改字", StringComparison.Ordinal), "NER prompt no longer forbids context correction");
+
+    OcrEntities ocrTypo = EntityPostProcessor.Merge(
+        [new OcrPageResult { Page = 1, Text = "甲 方：北 京 华 腾 科 技 有 限 公 同\n联系人：张纬再次确认条款。" }],
+        ["北京华腾科技有限公司"],
+        ["张伟"]);
+    assert(
+        ocrTypo.Companies.Count == 1 && ocrTypo.Companies[0].Name == "北京华腾科技有限公司",
+        "company lookalike 公同 is reported as 公司");
+    assert(ocrTypo.Persons.Count == 0, "person lookalike 张纬 is not rewritten to 张伟");
+    ChallengeFileResult typoFile = ChallengeResultMapper.BuildFileResult(
+        "typo",
+        [new OcrPageResult { Page = 1, Text = "甲 方：北 京 华 腾 科 技 有 限 公 同，联系人见附件说明。" }],
+        ocrTypo.Companies.Select(c => c.Name).ToList(),
+        []);
+    string? typoSnippet = typoFile.Pages
+        .SelectMany(p => p.RuleList)
+        .SelectMany(r => r.RuleItemList)
+        .SelectMany(i => i.OriginText)
+        .FirstOrDefault();
+    assert(typoSnippet is not null && typoSnippet.Contains("北京华腾科技有限公司", StringComparison.Ordinal),
+        "protocol origin contains the corrected company");
+    assert(typoSnippet!.Length is >= 10 and <= 100, $"corrected origin len={typoSnippet.Length}");
+
+    OcrEntities differentStem = EntityPostProcessor.Merge(
+        [new OcrPageResult { Page = 1, Text = "甲方：上海华腾科技有限公司" }],
+        ["北京华腾科技有限公司"],
+        []);
+    assert(differentStem.Companies.Count == 0, "北京/上海 is not treated as an OCR error");
+
+    OcrEntities typoPages = EntityPostProcessor.Merge(
+        [
+            new OcrPageResult { Page = 1, Text = "甲方：北京华腾科技有限公同\n联系人：张纬" },
+            new OcrPageResult { Page = 3, Text = "北京华腾科技有限公司确认盖章。张纬再次签字。" },
+        ],
+        ["北京华腾科技有限公司"],
+        ["张纬"]);
+    EntityHit? corrected = typoPages.Companies.SingleOrDefault(c => c.Name == "北京华腾科技有限公司");
+    assert(corrected is not null && corrected.Pages.SequenceEqual([1, 3]), "typo page and clean page both count");
+    assert(typoPages.Persons.Count == 1 && typoPages.Persons[0].Name == "张纬", "person kept when the exact name is in the text");
 
     OcrEntities expanded = EntityPostProcessor.Merge(
         [new OcrPageResult { Page = 1, Text = "乙 方：上 海 浦 东 发 展 银 行 股 份 有 限 公 司" }],
