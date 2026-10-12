@@ -6,7 +6,7 @@
 
 **`ocr.mode`：**
 
-- **`local`（默认）**：本地 PP-OCRv6 **ChineseV6Small**。人名和公司名可交给 LLM，也可在配置里打开启发式回退。
+- **`local`（默认）**：本地 PP-OCRv6 **ChineseV6Medium**。人名和公司名可交给 LLM，也可在配置里打开启发式回退。
 - **`llm`**：不加载本地 Paddle 模型。每页 JPEG 以 `image_url` 发给多模态 Chat Completions。
 - **`wechat`（实验，仅 Windows x64）**：调用本机已安装的微信 OCR 插件。非官方接口，只适合在自己的电脑上对比，不要当成对外服务。
 
@@ -180,7 +180,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/health` | 进程、配置路径和当前 OCR 开关 |
+| `GET` | `/health` | 进程、配置路径和当前 OCR 开关。`ocr.mode=local` 时 `ocrModel` 为 `ChineseV6Medium`；集群打开时 `cluster.model` 同样是这个名字 |
 | `POST` | `/ocr` | 同步识别。JSON 里给 `url`，或 `files`，或本机 `path` |
 | `POST` | `/ocr/upload` | `multipart` 上传一个 PDF |
 | `GET` | `/` | 纯文本接口说明 |
@@ -228,7 +228,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 | 来源 | 说明 |
 | --- | --- |
-| `external/SimdPaddleOCR` | fork 的 `ProjectReference`，含 ChineseV6Small。Apache-2.0 |
+| `external/SimdPaddleOCR` | fork 的 `ProjectReference`，含 ChineseV6Medium。Apache-2.0 |
 | `external/PDFtoImage` | fork 的 `ProjectReference`（含 `PDFtoImage.Parallel`）。MIT |
 
 ## Docker / 8×GPU

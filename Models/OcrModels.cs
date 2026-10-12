@@ -192,6 +192,11 @@ public sealed class HealthResponse
     public bool ConfigFileExisted { get; set; }
     public string ConfigPathSource { get; set; } = "";
     public string OcrMode { get; set; } = "local";
+    /// <summary>
+    /// Embedded local OCR bundle. <c>ChineseV6Medium</c> when <c>ocr.mode=local</c>.
+    /// Empty when local models are not loaded (<c>llm</c> or <c>wechat</c>).
+    /// </summary>
+    public string OcrModel { get; set; } = "";
     public string WeChatKind { get; set; } = "";
     public string WeChatPluginPath { get; set; } = "";
     public string WeChatDir { get; set; } = "";
