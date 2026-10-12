@@ -4,9 +4,16 @@ namespace MiniOcr.Services;
 
 /// <summary>
 /// Turns raw LLM name lists into protocol entities.
-/// Drops strings that cannot be aligned to the OCR text, masked names, roles,
-/// courts and other non-companies, and short names that are only a prefix of a
-/// longer legal name. Does not invent names with a regex scan.
+/// The model is asked to read the whole context and to correct OCR noise.
+/// This step still does not invent names with a regex scan. It drops masked
+/// names, roles, courts and other non-companies, and short names that are only
+/// a prefix of a longer legal name.
+/// A name is kept when it aligns after whitespace and fullwidth repair, including
+/// the next page's head. A company may also align when the page differs by exactly
+/// one character from <see cref="EntityText"/>'s OCR confusion list (for example
+/// 公同 / 公司); the reported name is the corrected form, and the origin snippet
+/// is rewritten so it contains that form. A person is kept only when the exact
+/// name appears, so a one-character guess such as 张纬 → 张伟 is dropped.
 /// </summary>
 public static class EntityPostProcessor
 {
@@ -19,16 +26,16 @@ public static class EntityPostProcessor
         List<string> personNames = Collect(persons, person: true);
 
         companyNames = Dedup(companyNames.Select(name => ExpandLegalForm(pages, name)));
-        companyNames = companyNames.Where(name => HasHit(pages, name)).ToList();
-        personNames = personNames.Where(name => HasHit(pages, name)).ToList();
+        companyNames = companyNames.Where(name => HasHit(pages, name, allowOcrConfusion: true)).ToList();
+        personNames = personNames.Where(name => HasHit(pages, name, allowOcrConfusion: false)).ToList();
         companyNames = SuppressShortCompanies(companyNames);
         personNames = personNames.Where(name => HasUncoveredPersonHit(pages, name, companyNames, personNames)).ToList();
         companyNames = companyNames.Where(name => HasUncoveredCompanyHit(pages, name, companyNames)).ToList();
 
         return new OcrEntities
         {
-            Companies = BuildHits(pages, companyNames, companyNames),
-            Persons = BuildHits(pages, personNames, CoverNamesForPersons(personNames, companyNames)),
+            Companies = BuildHits(pages, companyNames, companyNames, allowOcrConfusion: true),
+            Persons = BuildHits(pages, personNames, CoverNamesForPersons(personNames, companyNames), allowOcrConfusion: false),
         };
     }
 
@@ -169,14 +176,15 @@ public static class EntityPostProcessor
         return list;
     }
 
-    private static bool HasHit(IReadOnlyList<OcrPageResult> pages, string name)
+    private static bool HasHit(IReadOnlyList<OcrPageResult> pages, string name, bool allowOcrConfusion)
     {
         for (int i = 0; i < pages.Count; i++)
         {
             if (string.IsNullOrWhiteSpace(pages[i].Text))
                 continue;
             EntityText.PageIndex index = EntityText.PageIndex.Build(pages[i].Text, EntityText.Lookahead(pages, i));
-            if (index.Find(name).Count > 0)
+            List<EntityText.Hit> hits = allowOcrConfusion ? index.FindWithOcrConfusion(name) : index.Find(name);
+            if (hits.Count > 0)
                 return true;
         }
 
@@ -190,14 +198,14 @@ public static class EntityPostProcessor
         IReadOnlyList<string> persons)
     {
         List<string> covers = CoverNamesForPersons(persons, companies);
-        return CountUncovered(pages, name, covers) > 0;
+        return CountUncovered(pages, name, covers, allowOcrConfusion: false) > 0;
     }
 
     private static bool HasUncoveredCompanyHit(
         IReadOnlyList<OcrPageResult> pages,
         string name,
         IReadOnlyList<string> companies) =>
-        CountUncovered(pages, name, companies) > 0;
+        CountUncovered(pages, name, companies, allowOcrConfusion: true) > 0;
 
     private static List<string> CoverNamesForPersons(IReadOnlyList<string> persons, IReadOnlyList<string> companies)
     {
@@ -207,7 +215,11 @@ public static class EntityPostProcessor
         return covers;
     }
 
-    private static int CountUncovered(IReadOnlyList<OcrPageResult> pages, string name, IReadOnlyList<string> covers)
+    private static int CountUncovered(
+        IReadOnlyList<OcrPageResult> pages,
+        string name,
+        IReadOnlyList<string> covers,
+        bool allowOcrConfusion)
     {
         int total = 0;
         for (int i = 0; i < pages.Count; i++)
@@ -215,15 +227,19 @@ public static class EntityPostProcessor
             if (string.IsNullOrWhiteSpace(pages[i].Text))
                 continue;
             EntityText.PageIndex index = EntityText.PageIndex.Build(pages[i].Text, EntityText.Lookahead(pages, i));
-            total += Uncovered(index, name, covers).Count;
+            total += Uncovered(index, name, covers, allowOcrConfusion).Count;
         }
 
         return total;
     }
 
-    private static List<EntityText.Hit> Uncovered(EntityText.PageIndex index, string name, IReadOnlyList<string> covers)
+    private static List<EntityText.Hit> Uncovered(
+        EntityText.PageIndex index,
+        string name,
+        IReadOnlyList<string> covers,
+        bool allowOcrConfusion)
     {
-        List<EntityText.Hit> hits = index.Find(name);
+        List<EntityText.Hit> hits = allowOcrConfusion ? index.FindWithOcrConfusion(name) : index.Find(name);
         if (hits.Count == 0 || covers.Count == 0)
             return hits;
 
@@ -311,7 +327,8 @@ public static class EntityPostProcessor
     private static List<EntityHit> BuildHits(
         IReadOnlyList<OcrPageResult> pages,
         IReadOnlyList<string> names,
-        IReadOnlyList<string> covers)
+        IReadOnlyList<string> covers,
+        bool allowOcrConfusion)
     {
         List<EntityHit> hits = [];
         foreach (string name in names)
@@ -325,7 +342,7 @@ public static class EntityPostProcessor
                 if (string.IsNullOrWhiteSpace(pages[i].Text))
                     continue;
                 EntityText.PageIndex index = EntityText.PageIndex.Build(pages[i].Text, EntityText.Lookahead(pages, i));
-                List<EntityText.Hit> found = Uncovered(index, name, covers);
+                List<EntityText.Hit> found = Uncovered(index, name, covers, allowOcrConfusion);
                 if (found.Count == 0)
                     continue;
                 count += found.Count;
@@ -338,6 +355,13 @@ public static class EntityPostProcessor
                         display = EntityText.Repair(index.Source[first.OriginStart..end]);
                     if (display.Length == 0)
                         display = name;
+                    if (allowOcrConfusion &&
+                        !string.Equals(display, name, StringComparison.Ordinal) &&
+                        EntityText.IsSingleOcrConfusion(display, name))
+                    {
+                        display = name;
+                    }
+
                     haveDisplay = true;
                 }
             }

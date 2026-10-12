@@ -26,15 +26,18 @@ public sealed class LlmVisionOcr
         "Rules:\n" +
         "- text: complete readable page text (preserve reading order; omit pure noise).\n" +
         "- B04 items use personName only; B06 items use companyName only.\n" +
-        "- persons: natural names only. Strip 先生/女士/经理. No roles alone (原告, 甲方, 法定代表人), no pronouns, no masked names (张某, 李某某).\n" +
+        "- Read the whole page as context (headers, tables, signature blocks, repeated mentions). Extract every natural person and every company; output each name once.\n" +
+        "- persons: natural names only. Strip 先生/女士/经理. No roles alone (原告, 甲方, 法定代表人), no pronouns, no masked names (张某, 李某某). " +
+        "Do not guess a person by one lookalike character (张纬 stays 张纬 unless the corrected name is also written on the page).\n" +
         "- companies: full legal names ending in 公司/集团/银行/事务所/合伙企业 or Inc/Ltd/LLC/Corp. " +
         "If both a short name and the full name are visible, output only the full name. " +
-        "Keep a parent and its 分公司/分行 when both are visible.\n" +
+        "Keep a parent and its 分公司/分行 when both are visible. " +
+        "Correct one OCR lookalike using the rest of the page, for example 公同/公可→公司, 技木→技术, 股分→股份. Do not turn one company into a different company.\n" +
         "- Do not output courts, procuratorates, governments, 公安/管理局/仲裁委员会, or universities/hospitals/schools unless the name contains 公司.\n" +
         "- Do not output product names, addresses, or project titles.\n" +
-        "- Join characters split by spaces or line breaks. Do not invent characters that are not on the page.\n" +
-        "- count = number of occurrences on this page; originText length 10–100 chars each and must contain the name.\n" +
-        "- Do not invent names absent from the image. Empty ruleList is allowed if none found.\n" +
+        "- Join characters split by spaces or line breaks. Do not invent a name that is not on the page.\n" +
+        "- count = number of occurrences on this page; originText length 10–100 chars each and must contain the corrected personName or companyName.\n" +
+        "- Empty ruleList is allowed if none found.\n" +
         "- Omit a rule entirely when its ruleItemList would be empty.";
 
     private readonly HttpClient _http;
