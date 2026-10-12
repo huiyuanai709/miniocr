@@ -21,6 +21,16 @@ public sealed class OcrRuntimeConfig
     /// <c>MINIOCR_REMOVE_RED_SEAL=0</c> keeps the Gray8 render path.
     /// </summary>
     public bool RemoveRedSeal { get; init; } = true;
+    /// <summary>
+    /// When true the filter erases every saturated red pixel (legacy <c>MINIOCR_REMOVE_RED_SEAL=all</c>).
+    /// Default false: only seal-shaped red blobs are erased, so red letterhead text still reaches OCR.
+    /// </summary>
+    public bool RedSealAllInk { get; init; }
+    /// <summary>
+    /// PDFium smoothing for raster: <c>all</c> (default), <c>none</c>, or a comma list of
+    /// <c>text</c>, <c>images</c>, <c>paths</c>. <c>MINIOCR_RENDER_ANTIALIAS</c> overrides the file.
+    /// </summary>
+    public string AntiAliasing { get; init; } = "all";
     public int RasterWorkerCount { get; init; }
     /// <summary><c>parallel</c> (default) or <c>inprocess</c>.</summary>
     public string RenderMode { get; init; } = "parallel";
@@ -107,7 +117,13 @@ public sealed class OcrRuntimeConfig
 
         bool useClsFile = ocr.UseCls ?? false;
         bool useCls = ReadBool("MINIOCR_USE_CLS", useClsFile);
-        bool removeRedSeal = ReadBool("MINIOCR_REMOVE_RED_SEAL", ocr.RemoveRedSeal);
+        (bool removeRedSeal, bool redSealAllInk) = ResolveRedSeal(
+            Environment.GetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL"),
+            ocr.RemoveRedSeal,
+            ocr.RedSealMode);
+        string antiAliasing = CanonicalAntiAliasing(FirstSet(
+            Environment.GetEnvironmentVariable("MINIOCR_RENDER_ANTIALIAS"),
+            ocr.AntiAliasing));
 
         // Vision OCR is IO-bound, so the llm default uses every logical processor.
         // Explicit values use the same ceiling: the logical processor count.
@@ -151,7 +167,10 @@ public sealed class OcrRuntimeConfig
             ResolveInt("MINIOCR_TEXT_LAYER_IMAGE_MIN_CHARS", ocr.TextLayerImageMinChars, 200, autoScale: true, fixedFallback: 200),
             1, 100_000);
 
-        int detLimit = Math.Clamp(ReadInt("MINIOCR_DET_LIMIT_SIDE", 960), 64, 4096);
+        int detLimit = Math.Clamp(
+            ResolveInt("MINIOCR_DET_LIMIT_SIDE", ocr.DetLimitSide, DefaultDetLimitSide(dpi), autoScale: true, fixedFallback: DefaultDetLimitSide(dpi)),
+            64,
+            4096);
         // 1 keeps a pool of engines from each claiming the whole CPU. 0 is the library's auto budget.
         int recIntra = Math.Clamp(
             ReadInt("MINIOCR_REC_INTRA_OP_THREADS", ocr.RecIntraOpThreads ?? 1),
@@ -212,6 +231,8 @@ public sealed class OcrRuntimeConfig
             DetIntraOpThreads = det,
             UseDirectionClassification = useCls,
             RemoveRedSeal = removeRedSeal,
+            RedSealAllInk = redSealAllInk,
+            AntiAliasing = antiAliasing,
             RasterWorkerCount = raster,
             RenderMode = renderMode,
             RenderProcessCount = renderProcesses,
@@ -330,6 +351,8 @@ public sealed class OcrRuntimeConfig
         DetIntraOpThreads = DetIntraOpThreads,
         UseDirectionClassification = UseDirectionClassification,
         RemoveRedSeal = RemoveRedSeal,
+        RedSealAllInk = RedSealAllInk,
+        AntiAliasing = AntiAliasing,
         RasterWorkerCount = RasterWorkerCount,
         RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),
         RenderProcessCount = RenderProcessCount,
@@ -426,6 +449,79 @@ public sealed class OcrRuntimeConfig
     /// </summary>
     public static string BackendForHost(string backend) =>
         backend == "metal" && !OperatingSystem.IsMacOS() ? "cpu" : backend;
+
+    /// <summary>
+    /// <c>MINIOCR_REMOVE_RED_SEAL</c>: <c>0</c>/<c>off</c>/<c>false</c> disables the filter,
+    /// <c>all</c> erases every saturated red pixel (legacy), anything truthy or <c>seal</c>/<c>seals</c>
+    /// erases only seal-shaped blobs. Env wins over <c>ocr.removeRedSeal</c> + <c>ocr.redSealMode</c>.
+    /// </summary>
+    public static (bool Enabled, bool AllInk) ResolveRedSeal(string? env, bool fileEnabled, string? fileMode)
+    {
+        bool fileAll = string.Equals(fileMode?.Trim(), "all", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(env))
+            return (fileEnabled, fileEnabled && fileAll);
+        string raw = env.Trim();
+        if (string.Equals(raw, "all", StringComparison.OrdinalIgnoreCase))
+            return (true, true);
+        if (string.Equals(raw, "seal", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(raw, "seals", StringComparison.OrdinalIgnoreCase))
+            return (true, false);
+        if (bool.TryParse(raw, out bool b))
+            return (b, b && fileAll);
+        if (raw is "1" or "yes" or "YES" or "on" or "ON")
+            return (true, fileAll);
+        if (raw is "0" or "no" or "NO" or "off" or "OFF")
+            return (false, false);
+        return (fileEnabled, fileEnabled && fileAll);
+    }
+
+    /// <summary>
+    /// <c>all</c>, <c>none</c>, or a sorted comma list drawn from <c>text</c>, <c>images</c>,
+    /// <c>paths</c>. Unknown tokens are dropped; an empty result is <c>none</c>. Null is <c>all</c>.
+    /// </summary>
+    public static string CanonicalAntiAliasing(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return "all";
+        string trimmed = raw.Trim();
+        if (string.Equals(trimmed, "all", StringComparison.OrdinalIgnoreCase)
+            || trimmed is "1" or "true" or "on" or "yes")
+            return "all";
+        if (string.Equals(trimmed, "none", StringComparison.OrdinalIgnoreCase)
+            || trimmed is "0" or "false" or "off" or "no")
+            return "none";
+        bool text = false, images = false, paths = false;
+        foreach (string part in trimmed.Split([',', '|', '+', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (string.Equals(part, "text", StringComparison.OrdinalIgnoreCase)) text = true;
+            else if (string.Equals(part, "images", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(part, "image", StringComparison.OrdinalIgnoreCase)) images = true;
+            else if (string.Equals(part, "paths", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(part, "path", StringComparison.OrdinalIgnoreCase)) paths = true;
+        }
+
+        if (text && images && paths)
+            return "all";
+        if (!text && !images && !paths)
+            return "none";
+        List<string> parts = new(3);
+        if (text) parts.Add("text");
+        if (images) parts.Add("images");
+        if (paths) parts.Add("paths");
+        return string.Join(',', parts);
+    }
+
+    public bool AntiAliasText => AntiAliasing == "all" || AntiAliasing.Contains("text", StringComparison.Ordinal);
+    public bool AntiAliasImages => AntiAliasing == "all" || AntiAliasing.Contains("images", StringComparison.Ordinal);
+    public bool AntiAliasPaths => AntiAliasing == "all" || AntiAliasing.Contains("paths", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Detection long-side cap that keeps the 96 DPI / 960 px ratio: text that is 12 px tall
+    /// in the detector at 96 DPI stays 12 px when the operator raises the DPI, instead of
+    /// being shrunk back to 960 and losing the extra pixels before DB sees them.
+    /// </summary>
+    public static int DefaultDetLimitSide(int dpi) =>
+        Math.Clamp(Math.Max(960, dpi * 10), 960, 4096);
 
     public static string CanonicalTextLayer(string? raw)
     {

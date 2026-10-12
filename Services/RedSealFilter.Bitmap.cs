@@ -6,8 +6,10 @@ public static partial class RedSealFilter
 {
     /// <summary>
     /// In-place filter for a rendered page. Gray8 and any non-BGRA bitmap are skipped.
+    /// <paramref name="minSealSidePx"/> 0 erases all saturated red (legacy); a positive value
+    /// erases red only inside seal-shaped blobs. See <see cref="MinSealSideForDpi"/>.
     /// </summary>
-    public static int Apply(SKBitmap bitmap)
+    public static int Apply(SKBitmap bitmap, int minSealSidePx = 0)
     {
         if (bitmap.ColorType != SKColorType.Bgra8888)
             return 0;
@@ -22,7 +24,7 @@ public static partial class RedSealFilter
             return 0;
         unsafe
         {
-            return ApplyBgra(new Span<byte>((void*)ptr, byteCount), width, height, stride);
+            return ApplyBgra(new Span<byte>((void*)ptr, byteCount), width, height, stride, minSealSidePx);
         }
     }
 }

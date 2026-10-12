@@ -24,11 +24,31 @@ internal static class PdfParallelOptions
     };
 
     public static RenderOptions CreateRenderOptions(int dpi, bool removeRedSeal) =>
+        CreateRenderOptions(dpi, removeRedSeal, PdfAntiAliasing.All);
+
+    public static RenderOptions CreateRenderOptions(int dpi, OcrRuntimeConfig config) =>
+        CreateRenderOptions(dpi, config.RemoveRedSeal, AntiAliasingOf(config));
+
+    /// <summary>
+    /// <c>None</c> maps to PDFium <c>RENDER_NO_SMOOTHIMAGE</c>, which samples a scanned page
+    /// nearest-neighbour when it is shrunk to the OCR DPI and drops thin strokes. Smoothing
+    /// costs a little CPU per page and nothing on the GPU, so the default keeps it on.
+    /// </summary>
+    public static PdfAntiAliasing AntiAliasingOf(OcrRuntimeConfig config)
+    {
+        PdfAntiAliasing flags = PdfAntiAliasing.None;
+        if (config.AntiAliasText) flags |= PdfAntiAliasing.Text;
+        if (config.AntiAliasImages) flags |= PdfAntiAliasing.Images;
+        if (config.AntiAliasPaths) flags |= PdfAntiAliasing.Paths;
+        return flags;
+    }
+
+    public static RenderOptions CreateRenderOptions(int dpi, bool removeRedSeal, PdfAntiAliasing antiAliasing) =>
         new(
             Dpi: dpi,
             WithAnnotations: false,
             WithFormFill: false,
-            AntiAliasing: PdfAntiAliasing.None,
+            AntiAliasing: antiAliasing,
             // Red-seal removal needs the red channel. Gray8 cannot tell a seal from text.
             Grayscale: !removeRedSeal)
         {

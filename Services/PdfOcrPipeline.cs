@@ -1290,20 +1290,21 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     }
 
     private RenderOptions CreateRenderOptions(int dpi) =>
-        PdfParallelOptions.CreateRenderOptions(dpi, _config.RemoveRedSeal);
+        PdfParallelOptions.CreateRenderOptions(dpi, _config);
 
     /// <summary>
     /// After raster, before the page is queued for detection (and for vision JPEG).
     /// Gray8 pages have no red channel and are left unchanged.
     /// </summary>
-    private void SuppressRedSeal(PageImage image)
+    private void SuppressRedSeal(PageImage image, int dpi)
     {
         if (!_config.RemoveRedSeal)
             return;
         // Parallel Gray8 arrives as read-only pixels. That path is off while this switch is on.
         if (image.Pixels is not null)
             return;
-        RedSealFilter.Apply(image.RequireBitmap());
+        int minSide = _config.RedSealAllInk ? 0 : RedSealFilter.MinSealSideForDpi(dpi);
+        RedSealFilter.Apply(image.RequireBitmap(), minSide);
     }
 
     private static OcrTimings MakeTimings(
@@ -1913,7 +1914,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 int pageIndex = pageIndices[idx++];
                 try
                 {
-                    SuppressRedSeal(image);
+                    SuppressRedSeal(image, renderOptions.Dpi);
                     await writer.WriteAsync((pageIndex, image, sw.Elapsed.TotalMilliseconds), ct)
                         .ConfigureAwait(false);
                     written.Add(pageIndex);
@@ -2008,7 +2009,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         PageImage image = PageImage.FromBitmap(bitmap);
                         try
                         {
-                            SuppressRedSeal(image);
+                            SuppressRedSeal(image, renderOptions.Dpi);
                             await writer.WriteAsync((pageIndex, image, sw.Elapsed.TotalMilliseconds), ct)
                                 .ConfigureAwait(false);
                         }

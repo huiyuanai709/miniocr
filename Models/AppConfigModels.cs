@@ -107,6 +107,22 @@ public sealed class OcrFileConfig
     /// Gray8 pages are skipped. Set false to keep the Gray8 path.
     /// </summary>
     public bool RemoveRedSeal { get; set; } = true;
+    /// <summary>
+    /// <c>seal</c> (default) erases red only inside seal-shaped blobs, so red letterhead
+    /// text is still recognised. <c>all</c> erases every saturated red pixel (old behaviour).
+    /// </summary>
+    public string? RedSealMode { get; set; }
+    /// <summary>
+    /// <c>all</c> (default), <c>none</c>, or a comma list of <c>text</c>, <c>images</c>, <c>paths</c>.
+    /// PDFium smoothing flags for raster. <c>none</c> samples scanned images nearest-neighbour,
+    /// which drops thin strokes when a 300 DPI scan is rendered at 96–150 DPI.
+    /// </summary>
+    public string? AntiAliasing { get; set; }
+    /// <summary>
+    /// Detection input long-side cap. Null = <c>max(960, dpi × 10)</c>, so raising the DPI
+    /// does not shrink the page back to 960 before detection.
+    /// </summary>
+    public int? DetLimitSide { get; set; }
     /// <summary><c>cpu</c> (default), <c>auto</c>, or <c>vulkan</c>. <c>cpu</c> keeps the current text.</summary>
     public string Backend { get; set; } = "cpu";
     /// <summary>Recognizer intra-op threads per engine. Null = 1. <c>0</c> lets the library pick.</summary>

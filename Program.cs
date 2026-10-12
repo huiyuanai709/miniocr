@@ -171,7 +171,8 @@ Console.WriteLine(
     $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"backend={runtimeConfig.Backend}, lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"recIntraOpThreads={runtimeConfig.RecIntraOpThreads}, recBatch={runtimeConfig.RecBatchLines}, " +
-    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
+    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, antiAlias={runtimeConfig.AntiAliasing}, " +
+    $"detLimitSide={runtimeConfig.DetLimitSideLength}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
     $"renderMode={runtimeConfig.RenderMode}, renderProcesses={runtimeConfig.RenderProcessCount}, " +
     $"textLayer={runtimeConfig.TextLayer}, " +
     $"wechatInstances={runtimeConfig.WeChatInstances}, wechatStatus={wechatStatus}");
@@ -430,6 +431,7 @@ app.MapGet("/health", (IServiceProvider sp) =>
             DefaultDpi = cfg.DefaultDpi,
             UseDirectionClassification = cfg.UseDirectionClassification,
             RemoveRedSeal = cfg.RemoveRedSeal,
+            AntiAliasing = cfg.AntiAliasing,
             RasterWorkerCount = cfg.RasterWorkerCount,
             RenderMode = cfg.RenderMode,
             RenderProcessCount = cfg.RenderProcessCount,
