@@ -847,7 +847,8 @@ app.MapPost("/ocr", async Task<IResult> (
 
         return new SequentialPdfOverlap.Started(
             run.OcrCompleted,
-            FinishDebugFileAsync(index, fileId, decision, download.Buffer, download.Mode, traceScope, run));
+            FinishDebugFileAsync(index, fileId, decision, download.Buffer, download.Mode, traceScope, run),
+            run.ReleaseNext);
     }
 
     async Task FinishDebugFileAsync(

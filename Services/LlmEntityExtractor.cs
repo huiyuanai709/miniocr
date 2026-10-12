@@ -108,6 +108,7 @@ public sealed class LlmEntityExtractor
         string prompt = ClusterNerPrompt.WithLookahead(claim.PromptText, claim.Lookahead, claim.LookaheadPage);
         List<ChallengePageResult> modelPages = await ExtractPagesBatchAsync(prompt, claim.Pages, ct)
             .ConfigureAwait(false);
+        NerOriginFiller.Apply(modelPages, claim.Bodies, claim.Lookahead, claim.LookaheadPage);
         List<ClusterNerEntityHit> hits = ClusterNerAssembler.BuildFromPages(claim.Bodies, modelPages);
 
         List<string> companies = [];
@@ -245,6 +246,7 @@ public sealed class LlmEntityExtractor
                     : MergeToEntities(pages, _companies, _persons);
             }
 
+            NerOriginFiller.Apply(modelPages, pages);
             return new LlmExtractionResult { Entities = entities, Pages = modelPages };
         }
 
@@ -647,8 +649,9 @@ public sealed class LlmEntityExtractor
             return messages;
 
         string clipped = ClipForRepair(repairBody);
+        string repair = pagesMode ? RepairInstructionPages : RepairInstructionFlat;
         messages.Add(new ChatMessage { Role = "assistant", Content = clipped });
-        messages.Add(new ChatMessage { Role = "user", Content = RepairInstruction + clipped });
+        messages.Add(new ChatMessage { Role = "user", Content = repair + clipped });
         return messages;
     }
 
@@ -667,12 +670,20 @@ public sealed class LlmEntityExtractor
             text.AsSpan(text.Length - tail));
     }
 
-    private const string RepairInstruction =
+    private const string RepairInstructionFlat =
         """
         上一条回复不是合法 JSON。请开启思考，把下面的错误输出改成一个合法的 JSON 对象，且只输出这个对象。
-        不要 markdown，不要解释。page 和 count 必须是 JSON 数字，不能是字符串。
-        有逐页结果时使用 {"pages":[{"page":1,"ruleList":[]}]}。
-        没有逐页结果时使用 {"companies":[],"persons":[]}。
+        不要 markdown，不要解释。
+        使用 {"companies":[],"persons":[]}。
+        错误输出：
+        """;
+
+    private const string RepairInstructionPages =
+        """
+        上一条回复不是合法 JSON。请开启思考，把下面的错误输出改成一个合法的 JSON 对象，且只输出这个对象。
+        不要 markdown，不要解释。n 和次数必须是 JSON 数字，不能是字符串。
+        使用 {"p":[{"n":1,"c":[["公司全称",1]],"r":[["姓名",1]]}]}。
+        c 是公司，r 是人名。不要输出 originText、ruleCode、ruleList。
         错误输出：
         """;
 
@@ -714,7 +725,15 @@ public sealed class LlmEntityExtractor
     {
         BatchResult result = new();
 
-        // Per-page payload (direction A) wins; a flat name list is the fallback shape.
+        // Compact per-page reply (names + counts). Verbose ruleList is the fallback shape,
+        // then a flat name list. Invalid JSON still throws so the repair turn can run.
+        if (CompactNer.TryParse(json, out List<ChallengePageResult> compact) && compact.Count > 0)
+        {
+            result.Pages.AddRange(SanitizePages(compact.Select(page =>
+                new LlmPageEntities { Page = page.Page, RuleList = page.RuleList })));
+            return result;
+        }
+
         LlmPagesPayload? pages = LlmJson.Deserialize<LlmPagesPayload>(json);
         if (pages?.Pages is { Count: > 0 })
         {

@@ -248,7 +248,7 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
 
         Task finished = FinishFileAsync(
             job, index, fileId, decision, download.Buffer, download.Mode, traceScope, run, results);
-        return new SequentialPdfOverlap.Started(run.OcrCompleted, finished);
+        return new SequentialPdfOverlap.Started(run.OcrCompleted, finished, run.ReleaseNext);
     }
 
     private async Task FinishFileAsync(
