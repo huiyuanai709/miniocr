@@ -8,6 +8,9 @@ namespace MiniOcr.Services;
 /// <summary>
 /// Accepts challenge jobs into a bounded channel, processes them asynchronously
 /// (download → OCR → map → callback), with a small concurrency cap (~5 QPM friendly).
+/// Files in one request share the GPU one at a time: OCR of the next PDF starts when
+/// the previous PDF's OCR finishes, while that file's NER keeps running. The callback
+/// waits until every file's OCR and NER are done.
 /// </summary>
 public sealed class ChallengeJobService : IHostedService, IDisposable
 {
@@ -143,101 +146,153 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
             job.Files.Count,
             TryHost(job.CallbackUrl));
 
-        List<ChallengeFileResult> results = [];
+        int count = job.Files.Count;
+        ChallengeFileResult[] results = new ChallengeFileResult[count];
+        for (int i = 0; i < count; i++)
+            results[i] = new ChallengeFileResult { FileId = job.Files[i].FileId ?? "", Pages = [] };
 
-        foreach (ChallengeFileRef file in job.Files)
-        {
-            string fileId = file.FileId ?? "";
-            ChallengeResourceFiles.SourceDecision decision =
-                ChallengeResourceFiles.Decide(_resourceDir, file.FileId, file.Url);
-            if (decision.Kind == ChallengeResourceFiles.SourceKind.Missing)
-            {
-                _logger.LogWarning(
-                    "Challenge file has no PDF: fileId={FileId}, path={Path}, downloadMode={Mode}",
-                    fileId,
-                    decision.LocalPath,
-                    _resourceDir.Length > 0 ? ChallengeResourceFiles.DownloadMode : "url");
-                results.Add(new ChallengeFileResult { FileId = fileId, Pages = [] });
-                continue;
-            }
-
-            try
-            {
-                ParallelPdfDownloader.DownloadResult download;
-                string? sourceUrl;
-                if (decision.Kind == ChallengeResourceFiles.SourceKind.Local)
-                {
-                    _logger.LogInformation(
-                        "Challenge file local resource: fileId={FileId}, path={Path}, downloadMode={Mode}",
-                        fileId,
-                        decision.LocalPath,
-                        ChallengeResourceFiles.DownloadMode);
-                    ChallengeResourceFiles.LocalRead local =
-                        ChallengeResourceFiles.ReadLocal(decision.LocalPath!);
-                    download = new ParallelPdfDownloader.DownloadResult(
-                        local.Buffer, local.Mode, local.ElapsedMs);
-                    // Path lets cluster workers open the same file. It is not an http URL, so no prefetch.
-                    sourceUrl = decision.LocalPath;
-                }
-                else
-                {
-                    string url = decision.Url!;
-                    if (decision.LocalPath is not null)
-                    {
-                        _logger.LogInformation(
-                            "Challenge file not in resource dir, downloading: fileId={FileId}, path={Path}, downloadMode=url-fallback",
-                            fileId,
-                            decision.LocalPath);
-                    }
-
-                    _cluster?.BeginSourcePrefetch(url);
-                    download = await _downloader.DownloadAsync(url, ct).ConfigureAwait(false);
-                    sourceUrl = url;
-                }
-
-                using (download.Buffer)
-                {
-                    string requestId = string.IsNullOrEmpty(job.RequestId) ? "" : job.RequestId;
-                    string entry = string.IsNullOrEmpty(job.TraceEntry) ? "challenge" : job.TraceEntry;
-                    using IDisposable? traceScope = _trace is { Enabled: true }
-                        ? OcrTraceLog.BeginScope(requestId, entry, fileId, job.TeamId)
-                        : null;
-                    OcrResponse ocr = await _pipeline
-                        .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, sourceUrl: sourceUrl)
-                        .ConfigureAwait(false);
-
-                    if (_trace is { Enabled: true })
-                    {
-                        _trace.Text(
-                            entry, requestId, fileId, decision.Url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
-                            job.TeamId, download.Mode, path: decision.LocalPath);
-                    }
-
-                    ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(fileId, ocr);
-                    results.Add(mapped);
-                    _logger.LogInformation(
-                        "Challenge file done: fileId={FileId}, path={Path}, pages={Pages}, downloadMode={Mode}",
-                        fileId,
-                        decision.LocalPath,
-                        mapped.Pages.Count,
-                        download.Mode);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Challenge file failed: fileId={FileId}, path={Path}", fileId, decision.LocalPath);
-                results.Add(new ChallengeFileResult { FileId = fileId, Pages = [] });
-            }
-        }
+        await SequentialPdfOverlap.RunAsync(
+            count,
+            (index, token) => StartFileAsync(job, index, results, token),
+            continueAfterFailure: true,
+            ct).ConfigureAwait(false);
 
         ChallengeCallbackBody body = new()
         {
             TeamId = job.TeamId,
             Key = job.Key,
-            Result = results,
+            Result = [.. results],
         };
 
         await PostCallbackWithRetryAsync(job.CallbackUrl, body, ct).ConfigureAwait(false);
+    }
+
+    private async Task<SequentialPdfOverlap.Started?> StartFileAsync(
+        ChallengeJob job,
+        int index,
+        ChallengeFileResult[] results,
+        CancellationToken ct)
+    {
+        ChallengeFileRef file = job.Files[index];
+        string fileId = file.FileId ?? "";
+        ChallengeResourceFiles.SourceDecision decision =
+            ChallengeResourceFiles.Decide(_resourceDir, file.FileId, file.Url);
+        if (decision.Kind == ChallengeResourceFiles.SourceKind.Missing)
+        {
+            _logger.LogWarning(
+                "Challenge file has no PDF: fileId={FileId}, path={Path}, downloadMode={Mode}",
+                fileId,
+                decision.LocalPath,
+                _resourceDir.Length > 0 ? ChallengeResourceFiles.DownloadMode : "url");
+            results[index] = new ChallengeFileResult { FileId = fileId, Pages = [] };
+            return null;
+        }
+
+        ParallelPdfDownloader.DownloadResult download;
+        string? sourceUrl;
+        try
+        {
+            if (decision.Kind == ChallengeResourceFiles.SourceKind.Local)
+            {
+                _logger.LogInformation(
+                    "Challenge file local resource: fileId={FileId}, path={Path}, downloadMode={Mode}",
+                    fileId,
+                    decision.LocalPath,
+                    ChallengeResourceFiles.DownloadMode);
+                ChallengeResourceFiles.LocalRead local =
+                    ChallengeResourceFiles.ReadLocal(decision.LocalPath!);
+                download = new ParallelPdfDownloader.DownloadResult(
+                    local.Buffer, local.Mode, local.ElapsedMs);
+                // Path lets cluster workers open the same file. It is not an http URL, so no prefetch.
+                sourceUrl = decision.LocalPath;
+            }
+            else
+            {
+                string url = decision.Url!;
+                if (decision.LocalPath is not null)
+                {
+                    _logger.LogInformation(
+                        "Challenge file not in resource dir, downloading: fileId={FileId}, path={Path}, downloadMode=url-fallback",
+                        fileId,
+                        decision.LocalPath);
+                }
+
+                _cluster?.BeginSourcePrefetch(url);
+                download = await _downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+                sourceUrl = url;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Challenge file failed: fileId={FileId}, path={Path}", fileId, decision.LocalPath);
+            results[index] = new ChallengeFileResult { FileId = fileId, Pages = [] };
+            return null;
+        }
+
+        string requestId = string.IsNullOrEmpty(job.RequestId) ? "" : job.RequestId;
+        string entry = string.IsNullOrEmpty(job.TraceEntry) ? "challenge" : job.TraceEntry;
+        IDisposable? traceScope = _trace is { Enabled: true }
+            ? OcrTraceLog.BeginScope(requestId, entry, fileId, job.TeamId)
+            : null;
+        PdfOcrRun run;
+        try
+        {
+            run = _pipeline.Start(download.Buffer, download.ElapsedMs, download.Mode, ct, sourceUrl: sourceUrl);
+        }
+        catch
+        {
+            traceScope?.Dispose();
+            download.Buffer.Dispose();
+            throw;
+        }
+
+        Task finished = FinishFileAsync(
+            job, index, fileId, decision, download.Buffer, download.Mode, traceScope, run, results);
+        return new SequentialPdfOverlap.Started(run.OcrCompleted, finished);
+    }
+
+    private async Task FinishFileAsync(
+        ChallengeJob job,
+        int index,
+        string fileId,
+        ChallengeResourceFiles.SourceDecision decision,
+        RentedBuffer buffer,
+        string downloadMode,
+        IDisposable? traceScope,
+        PdfOcrRun run,
+        ChallengeFileResult[] results)
+    {
+        try
+        {
+            OcrResponse ocr = await run.Response.ConfigureAwait(false);
+            if (_trace is { Enabled: true })
+            {
+                string requestId = string.IsNullOrEmpty(job.RequestId) ? "" : job.RequestId;
+                string entry = string.IsNullOrEmpty(job.TraceEntry) ? "challenge" : job.TraceEntry;
+                _trace.Text(
+                    entry, requestId, fileId, decision.Url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
+                    job.TeamId, downloadMode, path: decision.LocalPath);
+            }
+
+            ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(fileId, ocr);
+            results[index] = mapped;
+            _logger.LogInformation(
+                "Challenge file done: fileId={FileId}, path={Path}, pages={Pages}, downloadMode={Mode}",
+                fileId,
+                decision.LocalPath,
+                mapped.Pages.Count,
+                downloadMode);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Challenge file failed: fileId={FileId}, path={Path}", fileId, decision.LocalPath);
+            results[index] = new ChallengeFileResult { FileId = fileId, Pages = [] };
+        }
+        finally
+        {
+            traceScope?.Dispose();
+            buffer.Dispose();
+        }
     }
 
     private async Task PostCallbackWithRetryAsync(

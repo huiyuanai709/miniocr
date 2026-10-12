@@ -221,8 +221,8 @@ public sealed class ClusterDispatchRequest
     /// </summary>
     public List<string>? ActiveJobs { get; set; }
     /// <summary>
-    /// Live session count, not including recently-left jobs. Null means the caller is an older worker
-    /// and <see cref="ActiveJobs"/> is the session list.
+    /// OCR sessions still borrowing the GPU, not including NER-only tails or recently-left jobs.
+    /// Null means the caller is an older worker and <see cref="ActiveJobs"/> is the session list.
     /// </summary>
     public int? ActiveSessions { get; set; }
 }

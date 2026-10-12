@@ -1216,6 +1216,146 @@ Console.WriteLine("=== dispatch rules ===");
     AssertTrue(!ClusterDispatchRules.ShouldOfferJob(true, true, false), "ocr done and no NER capacity is not offered");
     AssertTrue(!ClusterDispatchRules.ShouldOfferJob(true, false, true), "ocr done and NER idle is not offered");
     AssertTrue(ClusterDispatchRules.ShouldOfferJob(true, true, true), "ocr done with NER left goes to an LLM node");
+    AssertTrue(
+        ClusterDispatchRules.OfferOrder(ocrComplete: false) < ClusterDispatchRules.OfferOrder(ocrComplete: true),
+        "an open OCR job outranks a job that only has NER left");
+    AssertTrue(ClusterDispatchRules.CanStartOcrSession(0, alreadyInJob: false), "idle worker can take OCR");
+    AssertTrue(ClusterDispatchRules.CanStartOcrSession(1, alreadyInJob: false), "one OCR session still leaves a slot");
+    AssertTrue(!ClusterDispatchRules.CanStartOcrSession(2, alreadyInJob: false), "two OCR sessions is the cap");
+    AssertTrue(
+        ClusterDispatchRules.CanStartOcrSession(2, alreadyInJob: true),
+        "a job the worker already joined is not rejected by the OCR cap");
+}
+
+Console.WriteLine("=== multi-file OCR overlaps the previous file's tail ===");
+{
+    TaskCompletionSource ocr0 = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    TaskCompletionSource tail0 = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    TaskCompletionSource file1Started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    int started = 0;
+    Task run = SequentialPdfOverlap.RunAsync(
+        2,
+        (index, _) =>
+        {
+            Interlocked.Increment(ref started);
+            if (index == 0)
+            {
+                return Task.FromResult<SequentialPdfOverlap.Started?>(
+                    new SequentialPdfOverlap.Started(ocr0.Task, tail0.Task));
+            }
+
+            file1Started.TrySetResult();
+            return Task.FromResult<SequentialPdfOverlap.Started?>(
+                new SequentialPdfOverlap.Started(Task.CompletedTask, Task.CompletedTask));
+        },
+        continueAfterFailure: true,
+        CancellationToken.None);
+
+    await Task.Delay(80).ConfigureAwait(false);
+    AssertTrue(Volatile.Read(ref started) == 1, "file 2 waits until file 1 OCR finishes");
+    AssertTrue(!file1Started.Task.IsCompleted, "file 2 has not started during file 1 OCR");
+    ocr0.TrySetResult();
+    await file1Started.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+    AssertTrue(!tail0.Task.IsCompleted, "file 2 starts while file 1's tail is still open");
+    AssertTrue(!run.IsCompleted, "the batch stays open until every tail finishes");
+    tail0.TrySetResult();
+    await run.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+    AssertTrue(run.IsCompletedSuccessfully, "the batch returns after the overlapped tail");
+}
+
+Console.WriteLine("=== earlier tails stay in flight while a later file starts OCR ===");
+{
+    TaskCompletionSource[] ocr = [new(), new(), new()];
+    TaskCompletionSource[] tails = [new(), new(), new()];
+    TaskCompletionSource allStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    int started = 0;
+    Task run = SequentialPdfOverlap.RunAsync(
+        3,
+        (index, _) =>
+        {
+            if (Interlocked.Increment(ref started) == 3)
+                allStarted.TrySetResult();
+            ocr[index].TrySetResult();
+            return Task.FromResult<SequentialPdfOverlap.Started?>(
+                new SequentialPdfOverlap.Started(ocr[index].Task, tails[index].Task));
+        },
+        continueAfterFailure: true,
+        CancellationToken.None);
+
+    await allStarted.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+    AssertTrue(!tails[0].Task.IsCompleted && !tails[1].Task.IsCompleted, "file 3 OCR started with both earlier tails open");
+    AssertTrue(!run.IsCompleted, "three-file batch waits for every tail");
+    tails[2].TrySetResult();
+    AssertTrue(!run.IsCompleted, "one finished tail does not complete the batch");
+    tails[0].TrySetResult();
+    tails[1].TrySetResult();
+    await run.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+}
+
+Console.WriteLine("=== OCR failure still joins the tail, and can skip or continue ===");
+{
+    TaskCompletionSource tail = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    int started = 0;
+    Task stopped = SequentialPdfOverlap.RunAsync(
+        2,
+        (index, _) =>
+        {
+            Interlocked.Increment(ref started);
+            if (index == 0)
+            {
+                return Task.FromResult<SequentialPdfOverlap.Started?>(
+                    new SequentialPdfOverlap.Started(
+                        Task.FromException(new InvalidOperationException("ocr failed")),
+                        tail.Task));
+            }
+
+            return Task.FromResult<SequentialPdfOverlap.Started?>(
+                new SequentialPdfOverlap.Started(Task.CompletedTask, Task.CompletedTask));
+        },
+        continueAfterFailure: false,
+        CancellationToken.None);
+
+    await Task.Delay(80).ConfigureAwait(false);
+    AssertTrue(Volatile.Read(ref started) == 1, "a hard OCR failure does not start the next PDF");
+    AssertTrue(!stopped.IsCompleted, "the failed file's tail is still joined");
+    tail.TrySetResult();
+    InvalidOperationException? thrown = null;
+    try
+    {
+        await stopped.ConfigureAwait(false);
+    }
+    catch (InvalidOperationException ex)
+    {
+        thrown = ex;
+    }
+
+    AssertTrue(thrown is not null && thrown.Message == "ocr failed", "OCR failure surfaces after the tail joins");
+
+    started = 0;
+    TaskCompletionSource continuedTail = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    Task continued = SequentialPdfOverlap.RunAsync(
+        2,
+        (index, _) =>
+        {
+            Interlocked.Increment(ref started);
+            if (index == 0)
+            {
+                return Task.FromResult<SequentialPdfOverlap.Started?>(
+                    new SequentialPdfOverlap.Started(
+                        Task.FromException(new InvalidOperationException("ocr failed")),
+                        continuedTail.Task));
+            }
+
+            return Task.FromResult<SequentialPdfOverlap.Started?>(
+                new SequentialPdfOverlap.Started(Task.CompletedTask, Task.CompletedTask));
+        },
+        continueAfterFailure: true,
+        CancellationToken.None);
+    await Task.Delay(80).ConfigureAwait(false);
+    AssertTrue(Volatile.Read(ref started) == 2, "challenge mode starts the next PDF after one file's OCR fails");
+    AssertTrue(!continued.IsCompleted, "the failed file's tail still blocks the combined result");
+    continuedTail.TrySetResult();
+    await continued.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
 }
 
 Console.WriteLine("=== pdf range and read cancel ===");

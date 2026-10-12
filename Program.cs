@@ -719,82 +719,20 @@ app.MapPost("/ocr", async Task<IResult> (
             statusCode: StatusCodes.Status400BadRequest);
     }
 
-    List<ChallengeFileResult> results = [];
+    ChallengeFileResult[] results = new ChallengeFileResult[files.Count];
+    for (int i = 0; i < files.Count; i++)
+        results[i] = new ChallengeFileResult { FileId = files[i].FileId ?? "", Pages = [] };
     OcrResponse? single = null;
+    Exception? pipelineError = null;
     try
     {
-        foreach (ChallengeFileRef file in files)
-        {
-            string fileId = file.FileId ?? "f1";
-            ChallengeResourceFiles.SourceDecision decision =
-                ChallengeResourceFiles.Decide(resourceDir, file.FileId, file.Url);
-            if (decision.Kind == ChallengeResourceFiles.SourceKind.Missing)
-            {
-                logger.LogWarning(
-                    "Debug /ocr file has no PDF: fileId={FileId}, path={Path}, downloadMode={Mode}",
-                    fileId,
-                    decision.LocalPath,
-                    challenge.Enabled ? ChallengeResourceFiles.DownloadMode : "url");
-                results.Add(new ChallengeFileResult { FileId = fileId, Pages = [] });
-                continue;
-            }
-
-            ParallelPdfDownloader.DownloadResult download;
-            string? sourceUrl;
-            if (decision.Kind == ChallengeResourceFiles.SourceKind.Local)
-            {
-                logger.LogInformation(
-                    "Debug /ocr local resource: fileId={FileId}, path={Path}, downloadMode={Mode}",
-                    fileId,
-                    decision.LocalPath,
-                    ChallengeResourceFiles.DownloadMode);
-                ChallengeResourceFiles.LocalRead local = ChallengeResourceFiles.ReadLocal(decision.LocalPath!);
-                download = new ParallelPdfDownloader.DownloadResult(local.Buffer, local.Mode, local.ElapsedMs);
-                sourceUrl = decision.LocalPath;
-            }
-            else
-            {
-                string url = decision.Url!;
-                if (decision.LocalPath is not null)
-                {
-                    logger.LogInformation(
-                        "Debug /ocr file not in resource dir, downloading: fileId={FileId}, path={Path}, downloadMode=url-fallback",
-                        fileId,
-                        decision.LocalPath);
-                }
-
-                services.GetService<ClusterCoordinator>()?.BeginSourcePrefetch(url);
-                download = await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
-                sourceUrl = url;
-            }
-
-            using (download.Buffer)
-            {
-                using IDisposable? traceScope = ocrTrace.Enabled
-                    ? OcrTraceLog.BeginScope(requestId, "ocr", fileId, body.TeamId)
-                    : null;
-                OcrResponse ocr = await pipeline
-                    .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi, sourceUrl)
-                    .ConfigureAwait(false);
-
-                if (ocrTrace.Enabled)
-                {
-                    ocrTrace.Text(
-                        "ocr", requestId, fileId, decision.Url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
-                        body.TeamId, download.Mode, path: decision.LocalPath);
-                }
-
-                if (files.Count == 1)
-                    single = ocr;
-                results.Add(ChallengeResultMapper.BuildFileResult(fileId, ocr));
-                logger.LogInformation(
-                    "Debug /ocr file done: fileId={FileId}, path={Path}, pages={Pages}, downloadMode={Mode}",
-                    fileId,
-                    decision.LocalPath,
-                    results[^1].Pages.Count,
-                    download.Mode);
-            }
-        }
+        await SequentialPdfOverlap.RunAsync(
+            files.Count,
+            StartDebugFileAsync,
+            continueAfterFailure: false,
+            ct).ConfigureAwait(false);
+        if (pipelineError is not null)
+            throw pipelineError;
     }
     catch (ArgumentException ex)
     {
@@ -841,8 +779,116 @@ app.MapPost("/ocr", async Task<IResult> (
     {
         TeamId = body.TeamId,
         Key = string.IsNullOrWhiteSpace(body.Key) ? "debug" : body.Key.Trim(),
-        Result = results,
+        Result = [.. results],
     };
+
+    async Task<SequentialPdfOverlap.Started?> StartDebugFileAsync(int index, CancellationToken token)
+    {
+        ChallengeFileRef file = files[index];
+        string fileId = file.FileId ?? "f1";
+        ChallengeResourceFiles.SourceDecision decision =
+            ChallengeResourceFiles.Decide(resourceDir, file.FileId, file.Url);
+        if (decision.Kind == ChallengeResourceFiles.SourceKind.Missing)
+        {
+            logger.LogWarning(
+                "Debug /ocr file has no PDF: fileId={FileId}, path={Path}, downloadMode={Mode}",
+                fileId,
+                decision.LocalPath,
+                challenge.Enabled ? ChallengeResourceFiles.DownloadMode : "url");
+            results[index] = new ChallengeFileResult { FileId = fileId, Pages = [] };
+            return null;
+        }
+
+        ParallelPdfDownloader.DownloadResult download;
+        string? sourceUrl;
+        if (decision.Kind == ChallengeResourceFiles.SourceKind.Local)
+        {
+            logger.LogInformation(
+                "Debug /ocr local resource: fileId={FileId}, path={Path}, downloadMode={Mode}",
+                fileId,
+                decision.LocalPath,
+                ChallengeResourceFiles.DownloadMode);
+            ChallengeResourceFiles.LocalRead local = ChallengeResourceFiles.ReadLocal(decision.LocalPath!);
+            download = new ParallelPdfDownloader.DownloadResult(local.Buffer, local.Mode, local.ElapsedMs);
+            sourceUrl = decision.LocalPath;
+        }
+        else
+        {
+            string url = decision.Url!;
+            if (decision.LocalPath is not null)
+            {
+                logger.LogInformation(
+                    "Debug /ocr file not in resource dir, downloading: fileId={FileId}, path={Path}, downloadMode=url-fallback",
+                    fileId,
+                    decision.LocalPath);
+            }
+
+            services.GetService<ClusterCoordinator>()?.BeginSourcePrefetch(url);
+            download = await downloader.DownloadAsync(url, token).ConfigureAwait(false);
+            sourceUrl = url;
+        }
+
+        IDisposable? traceScope = ocrTrace.Enabled
+            ? OcrTraceLog.BeginScope(requestId, "ocr", fileId, body.TeamId)
+            : null;
+        PdfOcrRun run;
+        try
+        {
+            run = pipeline.Start(download.Buffer, download.ElapsedMs, download.Mode, token, dpi, sourceUrl);
+        }
+        catch
+        {
+            traceScope?.Dispose();
+            download.Buffer.Dispose();
+            throw;
+        }
+
+        return new SequentialPdfOverlap.Started(
+            run.OcrCompleted,
+            FinishDebugFileAsync(index, fileId, decision, download.Buffer, download.Mode, traceScope, run));
+    }
+
+    async Task FinishDebugFileAsync(
+        int index,
+        string fileId,
+        ChallengeResourceFiles.SourceDecision decision,
+        RentedBuffer buffer,
+        string downloadMode,
+        IDisposable? traceScope,
+        PdfOcrRun run)
+    {
+        try
+        {
+            OcrResponse ocr = await run.Response.ConfigureAwait(false);
+            if (ocrTrace.Enabled)
+            {
+                ocrTrace.Text(
+                    "ocr", requestId, fileId, decision.Url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
+                    body.TeamId, downloadMode, path: decision.LocalPath);
+            }
+
+            if (files.Count == 1)
+                single = ocr;
+            ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(fileId, ocr);
+            results[index] = mapped;
+            logger.LogInformation(
+                "Debug /ocr file done: fileId={FileId}, path={Path}, pages={Pages}, downloadMode={Mode}",
+                fileId,
+                decision.LocalPath,
+                mapped.Pages.Count,
+                downloadMode);
+        }
+        catch (Exception ex)
+        {
+            // One writer after OCR has already moved on, so keep the first failure.
+            pipelineError ??= ex;
+        }
+        finally
+        {
+            traceScope?.Dispose();
+            buffer.Dispose();
+        }
+    }
     return Results.Json(callbackShaped, AppJsonContext.Relaxed.ChallengeCallbackBody);
 });
 
