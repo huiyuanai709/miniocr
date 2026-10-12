@@ -179,6 +179,7 @@ Console.WriteLine(
     $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
     $"maxConcurrency={llmConfig.MaxConcurrency}, pagesPerRequest={llmConfig.PagesPerRequest}, " +
+    $"nerMaxAttempts={llmConfig.NerMaxAttempts}, " +
     $"maxCharsPerRequest={llmConfig.MaxCharsPerRequest}, " +
     $"ocrConcurrency={llmConfig.OcrConcurrency}, ocrJpegQuality={llmConfig.OcrJpegQuality}, " +
     $"thinking={llmConfig.Thinking}, fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
@@ -1003,7 +1004,7 @@ app.MapGet("/", () => Results.Text(
     "Env CHALLENGE: MINIOCR_CHALLENGE_RESOURCE_DIR (empty = require fileId+url; set = read-only {dir}/{fileId}.pdf)\n" +
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_OCR_BACKEND MINIOCR_OCR_VULKAN_DEVICE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_REC_INTRA_OP_THREADS MINIOCR_USE_CLS MINIOCR_REMOVE_RED_SEAL MINIOCR_RASTER_WORKERS MINIOCR_RENDER_MODE MINIOCR_RENDER_PROCESSES\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
-    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
+    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_NER_MAX_ATTEMPTS MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
     "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH MINIOCR_CLUSTER_DISTRIBUTED_NER\n" +
     $"OCR trace: {(ocrTrace.Enabled ? "on" : "off")} path={ocrTrace.Path} maxCharsPerPage={ocrTrace.MaxCharsPerPage} queue={ocrTrace.QueueCapacity}\n" +
     "  MINIOCR_OCR_TRACE=0 turns it off (default on). MINIOCR_OCR_TRACE_PATH sets the JSONL file. MINIOCR_OCR_TRACE_MAX_CHARS caps each page (0 keeps page metadata and omits the text). File URLs and OCR text are queued; a full queue drops events and does not fail or block OCR.\n" +

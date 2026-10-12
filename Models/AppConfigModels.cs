@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -58,6 +59,15 @@ public sealed class LlmFileConfig
 
     /// <summary>When LLM is not usable: use EntityExtractor heuristics. Ignored after an LLM NER attempt (never silent heuristic fallback). Default false.</summary>
     public bool FallbackToHeuristics { get; set; } = false;
+
+    /// <summary>
+    /// Chat-completion attempts per NER group, including the first call (clamped 1–8).
+    /// JSON parse failures spend the remaining attempts on a thinking-on correction that
+    /// quotes the bad reply. HTTP 403, 408, 429, 5xx, timeouts, and transport errors retry
+    /// the same request with a short backoff. 401 is not retried. Default 3.
+    /// Env <c>MINIOCR_LLM_NER_MAX_ATTEMPTS</c> overrides this.
+    /// </summary>
+    public int NerMaxAttempts { get; set; } = 3;
 
     /// <summary>
     /// Send <c>response_format: {"type":"json_object"}</c>. Null (default) turns it on for
@@ -138,6 +148,12 @@ public sealed class LlmRuntimeConfig
     public bool FallbackToHeuristics { get; init; } = false;
     /// <summary>When true (default), ask for a JSON object. Turned off at runtime if the provider rejects it.</summary>
     public bool JsonObject { get; init; } = true;
+
+    /// <summary>
+    /// Attempts per NER group, including the first call. Default 3.
+    /// Parse failures become a thinking correction; HTTP 403 and other transient HTTP retry the same request. 401 does not.
+    /// </summary>
+    public int NerMaxAttempts { get; init; } = 3;
 
     /// <summary>Payload for DeepSeek/OpenAI-compatible thinking field.</summary>
     public ThinkingOption ToThinkingOption() =>
@@ -227,6 +243,33 @@ public sealed class ThinkingConfigJsonConverter : JsonConverter<bool>
     }
 }
 
+/// <summary>
+/// LLM payloads sometimes emit integers as JSON strings (<c>"page": "26"</c>, <c>"count": "2"</c>).
+/// Accepts a JSON number or a base-10 integer string. Writes a JSON number so contest callbacks stay numeric.
+/// AOT-safe: no reflection. Source-generated JSON picks it up from <see cref="JsonConverterAttribute"/> on the property.
+/// </summary>
+public sealed class FlexibleInt32JsonConverter : JsonConverter<int>
+{
+    public override int Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        switch (reader.TokenType)
+        {
+            case JsonTokenType.Number:
+                return reader.GetInt32();
+            case JsonTokenType.String:
+                string? text = reader.GetString();
+                if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value))
+                    return value;
+                throw new JsonException($"Expected an integer string, got '{text}'.");
+            default:
+                throw new JsonException($"Expected a number or numeric string, got {reader.TokenType}.");
+        }
+    }
+
+    public override void Write(Utf8JsonWriter writer, int value, JsonSerializerOptions options) =>
+        writer.WriteNumberValue(value);
+}
+
 public sealed class VisionChatMessage
 {
     public string Role { get; set; } = "";
@@ -306,9 +349,13 @@ public sealed class LlmPagesPayload
     public List<LlmPageEntities>? Pages { get; set; }
 }
 
-/// <summary>One page block of <see cref="LlmPagesPayload"/>; <see cref="Page"/> is the PDF page number.</summary>
+/// <summary>
+/// One page block of <see cref="LlmPagesPayload"/>.
+/// <see cref="Page"/> is the PDF page number; models sometimes send it as a string.
+/// </summary>
 public sealed class LlmPageEntities
 {
+    [JsonConverter(typeof(FlexibleInt32JsonConverter))]
     public int Page { get; set; }
     public List<ChallengeRule>? RuleList { get; set; }
 }

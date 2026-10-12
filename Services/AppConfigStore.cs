@@ -203,6 +203,15 @@ public static class AppConfigStore
                 jsonObject = true;
         }
 
+        int nerMaxAttempts = llm.NerMaxAttempts <= 0 ? 3 : llm.NerMaxAttempts;
+        string? envAttempts = Environment.GetEnvironmentVariable("MINIOCR_LLM_NER_MAX_ATTEMPTS");
+        if (!string.IsNullOrWhiteSpace(envAttempts) &&
+            int.TryParse(envAttempts.Trim(), out int parsedAttempts) &&
+            parsedAttempts > 0)
+        {
+            nerMaxAttempts = parsedAttempts;
+        }
+
         return new LlmRuntimeConfig
         {
             Enabled = llm.Enabled,
@@ -220,6 +229,7 @@ public static class AppConfigStore
             Thinking = thinking,
             FallbackToHeuristics = llm.FallbackToHeuristics,
             JsonObject = jsonObject,
+            NerMaxAttempts = Math.Clamp(nerMaxAttempts, 1, 8),
         };
     }
 
@@ -400,6 +410,7 @@ public static class AppConfigStore
             "maxCharsPerRequest": 300000,
             "pagesPerRequest": 10,
             "maxConcurrency": 8,
+            "nerMaxAttempts": 3,
             "ocrConcurrency": 32,
             "ocrMaxCharsHint": 8000,
             "ocrJpegQuality": 70,

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace MiniOcr.Models;
 
 /// <summary>Platform → service challenge request (no auth).</summary>
@@ -56,6 +58,8 @@ public sealed class ChallengeRuleItem
 {
     public string? PersonName { get; set; }
     public string? CompanyName { get; set; }
+    /// <summary>Occurrence count. LLM payloads sometimes send this as a numeric string.</summary>
+    [JsonConverter(typeof(FlexibleInt32JsonConverter))]
     public int Count { get; set; }
     public List<string> OriginText { get; set; } = [];
 }
