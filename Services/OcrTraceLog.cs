@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Globalization;
-using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -151,7 +150,7 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
         }
     }
 
-    /// <summary>Record a file URL. Query credentials and userinfo are stripped before enqueue.</summary>
+    /// <summary>Record a file URL exactly as received, including query and userinfo.</summary>
     public void Url(
         string entry,
         string requestId,
@@ -173,7 +172,7 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
                 TeamId = teamId,
                 JobId = NullIfEmpty(jobId),
                 NodeId = NullIfEmpty(nodeId),
-                Url = RedactUrl(url),
+                Url = url,
             });
         }
         catch
@@ -197,7 +196,7 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
                 FileId = ctx?.FileId,
                 TeamId = ctx?.TeamId,
                 JobId = jobId,
-                Url = string.IsNullOrWhiteSpace(sourceUrl) ? null : RedactUrl(sourceUrl),
+                Url = string.IsNullOrWhiteSpace(sourceUrl) ? null : sourceUrl,
                 PageCount = pageCount,
             });
         }
@@ -233,7 +232,7 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
                 RequestId = requestId ?? "",
                 FileId = NullIfEmpty(fileId),
                 TeamId = teamId,
-                Url = string.IsNullOrWhiteSpace(url) ? null : RedactUrl(url),
+                Url = string.IsNullOrWhiteSpace(url) ? null : url,
                 Path = Clip(path, 1024),
                 FileName = Clip(fileName, 256),
                 DownloadMode = NullIfEmpty(downloadMode),
@@ -280,88 +279,6 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
             return;
         _cts.Cancel();
         _cts.Dispose();
-    }
-
-    /// <summary>
-    /// http(s) URL safe to write down. Drops userinfo and fragment. Replaces credential-like
-    /// query values with <c>***</c>. Non-http(s) input (including data URLs) becomes a tag,
-    /// never the original string.
-    /// </summary>
-    public static string RedactUrl(string? url)
-    {
-        if (string.IsNullOrWhiteSpace(url))
-            return "";
-        try
-        {
-            string trimmed = url.Trim();
-            if (trimmed.Length > 8192)
-                trimmed = trimmed[..8192];
-            if (!Uri.TryCreate(trimmed, UriKind.Absolute, out Uri? uri))
-                return "(unparsed)";
-            if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-                return "(non-http)";
-
-            string origin = uri.GetComponents(
-                UriComponents.Scheme | UriComponents.Host | UriComponents.Port | UriComponents.Path | UriComponents.KeepDelimiter,
-                UriFormat.UriEscaped);
-            return origin + RedactQuery(uri.Query);
-        }
-        catch
-        {
-            return "(unparsed)";
-        }
-    }
-
-    internal static string RedactQuery(string query)
-    {
-        if (string.IsNullOrEmpty(query) || query == "?")
-            return "";
-        string body = query[0] == '?' ? query[1..] : query;
-        string[] parts = body.Split('&');
-        var sb = new StringBuilder(body.Length + 8);
-        sb.Append('?');
-        for (int i = 0; i < parts.Length; i++)
-        {
-            if (i > 0)
-                sb.Append('&');
-            string part = parts[i];
-            if (part.Length == 0)
-                continue;
-            int eq = part.IndexOf('=');
-            string rawName = eq >= 0 ? part[..eq] : part;
-            string value = eq >= 0 ? part[(eq + 1)..] : "";
-            sb.Append(rawName);
-            if (eq < 0)
-                continue;
-            sb.Append('=');
-            sb.Append(IsSecretQueryName(DecodeName(rawName)) ? "***" : value);
-        }
-
-        return sb.ToString();
-    }
-
-    internal static bool IsSecretQueryName(string name)
-    {
-        if (name.Length == 0)
-            return false;
-        if (name.Equals("key", StringComparison.OrdinalIgnoreCase) ||
-            name.Equals("sig", StringComparison.OrdinalIgnoreCase) ||
-            name.Equals("auth", StringComparison.OrdinalIgnoreCase) ||
-            name.Equals("authorization", StringComparison.OrdinalIgnoreCase) ||
-            name.Equals("awsaccesskeyid", StringComparison.OrdinalIgnoreCase))
-            return true;
-        return name.Contains("token", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("secret", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("password", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("passwd", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("signature", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("credential", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("apikey", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("api_key", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("api-key", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("accesskey", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("access_key", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task RunAsync(CancellationToken ct)
@@ -605,18 +522,6 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
         if (Interlocked.CompareExchange(ref _lastDropWarnTicks, now, last) != last)
             return;
         _logger.LogWarning(ex, "OCR trace write failed at {Path}. OCR results were not affected.", Path);
-    }
-
-    private static string DecodeName(string rawName)
-    {
-        try
-        {
-            return Uri.UnescapeDataString(rawName.Replace('+', ' '));
-        }
-        catch (UriFormatException)
-        {
-            return rawName;
-        }
     }
 
     private static string? NullIfEmpty(string? value) =>

@@ -213,7 +213,7 @@ curl -sS -X POST http://127.0.0.1:5080/ocr/upload \
 
 `requestId` 把同一次 HTTP 请求的 URL 和分页文本对上；`fileId` 区分请求里的多个文件。文本按页各写一行，对应管道已经留下的页（空白页本来就不会进入结果）。集群任务另有一行 `kind=job`，用同一个 `requestId` 带上集群 `jobId`。Worker 收到下发的 `sourceUrl` 时记 `cluster-notify`、`cluster-dispatch` 或 `cluster-prefetch`，用 `jobId` 和上面那行对上。页文本只在跑完 `ProcessAsync` 的进程写一次，worker 不把同一份正文再写一遍。
 
-查询参数里的 `token`、`secret`、`password`、`signature`、`credential`、`api_key`、`key`、`sig` 以及 AWS 的签名字段会换成 `***`。URL 里的用户名密码和 fragment 不写。`data:` 这类非 http(s) 地址只记 `(non-http)`。challenge 的 `key` 和 callback 全量地址不进这个文件。
+文件 URL 按请求里的原始字符串写入，query、userinfo 和 fragment 都保留，方便对照得分。challenge 的 `key`、callback 全量地址和 LLM API key 仍然不写进这个文件。
 
 进程被直接杀掉时，队列里还没落盘的几条会丢。这不影响识别结果。多个进程不要追加同一个文件。
 

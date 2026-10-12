@@ -20,26 +20,6 @@ void AssertTrue(bool cond, string msg)
 using ILoggerFactory logs = LoggerFactory.Create(b => b.SetMinimumLevel(LogLevel.Warning));
 ILogger logger = logs.CreateLogger("ocr-trace");
 
-Console.WriteLine("=== redact file URLs ===");
-string signed = OcrTraceLog.RedactUrl(
-    "https://user:s3cr3t-key@files.example/a.pdf?file=a.pdf&X-Amz-Signature=super-secret&ttl=60");
-AssertTrue(
-    signed == "https://files.example/a.pdf?file=a.pdf&X-Amz-Signature=***&ttl=60",
-    "userinfo dropped, signature redacted, file id kept: " + signed);
-AssertTrue(!signed.Contains("s3cr3t-key", StringComparison.Ordinal), "password is absent");
-AssertTrue(!signed.Contains("super-secret", StringComparison.Ordinal), "signature value is absent");
-
-string keyed = OcrTraceLog.RedactUrl("https://files.example/a.pdf?key=challenge-secret&id=7");
-AssertTrue(keyed == "https://files.example/a.pdf?key=***&id=7", "query key redacted: " + keyed);
-AssertTrue(!keyed.Contains("challenge-secret", StringComparison.Ordinal), "challenge-like key value is absent");
-
-string token = OcrTraceLog.RedactUrl("http://user:pw@[::1]:8080/a.pdf?access_token=abc");
-AssertTrue(token == "http://[::1]:8080/a.pdf?access_token=***", "ipv6 userinfo and token: " + token);
-
-string dataUrl = "data:application/pdf;base64,AAAASECRET";
-AssertTrue(OcrTraceLog.RedactUrl(dataUrl) == "(non-http)", "non-http URLs are not stored");
-AssertTrue(OcrTraceLog.RedactUrl("not a url") == "(unparsed)", "unparsed URLs are not stored");
-
 Console.WriteLine("=== write url and truncated page text ===");
 string dir = Path.Combine(Path.GetTempPath(), "miniocr-trace-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(dir);
@@ -55,18 +35,21 @@ OcrTraceLog trace = OcrTraceLog.Create(
     directory: dir);
 await trace.StartAsync(CancellationToken.None);
 const string requestId = "req-trace-1";
+const string fileUrl =
+    "https://user:s3cr3t-key@files.example/a.pdf?file=a.pdf&X-Amz-Signature=super-secret&ttl=60#page=2";
 trace.Url(
     "challenge",
     requestId,
-    "https://user:s3cr3t-key@files.example/a.pdf?file=a.pdf&X-Amz-Signature=super-secret&ttl=60",
+    fileUrl,
     fileId: "f1",
     teamId: 9);
 string body = "01234567TAILMARKER";
+const string textUrl = "https://user:s3cr3t-key@files.example/a.pdf?key=challenge-secret";
 trace.Text(
     "challenge",
     requestId,
     "f1",
-    "https://user:s3cr3t-key@files.example/a.pdf?key=challenge-secret",
+    textUrl,
     pageCount: 2,
     pages:
     [
@@ -75,14 +58,15 @@ trace.Text(
     ],
     teamId: 9,
     downloadMode: "parallel");
+const string jobUrl = "https://files.example/a.pdf?sig=super-secret";
 using (OcrTraceLog.BeginScope(requestId, "challenge", "f1", 9))
-    trace.ClusterJob("job-abc", "https://files.example/a.pdf?sig=super-secret", 2);
+    trace.ClusterJob("job-abc", jobUrl, 2);
 AssertTrue(await trace.DrainAsync(TimeSpan.FromSeconds(5)), "background writer drained");
 
 string raw = await File.ReadAllTextAsync(logPath);
-AssertTrue(!raw.Contains("s3cr3t-key", StringComparison.Ordinal), "log has no userinfo secret");
-AssertTrue(!raw.Contains("super-secret", StringComparison.Ordinal), "log has no signature");
-AssertTrue(!raw.Contains("challenge-secret", StringComparison.Ordinal), "log has no key query value");
+AssertTrue(raw.Contains("s3cr3t-key", StringComparison.Ordinal), "userinfo is kept");
+AssertTrue(raw.Contains("super-secret", StringComparison.Ordinal), "query signature is kept");
+AssertTrue(raw.Contains("challenge-secret", StringComparison.Ordinal), "query key value is kept");
 AssertTrue(!raw.Contains("TAILMARKER", StringComparison.Ordinal), "page text is truncated");
 AssertTrue(raw.Contains("第二页识别文本", StringComparison.Ordinal), "short page text is kept");
 AssertTrue(!raw.Contains('\r'), "records are LF JSONL");
@@ -99,7 +83,9 @@ using (JsonDocument job = JsonDocument.Parse(lines[4]))
     AssertTrue(url.RootElement.GetProperty("requestId").GetString() == requestId, "url request id");
     AssertTrue(url.RootElement.GetProperty("fileId").GetString() == "f1", "url file id");
     AssertTrue(url.RootElement.GetProperty("teamId").GetInt32() == 9, "team id kept, key is not a field");
+    AssertTrue(url.RootElement.GetProperty("url").GetString() == fileUrl, "file url is the original string");
     AssertTrue(!url.RootElement.TryGetProperty("key", out _), "challenge key is not a log field");
+    AssertTrue(ocr.RootElement.GetProperty("url").GetString() == textUrl, "ocr line keeps the original file url");
     AssertTrue(ocr.RootElement.GetProperty("requestId").GetString() == requestId, "ocr request id matches the url");
     AssertTrue(ocr.RootElement.GetProperty("fileId").GetString() == "f1", "ocr file id matches the url");
     AssertTrue(ocr.RootElement.GetProperty("loggedPages").GetInt32() == 2, "both pages are logged");
@@ -112,7 +98,7 @@ using (JsonDocument job = JsonDocument.Parse(lines[4]))
     AssertTrue(job.RootElement.GetProperty("kind").GetString() == "job", "cluster job link");
     AssertTrue(job.RootElement.GetProperty("jobId").GetString() == "job-abc", "cluster job id");
     AssertTrue(job.RootElement.GetProperty("requestId").GetString() == requestId, "job joins the http request");
-    AssertTrue(job.RootElement.GetProperty("url").GetString() == "https://files.example/a.pdf?sig=***", "job url redacted");
+    AssertTrue(job.RootElement.GetProperty("url").GetString() == jobUrl, "job url is the original string");
 }
 
 await trace.StopAsync(CancellationToken.None);
