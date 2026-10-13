@@ -232,6 +232,10 @@ string? prevRenderProcesses = Environment.GetEnvironmentVariable("MINIOCR_RENDER
 string? prevTextLayer = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
 string? prevRemoveRed = Environment.GetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL");
 string? prevSealOcr = Environment.GetEnvironmentVariable("MINIOCR_SEAL_OCR");
+string? prevSealDpi = Environment.GetEnvironmentVariable("MINIOCR_SEAL_DPI");
+string? prevSealDet = Environment.GetEnvironmentVariable("MINIOCR_SEAL_DET_LIMIT_SIDE");
+string? prevDpi = Environment.GetEnvironmentVariable("MINIOCR_DPI");
+string? prevDetLimit = Environment.GetEnvironmentVariable("MINIOCR_DET_LIMIT_SIDE");
 string? prevRaster = Environment.GetEnvironmentVariable("MINIOCR_RASTER_WORKERS");
 try
 {
@@ -432,6 +436,59 @@ try
     }).SealOcr.ToString(), "env 0 turns seal OCR off");
     Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", null);
 
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "local");
+    Environment.SetEnvironmentVariable("MINIOCR_DPI", null);
+    Environment.SetEnvironmentVariable("MINIOCR_DET_LIMIT_SIDE", null);
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DPI", null);
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DET_LIMIT_SIDE", null);
+    OcrRuntimeConfig sealDpiOff = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealDpi = 144, SealDetLimitSide = 640 },
+    });
+    AssertEqual("144", sealDpiOff.SealDpi.ToString(), "file seal dpi is stored while seal OCR is off");
+    AssertEqual("96", sealDpiOff.SealRasterDpi(96).ToString(), "seal dpi does not change raster while seal OCR is off");
+    AssertEqual("960", sealDpiOff.DetLimitSideLength.ToString(), "seal dpi does not raise det limit while seal OCR is off");
+    OcrRuntimeConfig sealDpiOn = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = true, SealDpi = 144 },
+    });
+    AssertEqual("144", sealDpiOn.SealRasterDpi(96).ToString(), "seal dpi raises local raster");
+    AssertEqual("200", sealDpiOn.SealRasterDpi(200).ToString(), "a higher request dpi is kept");
+    AssertEqual("1440", sealDpiOn.DetLimitSideLength.ToString(), "unset det limit follows seal dpi");
+    AssertEqual("1440", sealDpiOn.SealStripLongSide.ToString(), "strip long side follows the engine limit");
+    AssertEqual("144", sealDpiOn.WithMode("local").SealDpi.ToString(), "mode copy keeps seal dpi");
+    Environment.SetEnvironmentVariable("MINIOCR_DET_LIMIT_SIDE", "960");
+    OcrRuntimeConfig sealDetPinned = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = true, SealDpi = 144, SealDetLimitSide = 2000 },
+    });
+    AssertEqual("960", sealDetPinned.DetLimitSideLength.ToString(), "explicit det limit is not raised");
+    AssertEqual("960", sealDetPinned.SealStripLongSide.ToString(), "strip cap cannot exceed the engine limit");
+    Environment.SetEnvironmentVariable("MINIOCR_DET_LIMIT_SIDE", null);
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DPI", "150");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DET_LIMIT_SIDE", "640");
+    OcrRuntimeConfig sealFromEnv = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = true, SealDpi = 72, SealDetLimitSide = 1200 },
+    });
+    AssertEqual("150", sealFromEnv.SealDpi.ToString(), "env seal dpi overrides the file");
+    AssertEqual("640", sealFromEnv.SealDetLimitSide.ToString(), "env seal det limit overrides the file");
+    AssertEqual("640", sealFromEnv.SealStripLongSide.ToString(), "strip uses the lower seal cap");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DPI", "10");
+    AssertEqual("36", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = true },
+    }).SealDpi.ToString(), "seal dpi clamps to 36");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DPI", null);
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "wechat");
+    AssertEqual("96", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = true, SealDpi = 150 },
+    }).SealRasterDpi(96).ToString(), "wechat raster ignores seal dpi");
+    Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "local");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DPI", null);
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DET_LIMIT_SIDE", null);
+
     int cores = Math.Max(1, Environment.ProcessorCount);
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "llm");
     Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", null);
@@ -459,6 +516,10 @@ finally
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
     Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", prevRemoveRed);
     Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", prevSealOcr);
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DPI", prevSealDpi);
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_DET_LIMIT_SIDE", prevSealDet);
+    Environment.SetEnvironmentVariable("MINIOCR_DPI", prevDpi);
+    Environment.SetEnvironmentVariable("MINIOCR_DET_LIMIT_SIDE", prevDetLimit);
     Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", prevRaster);
 }
 
@@ -552,6 +613,13 @@ Console.WriteLine("=== red seal filter ===");
     AssertTrue(ringPage.AsSpan().SequenceEqual(before), "capture leaves seal ink on the page");
     AssertTrue(rings[0].Primary.Width > rings[0].Primary.Height * 3, "ring unwrap is a wide strip");
     AssertTrue(CountBlack(rings[0].Primary) > 50, "unwrapped strip keeps the ring as dark text");
+    List<SealRingOcr.SealCapture> capped = SealRingOcr.Capture(
+        ringPage, canvas, canvas, canvasStride, minSealSidePx: 40, maxStripSide: 160);
+    AssertEqual("1", capped.Count.ToString(), "capped capture still finds the ring");
+    int cappedLong = Math.Max(capped[0].Primary.Width, capped[0].Primary.Height);
+    AssertTrue(cappedLong <= 160, "unwrap long side stays within the detector cap");
+    AssertTrue(cappedLong < rings[0].Primary.Width, "the cap is smaller than the uncapped strip");
+    AssertTrue(CountBlack(capped[0].Primary) > 20, "capped strip still has ring ink");
     AssertTrue(!rings[0].Reversed.IsEmpty && !rings[0].HeadsIn.IsEmpty, "ring has alternate orientations");
 
     byte[] squarePage = new byte[canvas * canvasStride];

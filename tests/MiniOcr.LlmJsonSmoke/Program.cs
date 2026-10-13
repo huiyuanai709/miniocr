@@ -258,6 +258,10 @@ Assert(redOmitted?.Ocr?.SealOcr == false, "omitted sealOcr stays false");
 AppConfigFile? sealOn = JsonSerializer.Deserialize(
     """{"ocr":{"sealOcr":true}}""", AppJsonContext.Default.AppConfigFile);
 Assert(sealOn?.Ocr?.SealOcr == true && sealOn.Ocr.RemoveRedSeal, "json sealOcr true keeps removeRedSeal default");
+AppConfigFile? sealDpi = JsonSerializer.Deserialize(
+    """{"ocr":{"sealDpi":144,"sealDetLimitSide":640}}""", AppJsonContext.Default.AppConfigFile);
+Assert(sealDpi?.Ocr?.SealDpi == 144 && sealDpi.Ocr.SealDetLimitSide == 640, "json seal dpi and det limit");
+Assert(sealDpi?.Ocr?.SealOcr == false, "omitted sealOcr stays false beside seal dpi");
 
 using SKBitmap grayPage = new(4, 4, SKColorType.Gray8, SKAlphaType.Opaque);
 Assert(RedSealFilter.Apply(grayPage) == 0, "Gray8 pages skip red-seal removal");

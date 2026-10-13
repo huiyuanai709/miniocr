@@ -27,7 +27,7 @@ internal static class PdfParallelOptions
         CreateRenderOptions(dpi, keepRedChannel, PdfAntiAliasing.All);
 
     public static RenderOptions CreateRenderOptions(int dpi, OcrRuntimeConfig config) =>
-        CreateRenderOptions(dpi, config.RasterKeepsRed, AntiAliasingOf(config));
+        CreateRenderOptions(config.SealRasterDpi(dpi), config.RasterKeepsRed, AntiAliasingOf(config));
 
     /// <summary>
     /// <c>None</c> maps to PDFium <c>RENDER_NO_SMOOTHIMAGE</c>, which samples a scanned page

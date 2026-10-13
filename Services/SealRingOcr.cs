@@ -38,13 +38,16 @@ public static class SealRingOcr
     /// <summary>
     /// Seal-shaped red blobs on a BGRA page. Does not write <paramref name="pixels"/>.
     /// <paramref name="minSealSidePx"/> is <see cref="RedSealFilter.MinSealSideForDpi"/>.
+    /// <paramref name="maxStripSide"/> caps the unwrapped ring's long side (padding included).
+    /// <c>0</c> keeps the internal 4096 ceiling. The page pixels are only read.
     /// </summary>
     public static List<SealCapture> Capture(
         ReadOnlySpan<byte> pixels,
         int width,
         int height,
         int stride,
-        int minSealSidePx)
+        int minSealSidePx,
+        int maxStripSide = 0)
     {
         List<SealCapture> found = [];
         if (width <= 0 || height <= 0 || stride < width * 4 || pixels.Length < stride * height)
@@ -55,7 +58,7 @@ public static class SealRingOcr
             if (!TryMeasure(pixels, width, height, stride, x0, y0, x1, y1, out Ellipse ellipse))
                 continue;
             found.Add(IsRing(pixels, width, height, stride, ellipse)
-                ? Unwrap(pixels, width, height, stride, ellipse)
+                ? Unwrap(pixels, width, height, stride, ellipse, maxStripSide)
                 : CropSolid(pixels, width, height, stride, ellipse));
         }
 
@@ -251,7 +254,8 @@ public static class SealRingOcr
         int width,
         int height,
         int stride,
-        Ellipse ellipse)
+        Ellipse ellipse,
+        int maxStripSide)
     {
         int columns = Math.Clamp((int)Math.Round(2 * Math.PI * ((ellipse.Rx + ellipse.Ry) / 2.0)), 32, 4096);
         int rows = Math.Clamp((int)Math.Round((RingOuter - RingInner) * Math.Min(ellipse.Rx, ellipse.Ry)), 12, 512);
@@ -263,11 +267,32 @@ public static class SealRingOcr
             columns = Math.Clamp((int)Math.Round(columns * scale), 32, 4096);
         }
 
+        FitStrip(ref columns, ref rows, maxStripSide);
+
         SealImage primary = SampleRing(pixels, width, height, stride, ellipse, columns, rows);
         SealImage reversed = FlipHorizontal(primary);
         SealImage headsIn = FlipVertical(primary);
         SealImage headsInReversed = FlipHorizontal(headsIn);
         return new SealCapture(primary, reversed, headsIn, headsInReversed);
+    }
+
+    /// <summary>
+    /// Shrinks the sample grid so the padded strip's long side stays within the detector limit.
+    /// Sampling once at that size avoids a second downsample inside SimdPaddleOCR.
+    /// </summary>
+    private static void FitStrip(ref int columns, ref int rows, int maxStripSide)
+    {
+        int cap = maxStripSide <= 0 ? 4096 : Math.Clamp(maxStripSide, 64, 4096);
+        if (Math.Max(columns, rows) + (Pad * 2) <= cap)
+            return;
+        int inner = Math.Max(32, cap - (Pad * 2));
+        double scale = (double)inner / Math.Max(columns, rows);
+        columns = Math.Max(32, (int)Math.Round(columns * scale));
+        rows = Math.Max(12, (int)Math.Round(rows * scale));
+        while (Math.Max(columns, rows) + (Pad * 2) > cap && columns > 32)
+            columns--;
+        while (Math.Max(columns, rows) + (Pad * 2) > cap && rows > 12)
+            rows--;
     }
 
     private static SealImage SampleRing(

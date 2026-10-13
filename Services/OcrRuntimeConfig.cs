@@ -32,12 +32,39 @@ public sealed class OcrRuntimeConfig
     /// </summary>
     public bool SealOcr { get; init; }
     /// <summary>
+    /// Raster DPI floor while <see cref="SealOcr"/> is on in local mode. <c>0</c> follows the page DPI.
+    /// </summary>
+    public int SealDpi { get; init; }
+    /// <summary>
+    /// Requested long-side cap for an unwrapped seal strip. <c>0</c> uses <see cref="DetLimitSideLength"/>.
+    /// </summary>
+    public int SealDetLimitSide { get; init; }
+    /// <summary>
     /// Erase red seal ink before body OCR. Off when <see cref="SealOcr"/> is on, even if
     /// <see cref="RemoveRedSeal"/> is still true in the file.
     /// </summary>
     public bool EraseRedSealInk => RemoveRedSeal && !SealOcr;
     /// <summary>Color raster: seal removal or seal OCR both need the red channel.</summary>
     public bool RasterKeepsRed => RemoveRedSeal || SealOcr;
+
+    /// <summary>
+    /// Long side of an unwrapped seal strip. Never above <see cref="DetLimitSideLength"/>:
+    /// SimdPaddleOCR bakes <c>LimitSideLength</c> into the engine at load, and a wider
+    /// strip is shrunk before detection.
+    /// </summary>
+    public int SealStripLongSide =>
+        Math.Min(SealDetLimitSide > 0 ? SealDetLimitSide : DetLimitSideLength, Math.Max(64, DetLimitSideLength));
+
+    /// <summary>
+    /// Page raster DPI. Local mode with seal OCR and <see cref="SealDpi"/> set uses the higher of the two.
+    /// Other modes keep <paramref name="requestedDpi"/> so a seal flag does not enlarge vision or WeChat pages.
+    /// </summary>
+    public int SealRasterDpi(int requestedDpi)
+    {
+        if (!SealOcr || IsLlmMode || IsWeChatMode || SealDpi <= 0)
+            return requestedDpi;
+        return Math.Clamp(Math.Max(requestedDpi, SealDpi), 36, 300);
+    }
     /// <summary>
     /// PDFium smoothing for raster: <c>all</c> (default), <c>none</c>, or a comma list of
     /// <c>text</c>, <c>images</c>, <c>paths</c>. <c>MINIOCR_RENDER_ANTIALIAS</c> overrides the file.
@@ -134,6 +161,12 @@ public sealed class OcrRuntimeConfig
             ocr.RemoveRedSeal,
             ocr.RedSealMode);
         bool sealOcr = ReadBool("MINIOCR_SEAL_OCR", ocr.SealOcr);
+        int sealDpi = ResolveInt("MINIOCR_SEAL_DPI", ocr.SealDpi, 0, autoScale: true, fixedFallback: 0);
+        if (sealDpi != 0)
+            sealDpi = Math.Clamp(sealDpi, 36, 300);
+        int sealDet = ResolveInt("MINIOCR_SEAL_DET_LIMIT_SIDE", ocr.SealDetLimitSide, 0, autoScale: true, fixedFallback: 0);
+        if (sealDet != 0)
+            sealDet = Math.Clamp(sealDet, 64, 4096);
         string antiAliasing = CanonicalAntiAliasing(FirstSet(
             Environment.GetEnvironmentVariable("MINIOCR_RENDER_ANTIALIAS"),
             ocr.AntiAliasing));
@@ -184,6 +217,12 @@ public sealed class OcrRuntimeConfig
             ResolveInt("MINIOCR_DET_LIMIT_SIDE", ocr.DetLimitSide, DefaultDetLimitSide(dpi), autoScale: true, fixedFallback: DefaultDetLimitSide(dpi)),
             64,
             4096);
+        // A higher seal DPI renders the whole page larger. Raise the detector cap with it
+        // unless the operator already set one, so body text is not shrunk back to 960.
+        bool detLimitExplicit = Environment.GetEnvironmentVariable("MINIOCR_DET_LIMIT_SIDE") is not null
+            || ocr.DetLimitSide is not null;
+        if (sealOcr && string.Equals(mode, "local", StringComparison.Ordinal) && sealDpi > dpi && !detLimitExplicit)
+            detLimit = Math.Clamp(Math.Max(detLimit, DefaultDetLimitSide(sealDpi)), 64, 4096);
         // 1 keeps a pool of engines from each claiming the whole CPU. 0 is the library's auto budget.
         int recIntra = Math.Clamp(
             ReadInt("MINIOCR_REC_INTRA_OP_THREADS", ocr.RecIntraOpThreads ?? 1),
@@ -246,6 +285,8 @@ public sealed class OcrRuntimeConfig
             RemoveRedSeal = removeRedSeal,
             RedSealAllInk = redSealAllInk,
             SealOcr = sealOcr,
+            SealDpi = sealDpi,
+            SealDetLimitSide = sealDet,
             AntiAliasing = antiAliasing,
             RasterWorkerCount = raster,
             RenderMode = renderMode,
@@ -367,6 +408,8 @@ public sealed class OcrRuntimeConfig
         RemoveRedSeal = RemoveRedSeal,
         RedSealAllInk = RedSealAllInk,
         SealOcr = SealOcr,
+        SealDpi = SealDpi,
+        SealDetLimitSide = SealDetLimitSide,
         AntiAliasing = AntiAliasing,
         RasterWorkerCount = RasterWorkerCount,
         RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),
