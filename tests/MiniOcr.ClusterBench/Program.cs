@@ -72,9 +72,14 @@ static async Task<BenchReport> RunScenarioAsync(string mode, string sourceUrl)
     try
     {
         await WaitHealthAsync(coord + "/health", TimeSpan.FromSeconds(15));
-        using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(20) };
+        using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(45) };
         using HttpResponseMessage start = await http.PostAsync(coord + "/start", new StringContent(""));
-        start.EnsureSuccessStatusCode();
+        if (!start.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException(
+                mode + " /start returned " + (int)start.StatusCode
+                + "\ncoord: " + coordErr + "\nfast: " + fastErr + "\nslow: " + slowErr);
+        }
         string? line = await ReadBenchLineAsync(coordinator, TimeSpan.FromSeconds(40));
         if (line is null)
         {
@@ -214,7 +219,7 @@ static async Task HandleAsync(HttpListenerContext ctx, JobState job, byte[] pdf)
 
         if (path == "/start")
         {
-            if (!await job.WaitForWorkersAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false))
+            if (!await job.WaitForWorkersAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false))
             {
                 await WriteTextAsync(ctx, 503, "{\"ok\":false}");
                 return;
@@ -375,20 +380,40 @@ static async Task<int> WorkerAsync(string[] args)
     int delay = int.Parse(Arg(args, "--delay") ?? "20");
     using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(30) };
     string? source = null;
-    for (int i = 0; i < 400; i++)
+    var dispatchWait = Stopwatch.StartNew();
+    while (dispatchWait.Elapsed < TimeSpan.FromSeconds(35))
     {
-        using HttpResponseMessage resp = await http.PostAsync(
-            coord + "/dispatch",
-            new StringContent("{\"node\":" + JsonQuoted(id) + "}", Encoding.UTF8, "application/json"));
-        using JsonDocument doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
-        if (doc.RootElement.TryGetProperty("wait", out JsonElement wait) && wait.GetBoolean())
+        try
+        {
+            using HttpResponseMessage resp = await http.PostAsync(
+                coord + "/dispatch",
+                new StringContent("{\"node\":" + JsonQuoted(id) + "}", Encoding.UTF8, "application/json"));
+            if (!resp.IsSuccessStatusCode)
+            {
+                await Task.Delay(50);
+                continue;
+            }
+
+            using JsonDocument doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            if (doc.RootElement.TryGetProperty("wait", out JsonElement wait) && wait.GetBoolean())
+            {
+                await Task.Delay(50);
+                continue;
+            }
+
+            source = doc.RootElement.GetProperty("sourceUrl").GetString();
+            break;
+        }
+        catch (HttpRequestException)
+        {
+            // The coordinator listener may not be up yet. The first failure used to
+            // kill the worker, so /start waited out its timeout and returned 503.
+            await Task.Delay(50);
+        }
+        catch (TaskCanceledException)
         {
             await Task.Delay(50);
-            continue;
         }
-
-        source = doc.RootElement.GetProperty("sourceUrl").GetString();
-        break;
     }
 
     if (string.IsNullOrWhiteSpace(source))
