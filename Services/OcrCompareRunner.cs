@@ -92,13 +92,13 @@ public static class OcrCompareRunner
                 if (!enumerator.MoveNext())
                     throw new InvalidOperationException($"PDFtoImage did not yield page {i + 1}.");
                 using SKBitmap bitmap = enumerator.Current;
-                if (config.RemoveRedSeal)
+                if (config.EraseRedSealInk)
                     RedSealFilter.Apply(bitmap, config.RedSealAllInk ? 0 : RedSealFilter.MinSealSideForDpi(dpi));
 
                 PageRow row = new() { Page = i + 1, Width = bitmap.Width, Height = bitmap.Height };
                 row.WeChat = await TimeAsync(() => wechat.RecognizeBitmapAsync(bitmap, CancellationToken.None))
                     .ConfigureAwait(false);
-                row.Local = await TimeAsync(() => RecognizeLocalAsync(local, bitmap, CancellationToken.None))
+                row.Local = await TimeAsync(() => RecognizeLocalAsync(local, bitmap, config, dpi, CancellationToken.None))
                     .ConfigureAwait(false);
                 rows.Add(row);
                 Console.WriteLine(
@@ -144,31 +144,83 @@ public static class OcrCompareRunner
         }
     }
 
-    private static async Task<string> RecognizeLocalAsync(OcrEngine engine, SKBitmap bitmap, CancellationToken ct)
+    private static async Task<string> RecognizeLocalAsync(
+        OcrEngine engine,
+        SKBitmap bitmap,
+        OcrRuntimeConfig config,
+        int dpi,
+        CancellationToken ct)
     {
         EnsureBgra(bitmap, out SKBitmap working, out bool owned);
         try
         {
-            int width = working.Width;
-            int height = working.Height;
-            int stride = working.RowBytes;
-            IntPtr pixels = working.GetPixels();
-            int byteCount = stride * height;
-            Sdcb.SimdPaddleOCR.PaddleOcrResult result = await engine.UseAsync(ocr =>
+            List<SealRingOcr.SealCapture> seals = [];
+            if (config.SealOcr)
             {
-                unsafe
+                int stride = working.RowBytes;
+                int byteCount = stride * working.Height;
+                IntPtr ptr = working.GetPixels();
+                if (ptr != IntPtr.Zero && byteCount > 0 && working.ColorType == SKColorType.Bgra8888)
                 {
-                    ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
-                    return ocr.Run(span, width, height, stride, Sdcb.SimdPaddleOCR.ImagePixelFormat.Bgra32);
+                    unsafe
+                    {
+                        ReadOnlySpan<byte> span = new((void*)ptr, byteCount);
+                        seals = SealRingOcr.Capture(
+                            span,
+                            working.Width,
+                            working.Height,
+                            stride,
+                            RedSealFilter.MinSealSideForDpi(dpi));
+                    }
                 }
-            }, ct).ConfigureAwait(false);
-            return result.Text?.Replace("\r", "").Trim() ?? "";
+            }
+
+            string body = await RunEngineAsync(engine, working, ct).ConfigureAwait(false);
+            if (seals.Count == 0)
+                return body;
+            string sealText = await SealOcrPass.ReadAsync(
+                seals,
+                (image, token) => RunEngineAsync(engine, image, token),
+                ct).ConfigureAwait(false);
+            return SealRingOcr.MergePageText(body, sealText);
         }
         finally
         {
             if (owned)
                 working.Dispose();
         }
+    }
+
+    private static async Task<string> RunEngineAsync(OcrEngine engine, SKBitmap bitmap, CancellationToken ct)
+    {
+        int width = bitmap.Width;
+        int height = bitmap.Height;
+        int stride = bitmap.RowBytes;
+        IntPtr pixels = bitmap.GetPixels();
+        int byteCount = stride * height;
+        Sdcb.SimdPaddleOCR.PaddleOcrResult result = await engine.UseAsync(ocr =>
+        {
+            unsafe
+            {
+                ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
+                return ocr.Run(span, width, height, stride, Sdcb.SimdPaddleOCR.ImagePixelFormat.Bgra32);
+            }
+        }, ct).ConfigureAwait(false);
+        return result.Text?.Replace("\r", "").Trim() ?? "";
+    }
+
+    private static async Task<string> RunEngineAsync(OcrEngine engine, SealRingOcr.SealImage image, CancellationToken ct)
+    {
+        if (image.IsEmpty)
+            return "";
+        byte[] bgra = image.Bgra;
+        int width = image.Width;
+        int height = image.Height;
+        int stride = image.Stride;
+        Sdcb.SimdPaddleOCR.PaddleOcrResult result = await engine.UseAsync(
+            ocr => ocr.Run(bgra, width, height, stride, Sdcb.SimdPaddleOCR.ImagePixelFormat.Bgra32),
+            ct).ConfigureAwait(false);
+        return result.Text?.Replace("\r", "").Trim() ?? "";
     }
 
     private static void EnsureBgra(SKBitmap source, out SKBitmap working, out bool owned)

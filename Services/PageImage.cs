@@ -31,6 +31,9 @@ internal sealed class PageImage : IDisposable
     public int Width { get; }
     public int Height { get; }
 
+    /// <summary>Raster DPI, used to size seal blobs. Zero means the caller did not set it.</summary>
+    public int Dpi { get; set; }
+
     public PdfPixels? Pixels => _pixels;
 
     public static PageImage FromPixels(PdfPixels pixels) => new(pixels, null);

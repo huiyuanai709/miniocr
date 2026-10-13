@@ -254,6 +254,10 @@ Assert(redOff?.Ocr?.RemoveRedSeal == false, "config json removeRedSeal false");
 AppConfigFile? redOmitted = JsonSerializer.Deserialize(
     """{"ocr":{"mode":"local"}}""", AppJsonContext.Default.AppConfigFile);
 Assert(redOmitted?.Ocr?.RemoveRedSeal == true, "omitted removeRedSeal stays true");
+Assert(redOmitted?.Ocr?.SealOcr == false, "omitted sealOcr stays false");
+AppConfigFile? sealOn = JsonSerializer.Deserialize(
+    """{"ocr":{"sealOcr":true}}""", AppJsonContext.Default.AppConfigFile);
+Assert(sealOn?.Ocr?.SealOcr == true && sealOn.Ocr.RemoveRedSeal, "json sealOcr true keeps removeRedSeal default");
 
 using SKBitmap grayPage = new(4, 4, SKColorType.Gray8, SKAlphaType.Opaque);
 Assert(RedSealFilter.Apply(grayPage) == 0, "Gray8 pages skip red-seal removal");

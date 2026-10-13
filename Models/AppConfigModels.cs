@@ -127,8 +127,16 @@ public sealed class OcrFileConfig
     /// <summary>
     /// <c>seal</c> (default) erases red only inside seal-shaped blobs, so red letterhead
     /// text is still recognised. <c>all</c> erases every saturated red pixel (old behaviour).
+    /// Ignored while <see cref="SealOcr"/> is on: the ink is kept for the seal pass.
     /// </summary>
     public string? RedSealMode { get; set; }
+
+    /// <summary>
+    /// Optional 公章 pass. Default false. When true, red seals are not erased.
+    /// In <c>local</c> mode the ring is polar-unwrapped and read with SimdPaddleOCR,
+    /// then that text is appended to the page before NER. Env <c>MINIOCR_SEAL_OCR</c>.
+    /// </summary>
+    public bool SealOcr { get; set; }
     /// <summary>
     /// <c>all</c> (default), <c>none</c>, or a comma list of <c>text</c>, <c>images</c>, <c>paths</c>.
     /// PDFium smoothing flags for raster. <c>none</c> samples scanned images nearest-neighbour,

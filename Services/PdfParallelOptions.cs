@@ -23,11 +23,11 @@ internal static class PdfParallelOptions
         PrewarmWorkers = true,
     };
 
-    public static RenderOptions CreateRenderOptions(int dpi, bool removeRedSeal) =>
-        CreateRenderOptions(dpi, removeRedSeal, PdfAntiAliasing.All);
+    public static RenderOptions CreateRenderOptions(int dpi, bool keepRedChannel) =>
+        CreateRenderOptions(dpi, keepRedChannel, PdfAntiAliasing.All);
 
     public static RenderOptions CreateRenderOptions(int dpi, OcrRuntimeConfig config) =>
-        CreateRenderOptions(dpi, config.RemoveRedSeal, AntiAliasingOf(config));
+        CreateRenderOptions(dpi, config.RasterKeepsRed, AntiAliasingOf(config));
 
     /// <summary>
     /// <c>None</c> maps to PDFium <c>RENDER_NO_SMOOTHIMAGE</c>, which samples a scanned page
@@ -43,18 +43,18 @@ internal static class PdfParallelOptions
         return flags;
     }
 
-    public static RenderOptions CreateRenderOptions(int dpi, bool removeRedSeal, PdfAntiAliasing antiAliasing) =>
+    public static RenderOptions CreateRenderOptions(int dpi, bool keepRedChannel, PdfAntiAliasing antiAliasing) =>
         new(
             Dpi: dpi,
             WithAnnotations: false,
             WithFormFill: false,
             AntiAliasing: antiAliasing,
-            // Red-seal removal needs the red channel. Gray8 cannot tell a seal from text.
-            Grayscale: !removeRedSeal)
+            // Seal removal and seal OCR both need the red channel. Gray8 cannot tell a seal from text.
+            Grayscale: !keepRedChannel)
         {
             // PDFium renders Gray8 when the switch is off. The parallel path reads those
             // bytes with no BGRA expand. Conversion.ToImages ignores NativeGrayscale, so
             // the in-process fallback stays a bitmap.
-            NativeGrayscale = !removeRedSeal,
+            NativeGrayscale = !keepRedChannel,
         };
 }

@@ -231,6 +231,7 @@ string? prevRenderMode = Environment.GetEnvironmentVariable("MINIOCR_RENDER_MODE
 string? prevRenderProcesses = Environment.GetEnvironmentVariable("MINIOCR_RENDER_PROCESSES");
 string? prevTextLayer = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
 string? prevRemoveRed = Environment.GetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL");
+string? prevSealOcr = Environment.GetEnvironmentVariable("MINIOCR_SEAL_OCR");
 string? prevRaster = Environment.GetEnvironmentVariable("MINIOCR_RASTER_WORKERS");
 try
 {
@@ -406,6 +407,31 @@ try
     AssertEqual("True", forcedOn.WithMode("llm").RemoveRedSeal.ToString(), "mode copy keeps removeRedSeal");
     Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", null);
 
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", null);
+    AssertEqual("False", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).SealOcr.ToString(), "sealOcr defaults off");
+    AssertEqual("True", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).EraseRedSealInk.ToString(), "default path still erases seals");
+    AssertEqual("False", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = true },
+    }).EraseRedSealInk.ToString(), "seal OCR keeps the ink");
+    AssertEqual("True", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = true, RemoveRedSeal = false },
+    }).RasterKeepsRed.ToString(), "seal OCR forces a color raster");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", "on");
+    OcrRuntimeConfig sealForced = OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = false },
+    });
+    AssertEqual("True", sealForced.SealOcr.ToString(), "env turns seal OCR on");
+    AssertEqual("True", sealForced.WithMode("llm").SealOcr.ToString(), "mode copy keeps seal OCR");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", "0");
+    AssertEqual("False", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealOcr = true },
+    }).SealOcr.ToString(), "env 0 turns seal OCR off");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", null);
+
     int cores = Math.Max(1, Environment.ProcessorCount);
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "llm");
     Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", null);
@@ -432,6 +458,7 @@ finally
     Environment.SetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER", prevTextLayer);
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
     Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", prevRemoveRed);
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", prevSealOcr);
     Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", prevRaster);
 }
 
@@ -489,6 +516,82 @@ Console.WriteLine("=== red seal filter ===");
     faded[3] = 128;
     AssertEqual("0", RedSealFilter.ApplyBgra(faded, 1, 1, 4).ToString(), "transparent red is left alone");
     AssertEqual("128", faded[3].ToString(), "alpha is unchanged");
+
+    Console.WriteLine("=== seal ring unwrap ===");
+    SealRingOcr.RingSample(0, 0, 360, 20, 100, 100, 40, 40, clockwise: true, out double bottomX, out double bottomY);
+    AssertTrue(Math.Abs(bottomX - 100) < 0.2 && bottomY > 140, "unwrap column 0 is the bottom of the ring");
+    SealRingOcr.RingSample(180, 0, 360, 20, 100, 100, 40, 40, clockwise: true, out double topX, out double topY);
+    AssertTrue(Math.Abs(topX - 100) < 0.2 && topY < 60, "unwrap midpoint is the top of the ring");
+
+    const int canvas = 160;
+    int canvasStride = canvas * 4;
+    byte[] ringPage = new byte[canvas * canvasStride];
+    for (int i = 0; i < ringPage.Length; i += 4)
+    {
+        ringPage[i] = 245;
+        ringPage[i + 1] = 245;
+        ringPage[i + 2] = 245;
+        ringPage[i + 3] = 255;
+    }
+
+    for (int y = 0; y < canvas; y++)
+    {
+        for (int x = 0; x < canvas; x++)
+        {
+            double dx = x - 80;
+            double dy = y - 80;
+            double dist = Math.Sqrt((dx * dx) + (dy * dy));
+            if ((dist >= 26 && dist <= 38) || dist <= 12)
+                SetPixel(ringPage, canvasStride, x, y, 30, 40, 220);
+        }
+    }
+
+    byte[] before = (byte[])ringPage.Clone();
+    List<SealRingOcr.SealCapture> rings = SealRingOcr.Capture(ringPage, canvas, canvas, canvasStride, minSealSidePx: 40);
+    AssertEqual("1", rings.Count.ToString(), "one ring seal is captured");
+    AssertTrue(ringPage.AsSpan().SequenceEqual(before), "capture leaves seal ink on the page");
+    AssertTrue(rings[0].Primary.Width > rings[0].Primary.Height * 3, "ring unwrap is a wide strip");
+    AssertTrue(CountBlack(rings[0].Primary) > 50, "unwrapped strip keeps the ring as dark text");
+    AssertTrue(!rings[0].Reversed.IsEmpty && !rings[0].HeadsIn.IsEmpty, "ring has alternate orientations");
+
+    byte[] squarePage = new byte[canvas * canvasStride];
+    for (int i = 0; i < squarePage.Length; i += 4)
+    {
+        squarePage[i] = 245;
+        squarePage[i + 1] = 245;
+        squarePage[i + 2] = 245;
+        squarePage[i + 3] = 255;
+    }
+
+    for (int y = 40; y < 110; y++)
+    {
+        for (int x = 40; x < 110; x++)
+            SetPixel(squarePage, canvasStride, x, y, 30, 40, 220);
+    }
+
+    List<SealRingOcr.SealCapture> squares = SealRingOcr.Capture(squarePage, canvas, canvas, canvasStride, minSealSidePx: 40);
+    AssertEqual("1", squares.Count.ToString(), "one square stamp is captured");
+    AssertTrue(squares[0].Primary.Width < squares[0].Primary.Height * 3, "square stamp is cropped, not unwrapped");
+    AssertTrue(squares[0].Reversed.IsEmpty, "square stamp has no ring alternate");
+
+    string merged = SealRingOcr.MergePageText("甲方：张伟", "北京华腾科技有限公司\n北京华腾科技有限公司");
+    AssertEqual("甲方：张伟\n北京华腾科技有限公司", merged, "seal text is appended once");
+    AssertEqual("甲方：北京华腾科技有限公司", SealRingOcr.MergePageText("甲方：北京华腾科技有限公司", "北京华腾科技有限公司"), "duplicate seal line is not appended");
+    AssertEqual("北京华腾科技有限公司", SealRingOcr.Prefer("章", "北京华腾科技有限公司", "公"), "prefer the reading with more CJK");
+    AssertTrue(SealRingOcr.Enough("北京华腾科技有限公司"), "a company name is enough to stop");
+    AssertTrue(!SealRingOcr.Enough("公司"), "two characters are not enough");
+
+    static int CountBlack(SealRingOcr.SealImage image)
+    {
+        int n = 0;
+        for (int i = 0; i < image.Bgra.Length; i += 4)
+        {
+            if (image.Bgra[i] == 0)
+                n++;
+        }
+
+        return n;
+    }
 
     static void SetPixel(byte[] buf, int rowStride, int x, int y, byte b, byte g, byte r)
     {
