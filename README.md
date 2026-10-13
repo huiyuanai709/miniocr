@@ -120,6 +120,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
     "renderProcesses": null,
     "useCls": false,
     "removeRedSeal": true,
+    "sealOcr": false,
     "backend": "cpu",
     "vulkanDevice": "",
     "recIntraOpThreads": 1,
@@ -155,7 +156,8 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_REC_BATCH` | — | 8 | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | `ocr.detLimitSide` | `max(960, DPI×10)` | 检测输入长边上限。随 DPI 走：96 → 960，144 → 1440，150 → 1500，这样提高 DPI 不会在检测前又被缩回 960 |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | false | 方向分类 |
-| `MINIOCR_REMOVE_RED_SEAL` | `ocr.removeRedSeal` + `ocr.redSealMode` | true（`seal`） | 彩色页在检测前去掉红章，换成页角纸色或白。默认 `seal`：在 1/4 分辨率的红色掩码上找连通块，只擦掉"像印章"的块（短边 ≥ 约 14 mm，长边 ≤ 2.5 × 短边），红头文件标题、红色条款号、红色签名仍会进入识别。`all` 恢复旧行为，擦掉所有饱和红。`0` / `false` / `off` 关闭，并回到 Gray8 渲染 |
+| `MINIOCR_REMOVE_RED_SEAL` | `ocr.removeRedSeal` + `ocr.redSealMode` | true（`seal`） | 彩色页在检测前去掉红章，换成页角纸色或白。默认 `seal`：在 1/4 分辨率的红色掩码上找连通块，只擦掉"像印章"的块（短边 ≥ 约 14 mm，长边 ≤ 2.5 × 短边），红头文件标题、红色条款号、红色签名仍会进入识别。`all` 恢复旧行为，擦掉所有饱和红。`0` / `false` / `off` 关闭，并回到 Gray8 渲染。`ocr.sealOcr` 打开时这一步不擦章 |
+| `MINIOCR_SEAL_OCR` | `ocr.sealOcr` | false | 可选公章识别。`1` / `true` / `on` 打开，默认关闭。打开后保留红章印泥（不再在识别前擦掉），并强制彩色渲染。`local` 模式检测印章色块，圆形章裁切后做极坐标展开，交给 SimdPaddleOCR，再把读到的文字追加到该页文本，随现有 NER 一起抽取。文本层已经采纳的页只补公章，不改正文。`llm` / `wechat` 没有本地引擎，不跑这一路，但开关打开时同样不擦章 |
 | `MINIOCR_RENDER_ANTIALIAS` | `ocr.antiAliasing` | `all` | PDFium 平滑开关：`all` / `none` / `text,images,paths` 的子集。`none` 对应 `RENDER_NO_SMOOTH*`：扫描件从 300 DPI 缩到 96–150 DPI 时按最近邻取样，细笔画会断。只在 CPU 极紧张时才设 `none` |
 | `MINIOCR_OCR_BACKEND` | `ocr.backend` | `cpu` | `cpu` / `auto` / `vulkan` / `metal`。`metal` 仅 macOS |
 | `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空 | 设备序号或名称子串 |

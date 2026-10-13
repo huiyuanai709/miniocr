@@ -27,6 +27,18 @@ public sealed class OcrRuntimeConfig
     /// </summary>
     public bool RedSealAllInk { get; init; }
     /// <summary>
+    /// Optional seal OCR. Default false. While this is on, <see cref="EraseRedSealInk"/> is false
+    /// so the stamp stays on the page. Local mode then unwraps the ring and reads it.
+    /// </summary>
+    public bool SealOcr { get; init; }
+    /// <summary>
+    /// Erase red seal ink before body OCR. Off when <see cref="SealOcr"/> is on, even if
+    /// <see cref="RemoveRedSeal"/> is still true in the file.
+    /// </summary>
+    public bool EraseRedSealInk => RemoveRedSeal && !SealOcr;
+    /// <summary>Color raster: seal removal or seal OCR both need the red channel.</summary>
+    public bool RasterKeepsRed => RemoveRedSeal || SealOcr;
+    /// <summary>
     /// PDFium smoothing for raster: <c>all</c> (default), <c>none</c>, or a comma list of
     /// <c>text</c>, <c>images</c>, <c>paths</c>. <c>MINIOCR_RENDER_ANTIALIAS</c> overrides the file.
     /// </summary>
@@ -121,6 +133,7 @@ public sealed class OcrRuntimeConfig
             Environment.GetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL"),
             ocr.RemoveRedSeal,
             ocr.RedSealMode);
+        bool sealOcr = ReadBool("MINIOCR_SEAL_OCR", ocr.SealOcr);
         string antiAliasing = CanonicalAntiAliasing(FirstSet(
             Environment.GetEnvironmentVariable("MINIOCR_RENDER_ANTIALIAS"),
             ocr.AntiAliasing));
@@ -232,6 +245,7 @@ public sealed class OcrRuntimeConfig
             UseDirectionClassification = useCls,
             RemoveRedSeal = removeRedSeal,
             RedSealAllInk = redSealAllInk,
+            SealOcr = sealOcr,
             AntiAliasing = antiAliasing,
             RasterWorkerCount = raster,
             RenderMode = renderMode,
@@ -352,6 +366,7 @@ public sealed class OcrRuntimeConfig
         UseDirectionClassification = UseDirectionClassification,
         RemoveRedSeal = RemoveRedSeal,
         RedSealAllInk = RedSealAllInk,
+        SealOcr = SealOcr,
         AntiAliasing = AntiAliasing,
         RasterWorkerCount = RasterWorkerCount,
         RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),

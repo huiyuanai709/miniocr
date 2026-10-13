@@ -171,11 +171,16 @@ Console.WriteLine(
     $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"backend={runtimeConfig.Backend}, lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"recIntraOpThreads={runtimeConfig.RecIntraOpThreads}, recBatch={runtimeConfig.RecBatchLines}, " +
-    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, antiAlias={runtimeConfig.AntiAliasing}, " +
+    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, sealOcr={runtimeConfig.SealOcr}, antiAlias={runtimeConfig.AntiAliasing}, " +
     $"detLimitSide={runtimeConfig.DetLimitSideLength}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
     $"renderMode={runtimeConfig.RenderMode}, renderProcesses={runtimeConfig.RenderProcessCount}, " +
     $"textLayer={runtimeConfig.TextLayer}, " +
     $"wechatInstances={runtimeConfig.WeChatInstances}, wechatStatus={wechatStatus}");
+if (runtimeConfig.SealOcr && !string.Equals(runtimeConfig.Mode, "local", StringComparison.Ordinal))
+{
+    Console.WriteLine(
+        "sealOcr is on, but the SimdPaddleOCR seal pass runs only in ocr.mode=local. Red-seal erasure is still skipped.");
+}
 Console.WriteLine(
     $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
@@ -436,6 +441,7 @@ app.MapGet("/health", (IServiceProvider sp) =>
             DefaultDpi = cfg.DefaultDpi,
             UseDirectionClassification = cfg.UseDirectionClassification,
             RemoveRedSeal = cfg.RemoveRedSeal,
+            SealOcr = cfg.SealOcr,
             AntiAliasing = cfg.AntiAliasing,
             RasterWorkerCount = cfg.RasterWorkerCount,
             RenderMode = cfg.RenderMode,

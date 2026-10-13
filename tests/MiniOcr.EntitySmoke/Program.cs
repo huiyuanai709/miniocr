@@ -294,6 +294,16 @@ AssertTrue(secondReady.Count == 1 && secondReady[0].PageNumbers is [4, 5], "next
 AssertTrue(buffer.FlushRemainder().Count == 0, "no trailing partial group");
 AssertTrue(buffer.NonEmptyPages.Select(p => p.Page).SequenceEqual([1, 2, 4, 5]), "non-empty pages recorded in order");
 
+Console.WriteLine("=== seal text in NER ===");
+string sealedPage = SealRingOcr.MergePageText("法定代表人：张伟", "北京华腾科技有限公司");
+OcrEntities fromSeal = EntityExtractor.ExtractFromPages([sealedPage]);
+AssertContains(fromSeal.Companies, "北京华腾科技有限公司", "seal line is a company entity");
+AssertContains(fromSeal.Persons, "张伟", "body person still extracts beside the seal");
+OcrPageResult sealNerPage = new() { Page = 3, Text = sealedPage };
+AssertTrue(
+    LlmPageGrouper.FormatPage(sealNerPage).Contains("北京华腾科技有限公司", StringComparison.Ordinal),
+    "seal line is in the NER page text");
+
 Console.WriteLine();
 if (failed == 0)
 {

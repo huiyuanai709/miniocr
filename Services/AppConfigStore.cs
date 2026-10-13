@@ -489,6 +489,7 @@ public static class AppConfigStore
             "textLayer": "auto",
             "useCls": false,
             "removeRedSeal": true,
+            "sealOcr": false,
             "backend": "cpu",
             "vulkanDevice": "",
             "recIntraOpThreads": 1,
