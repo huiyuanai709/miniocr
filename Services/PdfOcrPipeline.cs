@@ -19,6 +19,7 @@ public readonly record struct PdfOcrRun(Task OcrCompleted, Task<OcrResponse> Res
 public sealed class PdfOcrPipeline : IAsyncDisposable
 {
     private readonly OcrEngine? _engine;
+    private readonly SealOcrEngine? _seal;
     private readonly WeChatOcrEngine? _wechat;
     private readonly ILogger<PdfOcrPipeline> _logger;
     private readonly LlmEntityExtractor? _llm;
@@ -43,11 +44,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         LlmVisionOcr? vision = null,
         WeChatOcrEngine? wechat = null,
         ClusterCoordinator? cluster = null,
-        ParallelPdfProcessor? parallelRenderer = null)
+        ParallelPdfProcessor? parallelRenderer = null,
+        SealOcrEngine? seal = null)
     {
         _config = config;
         _logger = logger;
         _engine = engine;
+        _seal = seal;
         _wechat = wechat;
         _llm = llm;
         _vision = vision;
@@ -429,11 +432,10 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
     private async Task<string> RecognizeLocalAsync(PageImage image, CancellationToken ct)
     {
-        List<SealRingOcr.SealCapture> seals = SealPassEnabled ? CaptureSeals(image) : [];
         string body = await RecognizeBodyAsync(image, ct).ConfigureAwait(false);
-        if (seals.Count == 0)
+        if (!SealPassEnabled)
             return body;
-        string sealText = await ReadSealsAsync(seals, ct).ConfigureAwait(false);
+        string sealText = await ReadPageSealTextAsync(image, ct).ConfigureAwait(false);
         return SealRingOcr.MergePageText(body, sealText);
     }
 
@@ -602,7 +604,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     int height = bitmap.Height;
                     if (sealOnly is not null && sealOnly.Contains(index) && pages[index] is { } prepared)
                     {
-                        string seals = await ReadSealsAsync(CaptureSeals(bitmap), ct).ConfigureAwait(false);
+                        string seals = await ReadPageSealTextAsync(bitmap, ct).ConfigureAwait(false);
                         ocrSw.Stop();
                         prepared.Text = SealRingOcr.MergePageText(prepared.Text, seals);
                         prepared.Width = width;
@@ -1907,16 +1909,37 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         ct.ThrowIfCancellationRequested();
         RenderOptions options = CreateRenderOptions(dpi);
         using MemoryStream local = new(pdfBytes, 0, pdfLength, writable: false, publiclyVisible: true);
-        List<SealRingOcr.SealCapture> seals = [];
         foreach (SKBitmap page in Conversion.ToImages(local, [pageIndex], leaveOpen: true, options: options))
         {
             using PageImage image = PageImage.FromBitmap(page);
             image.Dpi = dpi;
-            seals = CaptureSeals(image);
-            break;
+            return await ReadPageSealTextAsync(image, ct).ConfigureAwait(false);
         }
 
-        return await ReadSealsAsync(seals, ct).ConfigureAwait(false);
+        return "";
+    }
+
+    /// <summary>
+    /// Prefer <see cref="PaddleOcrSealAll"/> on the color page. If those models did not
+    /// load, keep the red-blob polar unwrap.
+    /// </summary>
+    private async Task<string> ReadPageSealTextAsync(PageImage image, CancellationToken ct)
+    {
+        if (_seal is { IsLoaded: true })
+        {
+            string text = await _seal.ReadAsync(image, ct).ConfigureAwait(false);
+            if (text.Length > 0)
+            {
+                _logger.LogInformation(
+                    "Seal OCR (PaddleOcrSealAll/{Model}) merged {Chars} chars",
+                    _seal.Model,
+                    text.Length);
+            }
+
+            return text;
+        }
+
+        return await ReadSealsAsync(CaptureSeals(image), ct).ConfigureAwait(false);
     }
 
     private static void PlacePrepared(

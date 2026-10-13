@@ -171,7 +171,7 @@ Console.WriteLine(
     $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"backend={runtimeConfig.Backend}, lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"recIntraOpThreads={runtimeConfig.RecIntraOpThreads}, recBatch={runtimeConfig.RecBatchLines}, " +
-    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, sealOcr={runtimeConfig.SealOcr}, antiAlias={runtimeConfig.AntiAliasing}, " +
+    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, sealOcr={runtimeConfig.SealOcr}, sealModel={runtimeConfig.SealModel}, antiAlias={runtimeConfig.AntiAliasing}, " +
     $"detLimitSide={runtimeConfig.DetLimitSideLength}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
     $"renderMode={runtimeConfig.RenderMode}, renderProcesses={runtimeConfig.RenderProcessCount}, " +
     $"textLayer={runtimeConfig.TextLayer}, " +
@@ -191,6 +191,7 @@ Console.WriteLine(
     $"thinking={llmConfig.Thinking}, fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
 
 OcrEngine? engine = null;
+SealOcrEngine? sealEngine = null;
 if (llmOcrMode)
 {
     Console.WriteLine($"Skipping {ClusterRuntimeConfig.LocalModelName} / PaddleOcrAll — ocr.mode=llm (vision OCR).");
@@ -209,6 +210,16 @@ else
     if (engine.EngineCount != runtimeConfig.EngineCount)
         runtimeConfig = runtimeConfig.With(engineCount: engine.EngineCount);
     Console.WriteLine($"OCR backend requested={runtimeConfig.Backend} effective={engine.EffectiveBackend}");
+    if (runtimeConfig.SealOcr)
+    {
+        sealEngine = await SealOcrEngine.CreateAsync(
+            bootstrapLogs.CreateLogger<SealOcrEngine>(),
+            runtimeConfig,
+            engine.EffectiveBackend);
+        Console.WriteLine(sealEngine.IsLoaded
+            ? $"Seal OCR: PaddleOcrSealAll model={sealEngine.Model} engines={sealEngine.EngineCount}"
+            : $"Seal OCR: {sealEngine.Model} models unavailable; using red-blob polar unwrap.");
+    }
     if (engine.EffectiveBackend == "metal" && !string.IsNullOrEmpty(engine.GpuDeviceName))
     {
         Console.WriteLine(
@@ -247,6 +258,8 @@ else
 }
 if (engine is not null)
     builder.Services.AddSingleton(engine);
+if (sealEngine is not null)
+    builder.Services.AddSingleton(sealEngine);
 if (wechatEngine is not null)
     builder.Services.AddSingleton(wechatEngine);
 
@@ -382,7 +395,8 @@ builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
         vision: sp.GetService<LlmVisionOcr>(),
         wechat: sp.GetService<WeChatOcrEngine>(),
         cluster: sp.GetService<ClusterCoordinator>(),
-        parallelRenderer: parallelRenderer);
+        parallelRenderer: parallelRenderer,
+        seal: sealEngine);
 });
 if (clusterConfig.Enabled)
 {
@@ -419,6 +433,7 @@ lifetime.ApplicationStopping.Register(() =>
         pipeline.DisposeAsync().AsTask().GetAwaiter().GetResult();
     if (engine is not null)
         engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    sealEngine?.Dispose();
     if (wechatEngine is not null)
         wechatEngine.DisposeAsync().AsTask().GetAwaiter().GetResult();
 });
@@ -442,6 +457,8 @@ app.MapGet("/health", (IServiceProvider sp) =>
             UseDirectionClassification = cfg.UseDirectionClassification,
             RemoveRedSeal = cfg.RemoveRedSeal,
             SealOcr = cfg.SealOcr,
+            SealModel = cfg.SealOcr ? (sp.GetService<SealOcrEngine>()?.Model ?? cfg.SealModel) : "",
+            SealApi = sp.GetService<SealOcrEngine>()?.IsLoaded ?? false,
             AntiAliasing = cfg.AntiAliasing,
             RasterWorkerCount = cfg.RasterWorkerCount,
             RenderMode = cfg.RenderMode,

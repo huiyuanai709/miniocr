@@ -28,9 +28,16 @@ public sealed class OcrRuntimeConfig
     public bool RedSealAllInk { get; init; }
     /// <summary>
     /// Optional seal OCR. Default false. While this is on, <see cref="EraseRedSealInk"/> is false
-    /// so the stamp stays on the page. Local mode then unwraps the ring and reads it.
+    /// so the stamp stays on the page. Local mode runs <c>PaddleOcrSealAll</c> when the
+    /// seal detector and ChineseV6Medium recognizer open, and otherwise falls back to
+    /// red-blob detection plus polar unwrap.
     /// </summary>
     public bool SealOcr { get; init; }
+    /// <summary>
+    /// Seal detector used by <c>PaddleOcrSealAll</c>: <c>mobile</c> (SealV4Mobile, default)
+    /// or <c>server</c> (SealV4Server). Env <c>MINIOCR_SEAL_MODEL</c> wins over the file.
+    /// </summary>
+    public string SealModel { get; init; } = "mobile";
     /// <summary>
     /// Erase red seal ink before body OCR. Off when <see cref="SealOcr"/> is on, even if
     /// <see cref="RemoveRedSeal"/> is still true in the file.
@@ -134,6 +141,9 @@ public sealed class OcrRuntimeConfig
             ocr.RemoveRedSeal,
             ocr.RedSealMode);
         bool sealOcr = ReadBool("MINIOCR_SEAL_OCR", ocr.SealOcr);
+        string sealModel = CanonicalSealModel(FirstSet(
+            Environment.GetEnvironmentVariable("MINIOCR_SEAL_MODEL"),
+            ocr.SealModel));
         string antiAliasing = CanonicalAntiAliasing(FirstSet(
             Environment.GetEnvironmentVariable("MINIOCR_RENDER_ANTIALIAS"),
             ocr.AntiAliasing));
@@ -246,6 +256,7 @@ public sealed class OcrRuntimeConfig
             RemoveRedSeal = removeRedSeal,
             RedSealAllInk = redSealAllInk,
             SealOcr = sealOcr,
+            SealModel = sealModel,
             AntiAliasing = antiAliasing,
             RasterWorkerCount = raster,
             RenderMode = renderMode,
@@ -367,6 +378,7 @@ public sealed class OcrRuntimeConfig
         RemoveRedSeal = RemoveRedSeal,
         RedSealAllInk = RedSealAllInk,
         SealOcr = SealOcr,
+        SealModel = SealModel,
         AntiAliasing = AntiAliasing,
         RasterWorkerCount = RasterWorkerCount,
         RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),
@@ -464,6 +476,21 @@ public sealed class OcrRuntimeConfig
     /// </summary>
     public static string BackendForHost(string backend) =>
         backend == "metal" && !OperatingSystem.IsMacOS() ? "cpu" : backend;
+
+    /// <summary>
+    /// <c>mobile</c> (default) or <c>server</c>. Unknown values stay on the smaller SealV4Mobile detector.
+    /// </summary>
+    public static string CanonicalSealModel(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return "mobile";
+        string text = raw.Trim();
+        if (text.Equals("server", StringComparison.OrdinalIgnoreCase)
+            || text.Equals("sealv4server", StringComparison.OrdinalIgnoreCase)
+            || text.Equals("v4-server", StringComparison.OrdinalIgnoreCase))
+            return "server";
+        return "mobile";
+    }
 
     /// <summary>
     /// <c>MINIOCR_REMOVE_RED_SEAL</c>: <c>0</c>/<c>off</c>/<c>false</c> disables the filter,

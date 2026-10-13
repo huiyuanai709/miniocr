@@ -121,6 +121,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
     "useCls": false,
     "removeRedSeal": true,
     "sealOcr": false,
+    "sealModel": "mobile",
     "backend": "cpu",
     "vulkanDevice": "",
     "recIntraOpThreads": 1,
@@ -157,7 +158,8 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_DET_LIMIT_SIDE` | `ocr.detLimitSide` | `max(960, DPI×10)` | 检测输入长边上限。随 DPI 走：96 → 960，144 → 1440，150 → 1500，这样提高 DPI 不会在检测前又被缩回 960 |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | false | 方向分类 |
 | `MINIOCR_REMOVE_RED_SEAL` | `ocr.removeRedSeal` + `ocr.redSealMode` | true（`seal`） | 彩色页在检测前去掉红章，换成页角纸色或白。默认 `seal`：在 1/4 分辨率的红色掩码上找连通块，只擦掉"像印章"的块（短边 ≥ 约 14 mm，长边 ≤ 2.5 × 短边），红头文件标题、红色条款号、红色签名仍会进入识别。`all` 恢复旧行为，擦掉所有饱和红。`0` / `false` / `off` 关闭，并回到 Gray8 渲染。`ocr.sealOcr` 打开时这一步不擦章 |
-| `MINIOCR_SEAL_OCR` | `ocr.sealOcr` | false | 可选公章识别。`1` / `true` / `on` 打开，默认关闭。打开后保留红章印泥（不再在识别前擦掉），并强制彩色渲染。`local` 模式检测印章色块，圆形章裁切后做极坐标展开，交给 SimdPaddleOCR，再把读到的文字追加到该页文本，随现有 NER 一起抽取。文本层已经采纳的页只补公章，不改正文。`llm` / `wechat` 没有本地引擎，不跑这一路，但开关打开时同样不擦章 |
+| `MINIOCR_SEAL_OCR` | `ocr.sealOcr` | false | 可选公章识别。`1` / `true` / `on` 打开，默认关闭。打开后保留红章印泥（不再在识别前擦掉），并强制彩色渲染。`local` 模式在模型能打开时走 `PaddleOcrSealAll`（检测 + 环排拉直 + ChineseV6Medium 识别），把读到的文字追加到该页文本，随现有 NER 一起抽取。模型打不开时退回红章色块 + 极坐标展开。文本层已经采纳的页只补公章，不改正文。`llm` / `wechat` 没有本地引擎，不跑这一路，但开关打开时同样不擦章 |
+| `MINIOCR_SEAL_MODEL` | `ocr.sealModel` | `mobile` | 公章检测模型。`mobile` 用 SealV4Mobile（默认，体积小）。`server` 用 SealV4Server。两者都从 fork 的 `ProjectReference` 嵌入，不从 NuGet 拉包。未识别的值按 `mobile` |
 | `MINIOCR_RENDER_ANTIALIAS` | `ocr.antiAliasing` | `all` | PDFium 平滑开关：`all` / `none` / `text,images,paths` 的子集。`none` 对应 `RENDER_NO_SMOOTH*`：扫描件从 300 DPI 缩到 96–150 DPI 时按最近邻取样，细笔画会断。只在 CPU 极紧张时才设 `none` |
 | `MINIOCR_OCR_BACKEND` | `ocr.backend` | `cpu` | `cpu` / `auto` / `vulkan` / `metal`。`metal` 仅 macOS |
 | `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空 | 设备序号或名称子串 |
@@ -281,7 +283,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 | 来源 | 说明 |
 | --- | --- |
-| `external/SimdPaddleOCR` | fork 的 `ProjectReference`，含 ChineseV6Medium。Apache-2.0 |
+| `external/SimdPaddleOCR` | fork `main` @ `1ff78ca` 的 `ProjectReference`（ChineseV6Medium，以及 SealV4Mobile / SealV4Server）。不发布、不引用 NuGet。Apache-2.0 |
 | `external/PDFtoImage` | fork 的 `ProjectReference`（含 `PDFtoImage.Parallel`）。MIT |
 
 ## Docker / 8×GPU

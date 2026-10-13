@@ -232,6 +232,7 @@ string? prevRenderProcesses = Environment.GetEnvironmentVariable("MINIOCR_RENDER
 string? prevTextLayer = Environment.GetEnvironmentVariable("MINIOCR_OCR_TEXT_LAYER");
 string? prevRemoveRed = Environment.GetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL");
 string? prevSealOcr = Environment.GetEnvironmentVariable("MINIOCR_SEAL_OCR");
+string? prevSealModel = Environment.GetEnvironmentVariable("MINIOCR_SEAL_MODEL");
 string? prevRaster = Environment.GetEnvironmentVariable("MINIOCR_RASTER_WORKERS");
 try
 {
@@ -432,6 +433,22 @@ try
     }).SealOcr.ToString(), "env 0 turns seal OCR off");
     Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", null);
 
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_MODEL", null);
+    AssertEqual("mobile", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).SealModel, "seal model defaults to mobile");
+    AssertEqual("server", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealModel = "server" },
+    }).SealModel, "file seal model server");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_MODEL", "SERVER");
+    AssertEqual("server", OcrRuntimeConfig.FromAppConfig(new AppConfigFile
+    {
+        Ocr = new OcrFileConfig { SealModel = "mobile" },
+    }).SealModel, "env seal model overrides file");
+    AssertEqual("server", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).WithMode("llm").SealModel, "mode copy keeps seal model");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_MODEL", "nope");
+    AssertEqual("mobile", OcrRuntimeConfig.FromAppConfig(new AppConfigFile()).SealModel, "unknown seal model is mobile");
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_MODEL", null);
+
     int cores = Math.Max(1, Environment.ProcessorCount);
     Environment.SetEnvironmentVariable("MINIOCR_OCR_MODE", "llm");
     Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", null);
@@ -459,6 +476,7 @@ finally
     Environment.SetEnvironmentVariable("MINIOCR_TEXT_LAYER_MIN_CHARS", null);
     Environment.SetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL", prevRemoveRed);
     Environment.SetEnvironmentVariable("MINIOCR_SEAL_OCR", prevSealOcr);
+    Environment.SetEnvironmentVariable("MINIOCR_SEAL_MODEL", prevSealModel);
     Environment.SetEnvironmentVariable("MINIOCR_RASTER_WORKERS", prevRaster);
 }
 

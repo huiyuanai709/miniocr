@@ -133,10 +133,16 @@ public sealed class OcrFileConfig
 
     /// <summary>
     /// Optional 公章 pass. Default false. When true, red seals are not erased.
-    /// In <c>local</c> mode the ring is polar-unwrapped and read with SimdPaddleOCR,
-    /// then that text is appended to the page before NER. Env <c>MINIOCR_SEAL_OCR</c>.
+    /// In <c>local</c> mode <c>PaddleOcrSealAll</c> reads the stamp when the models
+    /// open; otherwise the ring is polar-unwrapped and read with SimdPaddleOCR.
+    /// That text is appended to the page before NER. Env <c>MINIOCR_SEAL_OCR</c>.
     /// </summary>
     public bool SealOcr { get; set; }
+    /// <summary>
+    /// <c>mobile</c> (default, SealV4Mobile) or <c>server</c> (SealV4Server).
+    /// Env <c>MINIOCR_SEAL_MODEL</c>.
+    /// </summary>
+    public string? SealModel { get; set; }
     /// <summary>
     /// <c>all</c> (default), <c>none</c>, or a comma list of <c>text</c>, <c>images</c>, <c>paths</c>.
     /// PDFium smoothing flags for raster. <c>none</c> samples scanned images nearest-neighbour,

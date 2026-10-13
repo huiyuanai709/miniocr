@@ -59,13 +59,16 @@
          executable as a worker (CoreCLR startup hook, Native AOT module initializer). -->
     <ProjectReference Include="external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
     <ProjectReference Include="external/PDFtoImage/src/Parallel/Parallel.csproj" />
-    <!-- Pinned fork main @ 9d4d944 (upstream sdcb/SimdPaddleOCR main: Vulkan
-         memory-type retry, GPU shape/CTC caches, AVX2 ArgMax scratch reuse,
-         GPU thread budgets, Metal SE fusion, and the browser/WASI Vulkan
-         probe skip). ChineseV6Medium models come from the same tree.
-         Default backend stays CPU. -->
+    <!-- Pinned fork main @ 1ff78ca (PP-OCRv4 seal text detection:
+         PaddleOcrSealAll, SealV4Mobile, SealV4Server, on top of 9d4d944).
+         ChineseV6Medium stays the body recognizer. These packages are not on
+         NuGet; consume them only through ProjectReference. Default backend
+         stays CPU. SealV4Mobile is the default seal detector; SealV4Server
+         is selected with ocr.sealModel=server. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
     <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Medium/Sdcb.SimdPaddleOCR.Models.ChineseV6Medium.csproj" />
+    <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.SealV4Mobile/Sdcb.SimdPaddleOCR.Models.SealV4Mobile.csproj" />
+    <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.SealV4Server/Sdcb.SimdPaddleOCR.Models.SealV4Server.csproj" />
   </ItemGroup>
 
   <Target Name="EnsureSimdPaddleOcrSubmodule" BeforeTargets="Restore;Build;Publish">
@@ -89,6 +92,8 @@
     <!-- Keep model / Skia / PDFium assemblies from being trimmed away -->
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Medium" />
+    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.SealV4Mobile" />
+    <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.SealV4Server" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.Models.TextLineOrientation" />
     <TrimmerRootAssembly Include="Sdcb.SimdPaddleOCR.ModelProvider" />
     <TrimmerRootAssembly Include="PDFtoImage" />

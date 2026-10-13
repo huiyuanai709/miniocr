@@ -72,6 +72,7 @@ public static class OcrCompareRunner
 
         WeChatOcrEngine? wechat = null;
         OcrEngine? local = null;
+        SealOcrEngine? seal = null;
         try
         {
             wechat = await WeChatOcrEngine.ConnectAsync(location, config, logger, CancellationToken.None, instanceCount: 1)
@@ -79,6 +80,11 @@ public static class OcrCompareRunner
             Console.WriteLine($"Loading one {ClusterRuntimeConfig.LocalModelName} engine for the local side of the comparison...");
             local = await OcrEngine.CreateAsync(logs.CreateLogger<OcrEngine>(), config, CancellationToken.None)
                 .ConfigureAwait(false);
+            if (config.SealOcr)
+            {
+                seal = await SealOcrEngine.CreateAsync(logger, config, local.EffectiveBackend, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
 
             var rows = new List<PageRow>(limit);
             RenderOptions render = PdfParallelOptions.CreateRenderOptions(dpi, config);
@@ -98,7 +104,7 @@ public static class OcrCompareRunner
                 PageRow row = new() { Page = i + 1, Width = bitmap.Width, Height = bitmap.Height };
                 row.WeChat = await TimeAsync(() => wechat.RecognizeBitmapAsync(bitmap, CancellationToken.None))
                     .ConfigureAwait(false);
-                row.Local = await TimeAsync(() => RecognizeLocalAsync(local, bitmap, config, dpi, CancellationToken.None))
+                row.Local = await TimeAsync(() => RecognizeLocalAsync(local, seal, bitmap, config, dpi, CancellationToken.None))
                     .ConfigureAwait(false);
                 rows.Add(row);
                 Console.WriteLine(
@@ -125,6 +131,7 @@ public static class OcrCompareRunner
                 await wechat.DisposeAsync().ConfigureAwait(false);
             if (local is not null)
                 await local.DisposeAsync().ConfigureAwait(false);
+            seal?.Dispose();
         }
     }
 
@@ -146,6 +153,7 @@ public static class OcrCompareRunner
 
     private static async Task<string> RecognizeLocalAsync(
         OcrEngine engine,
+        SealOcrEngine? seal,
         SKBitmap bitmap,
         OcrRuntimeConfig config,
         int dpi,
@@ -154,28 +162,33 @@ public static class OcrCompareRunner
         EnsureBgra(bitmap, out SKBitmap working, out bool owned);
         try
         {
-            List<SealRingOcr.SealCapture> seals = [];
-            if (config.SealOcr)
+            string body = await RunEngineAsync(engine, working, ct).ConfigureAwait(false);
+            if (!config.SealOcr)
+                return body;
+            if (seal is { IsLoaded: true })
             {
-                int stride = working.RowBytes;
-                int byteCount = stride * working.Height;
-                IntPtr ptr = working.GetPixels();
-                if (ptr != IntPtr.Zero && byteCount > 0 && working.ColorType == SKColorType.Bgra8888)
+                string apiText = await seal.ReadAsync(working, ct).ConfigureAwait(false);
+                return SealRingOcr.MergePageText(body, apiText);
+            }
+
+            List<SealRingOcr.SealCapture> seals = [];
+            int stride = working.RowBytes;
+            int byteCount = stride * working.Height;
+            IntPtr ptr = working.GetPixels();
+            if (ptr != IntPtr.Zero && byteCount > 0 && working.ColorType == SKColorType.Bgra8888)
+            {
+                unsafe
                 {
-                    unsafe
-                    {
-                        ReadOnlySpan<byte> span = new((void*)ptr, byteCount);
-                        seals = SealRingOcr.Capture(
-                            span,
-                            working.Width,
-                            working.Height,
-                            stride,
-                            RedSealFilter.MinSealSideForDpi(dpi));
-                    }
+                    ReadOnlySpan<byte> span = new((void*)ptr, byteCount);
+                    seals = SealRingOcr.Capture(
+                        span,
+                        working.Width,
+                        working.Height,
+                        stride,
+                        RedSealFilter.MinSealSideForDpi(dpi));
                 }
             }
 
-            string body = await RunEngineAsync(engine, working, ct).ConfigureAwait(false);
             if (seals.Count == 0)
                 return body;
             string sealText = await SealOcrPass.ReadAsync(
