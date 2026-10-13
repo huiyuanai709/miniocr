@@ -137,6 +137,18 @@ public sealed class OcrFileConfig
     /// then that text is appended to the page before NER. Env <c>MINIOCR_SEAL_OCR</c>.
     /// </summary>
     public bool SealOcr { get; set; }
+
+    /// <summary>
+    /// Raster DPI floor while <see cref="SealOcr"/> is on in local mode.
+    /// Null or 0 follows the page DPI. Env <c>MINIOCR_SEAL_DPI</c>.
+    /// </summary>
+    public int? SealDpi { get; set; }
+
+    /// <summary>
+    /// Long-side cap for an unwrapped seal strip. Null or 0 uses the engine detection limit.
+    /// Values above that limit are clamped to it. Env <c>MINIOCR_SEAL_DET_LIMIT_SIDE</c>.
+    /// </summary>
+    public int? SealDetLimitSide { get; set; }
     /// <summary>
     /// <c>all</c> (default), <c>none</c>, or a comma list of <c>text</c>, <c>images</c>, <c>paths</c>.
     /// PDFium smoothing flags for raster. <c>none</c> samples scanned images nearest-neighbour,

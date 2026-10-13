@@ -499,7 +499,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         {
             if (pixels.ColorType != SKColorType.Bgra8888)
                 return [];
-            return SealRingOcr.Capture(pixels.Pixels.Span, pixels.Width, pixels.Height, pixels.RowBytes, minSide);
+            return SealRingOcr.Capture(
+                pixels.Pixels.Span, pixels.Width, pixels.Height, pixels.RowBytes, minSide, _config.SealStripLongSide);
         }
 
         SKBitmap bitmap = image.RequireBitmap();
@@ -512,7 +513,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         unsafe
         {
             ReadOnlySpan<byte> span = new((void*)ptr, byteCount);
-            return SealRingOcr.Capture(span, bitmap.Width, bitmap.Height, bitmap.RowBytes, minSide);
+            return SealRingOcr.Capture(span, bitmap.Width, bitmap.Height, bitmap.RowBytes, minSide, _config.SealStripLongSide);
         }
     }
 
@@ -1911,7 +1912,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         foreach (SKBitmap page in Conversion.ToImages(local, [pageIndex], leaveOpen: true, options: options))
         {
             using PageImage image = PageImage.FromBitmap(page);
-            image.Dpi = dpi;
+            image.Dpi = options.Dpi;
             seals = CaptureSeals(image);
             break;
         }

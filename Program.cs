@@ -171,7 +171,8 @@ Console.WriteLine(
     $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"backend={runtimeConfig.Backend}, lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"recIntraOpThreads={runtimeConfig.RecIntraOpThreads}, recBatch={runtimeConfig.RecBatchLines}, " +
-    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, sealOcr={runtimeConfig.SealOcr}, antiAlias={runtimeConfig.AntiAliasing}, " +
+    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, sealOcr={runtimeConfig.SealOcr}, " +
+    $"sealDpi={runtimeConfig.SealDpi}, sealStrip={runtimeConfig.SealStripLongSide}, antiAlias={runtimeConfig.AntiAliasing}, " +
     $"detLimitSide={runtimeConfig.DetLimitSideLength}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
     $"renderMode={runtimeConfig.RenderMode}, renderProcesses={runtimeConfig.RenderProcessCount}, " +
     $"textLayer={runtimeConfig.TextLayer}, " +
@@ -442,6 +443,8 @@ app.MapGet("/health", (IServiceProvider sp) =>
             UseDirectionClassification = cfg.UseDirectionClassification,
             RemoveRedSeal = cfg.RemoveRedSeal,
             SealOcr = cfg.SealOcr,
+            SealDpi = cfg.SealDpi,
+            SealStripLongSide = cfg.SealStripLongSide,
             AntiAliasing = cfg.AntiAliasing,
             RasterWorkerCount = cfg.RasterWorkerCount,
             RenderMode = cfg.RenderMode,

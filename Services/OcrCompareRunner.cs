@@ -93,12 +93,12 @@ public static class OcrCompareRunner
                     throw new InvalidOperationException($"PDFtoImage did not yield page {i + 1}.");
                 using SKBitmap bitmap = enumerator.Current;
                 if (config.EraseRedSealInk)
-                    RedSealFilter.Apply(bitmap, config.RedSealAllInk ? 0 : RedSealFilter.MinSealSideForDpi(dpi));
+                    RedSealFilter.Apply(bitmap, config.RedSealAllInk ? 0 : RedSealFilter.MinSealSideForDpi(render.Dpi));
 
                 PageRow row = new() { Page = i + 1, Width = bitmap.Width, Height = bitmap.Height };
                 row.WeChat = await TimeAsync(() => wechat.RecognizeBitmapAsync(bitmap, CancellationToken.None))
                     .ConfigureAwait(false);
-                row.Local = await TimeAsync(() => RecognizeLocalAsync(local, bitmap, config, dpi, CancellationToken.None))
+                row.Local = await TimeAsync(() => RecognizeLocalAsync(local, bitmap, config, render.Dpi, CancellationToken.None))
                     .ConfigureAwait(false);
                 rows.Add(row);
                 Console.WriteLine(
@@ -170,7 +170,8 @@ public static class OcrCompareRunner
                             working.Width,
                             working.Height,
                             stride,
-                            RedSealFilter.MinSealSideForDpi(dpi));
+                            RedSealFilter.MinSealSideForDpi(dpi),
+                            config.SealStripLongSide);
                     }
                 }
             }

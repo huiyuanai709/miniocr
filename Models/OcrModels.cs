@@ -168,6 +168,10 @@ public sealed class HealthResponse
     public bool RemoveRedSeal { get; set; } = true;
     /// <summary>When true, red seals are kept and (in local mode) their ring text is read.</summary>
     public bool SealOcr { get; set; }
+    /// <summary>Seal-pass raster DPI floor. <c>0</c> follows the page DPI.</summary>
+    public int SealDpi { get; set; }
+    /// <summary>Long side actually used for an unwrapped seal strip.</summary>
+    public int SealStripLongSide { get; set; }
     /// <summary>PDFium smoothing in use: <c>all</c>, <c>none</c>, or a comma list of <c>text</c>, <c>images</c>, <c>paths</c>.</summary>
     public string AntiAliasing { get; set; } = "all";
     public int RasterWorkerCount { get; set; }

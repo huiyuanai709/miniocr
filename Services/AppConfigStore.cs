@@ -490,6 +490,8 @@ public static class AppConfigStore
             "useCls": false,
             "removeRedSeal": true,
             "sealOcr": false,
+            "sealDpi": null,
+            "sealDetLimitSide": null,
             "backend": "cpu",
             "vulkanDevice": "",
             "recIntraOpThreads": 1,

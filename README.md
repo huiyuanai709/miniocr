@@ -121,6 +121,8 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
     "useCls": false,
     "removeRedSeal": true,
     "sealOcr": false,
+    "sealDpi": null,
+    "sealDetLimitSide": null,
     "backend": "cpu",
     "vulkanDevice": "",
     "recIntraOpThreads": 1,
@@ -157,7 +159,9 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_DET_LIMIT_SIDE` | `ocr.detLimitSide` | `max(960, DPI×10)` | 检测输入长边上限。随 DPI 走：96 → 960，144 → 1440，150 → 1500，这样提高 DPI 不会在检测前又被缩回 960 |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | false | 方向分类 |
 | `MINIOCR_REMOVE_RED_SEAL` | `ocr.removeRedSeal` + `ocr.redSealMode` | true（`seal`） | 彩色页在检测前去掉红章，换成页角纸色或白。默认 `seal`：在 1/4 分辨率的红色掩码上找连通块，只擦掉"像印章"的块（短边 ≥ 约 14 mm，长边 ≤ 2.5 × 短边），红头文件标题、红色条款号、红色签名仍会进入识别。`all` 恢复旧行为，擦掉所有饱和红。`0` / `false` / `off` 关闭，并回到 Gray8 渲染。`ocr.sealOcr` 打开时这一步不擦章 |
-| `MINIOCR_SEAL_OCR` | `ocr.sealOcr` | false | 可选公章识别。`1` / `true` / `on` 打开，默认关闭。打开后保留红章印泥（不再在识别前擦掉），并强制彩色渲染。`local` 模式检测印章色块，圆形章裁切后做极坐标展开，交给 SimdPaddleOCR，再把读到的文字追加到该页文本，随现有 NER 一起抽取。文本层已经采纳的页只补公章，不改正文。`llm` / `wechat` 没有本地引擎，不跑这一路，但开关打开时同样不擦章 |
+| `MINIOCR_SEAL_OCR` | `ocr.sealOcr` | false | 可选公章识别。`1` / `true` / `on` 打开，默认关闭。打开后保留红章印泥（不再在识别前擦掉），并强制彩色渲染。`local` 模式检测印章色块，圆形章裁切后做极坐标展开，交给同一个 SimdPaddleOCR 再读一遍，文字追加到该页文本，随现有 NER 一起抽取。文本层已经采纳的页只补公章，不改正文。`llm` / `wechat` 没有本地引擎，不跑这一路，但开关打开时同样不擦章。和百度 SealRecognition 的差别见下文 |
+| `MINIOCR_SEAL_DPI` | `ocr.sealDpi` | 0 | 仅 `local` 且 `sealOcr` 打开时生效。`0` 跟页面 DPI。设成 144 或 150 后，栅格至少用这个 DPI，印章圆环上的字更大。没单独设置 `detLimitSide` 时，检测长边跟着抬到 `max(960, sealDpi×10)`，避免整页被缩回 960 |
+| `MINIOCR_SEAL_DET_LIMIT_SIDE` | `ocr.sealDetLimitSide` | 0 | 展开后圆环图的长边上限。`0` 用引擎的 `detLimitSide`。大于引擎上限时截到引擎上限：SimdPaddleOCR 的 `LimitSideLength` 在加载时定死，更宽的图会在检测前被缩小 |
 | `MINIOCR_RENDER_ANTIALIAS` | `ocr.antiAliasing` | `all` | PDFium 平滑开关：`all` / `none` / `text,images,paths` 的子集。`none` 对应 `RENDER_NO_SMOOTH*`：扫描件从 300 DPI 缩到 96–150 DPI 时按最近邻取样，细笔画会断。只在 CPU 极紧张时才设 `none` |
 | `MINIOCR_OCR_BACKEND` | `ocr.backend` | `cpu` | `cpu` / `auto` / `vulkan` / `metal`。`metal` 仅 macOS |
 | `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空 | 设备序号或名称子串 |
@@ -188,6 +192,25 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_CHALLENGE_RESOURCE_DIR` | `challenge.resourceDir` | 空 | 比赛 PDF 目录。空则仍按 URL 下载。非空时只读，见下文 |
 
 未设置的引擎数、行内线程、检测线程和栅格线程按逻辑核数估算。显式环境变量或文件值优先，栅格线程上限为逻辑核数。小显存 GPU 上引擎数会降为 1。
+
+### 公章文字和百度 SealRecognition
+
+生产集群用的是 SimdPaddleOCR ChineseV6Medium，CPU 走 `avx512v2`，GPU 走 Vulkan。百度 PaddleOCR 的 SealRecognition 是另一条管线：`seal_det` 检出印章，再对弯曲文字做极坐标展开后识别。SimdPaddleOCR 没有这条管线，也没有 `seal_det_*` 权重。检测参数（`LimitSideLength`、框阈值、unclip）在 `PaddleOcrAll` 加载时写死，不能按一张图临时换；库只提供对一块像素再调一次 `Run`。把官方 seal 检测模型嵌进 Native AOT 还要另接一套图、弯曲框后处理和模型字节，Vulkan 会话和发布镜像都会变，所以不走那条路。
+
+这里的做法仍用现有红章几何（连通的红色块，短边大约 14 mm 以上，长宽比不超过 2.5）：
+
+- 默认 `ocr.sealOcr=false`。关掉时页面 OCR 和以前一样，红章仍按 `removeRedSeal` 擦掉。
+- 打开后先不擦章。圆环裁出来做极坐标展开（6 点钟起、顺时针，字头朝外），方章直接裁切。展开图的长边不超过 `MINIOCR_SEAL_DET_LIMIT_SIDE`（默认就是引擎的检测长边）。
+- 同一套 ChineseV6Medium 引擎对裁切图再跑一遍，读到的行追加到该页文本。启发式 NER 和 LLM NER 都读 `page.Text`，所以公章上的公司名会进实体。
+- 文本层已经采纳的页不会整页重识别，只补公章。需要连正文也走 OCR 时把 `MINIOCR_OCR_TEXT_LAYER=off`。
+
+`MINIOCR_SEAL_OCR=1` 即可启用，不必再把 `MINIOCR_REMOVE_RED_SEAL` 关掉。印章 DPI 想再清楚一点：
+
+```bash
+MINIOCR_SEAL_OCR=1 MINIOCR_SEAL_DPI=144 ./MiniOcr
+```
+
+健康检查里的 `sealOcr`、`sealDpi`、`sealStripLongSide` 是实际生效的值。
 
 ### 比赛本地 PDF（`POST /challenge`、`POST /`、同步 `POST /ocr`）
 
