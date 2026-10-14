@@ -164,14 +164,6 @@ public sealed class HealthResponse
     public int DetIntraOpThreads { get; set; }
     public int DefaultDpi { get; set; }
     public bool UseDirectionClassification { get; set; }
-    /// <summary>When true, high-saturation red is removed from color pages before detection.</summary>
-    public bool RemoveRedSeal { get; set; } = true;
-    /// <summary>When true, red seals are kept and (in local mode) their ring text is read.</summary>
-    public bool SealOcr { get; set; }
-    /// <summary><c>mobile</c> or <c>server</c> while seal OCR is on. Empty otherwise.</summary>
-    public string SealModel { get; set; } = "";
-    /// <summary>True when <c>PaddleOcrSealAll</c> loaded. False keeps the polar unwrap.</summary>
-    public bool SealApi { get; set; }
     /// <summary>PDFium smoothing in use: <c>all</c>, <c>none</c>, or a comma list of <c>text</c>, <c>images</c>, <c>paths</c>.</summary>
     public string AntiAliasing { get; set; } = "all";
     public int RasterWorkerCount { get; set; }
@@ -201,7 +193,7 @@ public sealed class HealthResponse
     public string ConfigPathSource { get; set; } = "";
     public string OcrMode { get; set; } = "local";
     /// <summary>
-    /// Embedded local OCR bundle. <c>ChineseV6Medium</c> when <c>ocr.mode=local</c>.
+    /// Embedded local OCR bundle. <c>ChineseV6Tiny</c> when <c>ocr.mode=local</c>.
     /// Empty when local models are not loaded (<c>llm</c> or <c>wechat</c>).
     /// </summary>
     public string OcrModel { get; set; } = "";

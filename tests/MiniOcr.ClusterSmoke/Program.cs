@@ -246,8 +246,8 @@ Console.WriteLine("=== takeover drops only remote leases ===");
 
 Console.WriteLine("=== model mismatch warning ===");
 AssertTrue(
-    ClusterRuntimeConfig.LocalModelName == "ChineseV6Medium",
-    "local OCR model name is ChineseV6Medium");
+    ClusterRuntimeConfig.LocalModelName == "ChineseV6Tiny",
+    "local OCR model name is ChineseV6Tiny");
 AssertTrue(
     ClusterNodeRegistry.Mismatch("llm", "gpt-4o", 72, "local", ClusterRuntimeConfig.LocalModelName, 96) is not null,
     "mode, model, and dpi differences are reported");

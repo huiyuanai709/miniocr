@@ -17,35 +17,6 @@ public sealed class OcrRuntimeConfig
     public int DetIntraOpThreads { get; init; }
     public bool UseDirectionClassification { get; init; }
     /// <summary>
-    /// When true (default), color pages lose high-saturation red before detection.
-    /// <c>MINIOCR_REMOVE_RED_SEAL=0</c> keeps the Gray8 render path.
-    /// </summary>
-    public bool RemoveRedSeal { get; init; } = true;
-    /// <summary>
-    /// When true the filter erases every saturated red pixel (legacy <c>MINIOCR_REMOVE_RED_SEAL=all</c>).
-    /// Default false: only seal-shaped red blobs are erased, so red letterhead text still reaches OCR.
-    /// </summary>
-    public bool RedSealAllInk { get; init; }
-    /// <summary>
-    /// Optional seal OCR. Default false. While this is on, <see cref="EraseRedSealInk"/> is false
-    /// so the stamp stays on the page. Local mode runs <c>PaddleOcrSealAll</c> when the
-    /// seal detector and ChineseV6Medium recognizer open, and otherwise falls back to
-    /// red-blob detection plus polar unwrap.
-    /// </summary>
-    public bool SealOcr { get; init; }
-    /// <summary>
-    /// Seal detector used by <c>PaddleOcrSealAll</c>: <c>mobile</c> (SealV4Mobile, default)
-    /// or <c>server</c> (SealV4Server). Env <c>MINIOCR_SEAL_MODEL</c> wins over the file.
-    /// </summary>
-    public string SealModel { get; init; } = "mobile";
-    /// <summary>
-    /// Erase red seal ink before body OCR. Off when <see cref="SealOcr"/> is on, even if
-    /// <see cref="RemoveRedSeal"/> is still true in the file.
-    /// </summary>
-    public bool EraseRedSealInk => RemoveRedSeal && !SealOcr;
-    /// <summary>Color raster: seal removal or seal OCR both need the red channel.</summary>
-    public bool RasterKeepsRed => RemoveRedSeal || SealOcr;
-    /// <summary>
     /// PDFium smoothing for raster: <c>all</c> (default), <c>none</c>, or a comma list of
     /// <c>text</c>, <c>images</c>, <c>paths</c>. <c>MINIOCR_RENDER_ANTIALIAS</c> overrides the file.
     /// </summary>
@@ -136,14 +107,6 @@ public sealed class OcrRuntimeConfig
 
         bool useClsFile = ocr.UseCls ?? false;
         bool useCls = ReadBool("MINIOCR_USE_CLS", useClsFile);
-        (bool removeRedSeal, bool redSealAllInk) = ResolveRedSeal(
-            Environment.GetEnvironmentVariable("MINIOCR_REMOVE_RED_SEAL"),
-            ocr.RemoveRedSeal,
-            ocr.RedSealMode);
-        bool sealOcr = ReadBool("MINIOCR_SEAL_OCR", ocr.SealOcr);
-        string sealModel = CanonicalSealModel(FirstSet(
-            Environment.GetEnvironmentVariable("MINIOCR_SEAL_MODEL"),
-            ocr.SealModel));
         string antiAliasing = CanonicalAntiAliasing(FirstSet(
             Environment.GetEnvironmentVariable("MINIOCR_RENDER_ANTIALIAS"),
             ocr.AntiAliasing));
@@ -253,10 +216,6 @@ public sealed class OcrRuntimeConfig
             LineWorkerCount = line,
             DetIntraOpThreads = det,
             UseDirectionClassification = useCls,
-            RemoveRedSeal = removeRedSeal,
-            RedSealAllInk = redSealAllInk,
-            SealOcr = sealOcr,
-            SealModel = sealModel,
             AntiAliasing = antiAliasing,
             RasterWorkerCount = raster,
             RenderMode = renderMode,
@@ -375,10 +334,6 @@ public sealed class OcrRuntimeConfig
         LineWorkerCount = LineWorkerCount,
         DetIntraOpThreads = DetIntraOpThreads,
         UseDirectionClassification = UseDirectionClassification,
-        RemoveRedSeal = RemoveRedSeal,
-        RedSealAllInk = RedSealAllInk,
-        SealOcr = SealOcr,
-        SealModel = SealModel,
         AntiAliasing = AntiAliasing,
         RasterWorkerCount = RasterWorkerCount,
         RenderMode = renderMode is null ? RenderMode : CanonicalRenderMode(renderMode),
@@ -476,46 +431,6 @@ public sealed class OcrRuntimeConfig
     /// </summary>
     public static string BackendForHost(string backend) =>
         backend == "metal" && !OperatingSystem.IsMacOS() ? "cpu" : backend;
-
-    /// <summary>
-    /// <c>mobile</c> (default) or <c>server</c>. Unknown values stay on the smaller SealV4Mobile detector.
-    /// </summary>
-    public static string CanonicalSealModel(string? raw)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return "mobile";
-        string text = raw.Trim();
-        if (text.Equals("server", StringComparison.OrdinalIgnoreCase)
-            || text.Equals("sealv4server", StringComparison.OrdinalIgnoreCase)
-            || text.Equals("v4-server", StringComparison.OrdinalIgnoreCase))
-            return "server";
-        return "mobile";
-    }
-
-    /// <summary>
-    /// <c>MINIOCR_REMOVE_RED_SEAL</c>: <c>0</c>/<c>off</c>/<c>false</c> disables the filter,
-    /// <c>all</c> erases every saturated red pixel (legacy), anything truthy or <c>seal</c>/<c>seals</c>
-    /// erases only seal-shaped blobs. Env wins over <c>ocr.removeRedSeal</c> + <c>ocr.redSealMode</c>.
-    /// </summary>
-    public static (bool Enabled, bool AllInk) ResolveRedSeal(string? env, bool fileEnabled, string? fileMode)
-    {
-        bool fileAll = string.Equals(fileMode?.Trim(), "all", StringComparison.OrdinalIgnoreCase);
-        if (string.IsNullOrWhiteSpace(env))
-            return (fileEnabled, fileEnabled && fileAll);
-        string raw = env.Trim();
-        if (string.Equals(raw, "all", StringComparison.OrdinalIgnoreCase))
-            return (true, true);
-        if (string.Equals(raw, "seal", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(raw, "seals", StringComparison.OrdinalIgnoreCase))
-            return (true, false);
-        if (bool.TryParse(raw, out bool b))
-            return (b, b && fileAll);
-        if (raw is "1" or "yes" or "YES" or "on" or "ON")
-            return (true, fileAll);
-        if (raw is "0" or "no" or "NO" or "off" or "OFF")
-            return (false, false);
-        return (fileEnabled, fileEnabled && fileAll);
-    }
 
     /// <summary>
     /// <c>all</c>, <c>none</c>, or a sorted comma list drawn from <c>text</c>, <c>images</c>,
