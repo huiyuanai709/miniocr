@@ -119,31 +119,6 @@ public sealed class OcrFileConfig
     public int? TextLayerImageMinChars { get; set; }
     public bool? UseCls { get; set; }
     /// <summary>
-    /// Drop high-saturation red seal ink after raster and before detection.
-    /// Default true. Color pages are rendered so the red channel still exists;
-    /// Gray8 pages are skipped. Set false to keep the Gray8 path.
-    /// </summary>
-    public bool RemoveRedSeal { get; set; } = true;
-    /// <summary>
-    /// <c>seal</c> (default) erases red only inside seal-shaped blobs, so red letterhead
-    /// text is still recognised. <c>all</c> erases every saturated red pixel (old behaviour).
-    /// Ignored while <see cref="SealOcr"/> is on: the ink is kept for the seal pass.
-    /// </summary>
-    public string? RedSealMode { get; set; }
-
-    /// <summary>
-    /// Optional 公章 pass. Default false. When true, red seals are not erased.
-    /// In <c>local</c> mode <c>PaddleOcrSealAll</c> reads the stamp when the models
-    /// open; otherwise the ring is polar-unwrapped and read with SimdPaddleOCR.
-    /// That text is appended to the page before NER. Env <c>MINIOCR_SEAL_OCR</c>.
-    /// </summary>
-    public bool SealOcr { get; set; }
-    /// <summary>
-    /// <c>mobile</c> (default, SealV4Mobile) or <c>server</c> (SealV4Server).
-    /// Env <c>MINIOCR_SEAL_MODEL</c>.
-    /// </summary>
-    public string? SealModel { get; set; }
-    /// <summary>
     /// <c>all</c> (default), <c>none</c>, or a comma list of <c>text</c>, <c>images</c>, <c>paths</c>.
     /// PDFium smoothing flags for raster. <c>none</c> samples scanned images nearest-neighbour,
     /// which drops thin strokes when a 300 DPI scan is rendered at 96–150 DPI.

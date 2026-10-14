@@ -5,7 +5,6 @@ using Microsoft.Extensions.Logging;
 using MiniOcr;
 using MiniOcr.Models;
 using MiniOcr.Services;
-using SkiaSharp;
 
 int failed = 0;
 
@@ -247,29 +246,6 @@ Assert(fromHits.Companies.Count == 1 && fromHits.Companies[0].Count == 2, "entit
 List<ChallengePageResult> roundTrip = ClusterNerAssembler.PagesFromHits(pageHits);
 Assert(roundTrip.Count == 1 && roundTrip[0].Page == 1 && roundTrip[0].RuleList[0].RuleItemList[0].Count == 2,
     "hits round-trip back to per-page rules with the model count");
-
-AppConfigFile? redOff = JsonSerializer.Deserialize(
-    """{"ocr":{"removeRedSeal":false}}""", AppJsonContext.Default.AppConfigFile);
-Assert(redOff?.Ocr?.RemoveRedSeal == false, "config json removeRedSeal false");
-AppConfigFile? redOmitted = JsonSerializer.Deserialize(
-    """{"ocr":{"mode":"local"}}""", AppJsonContext.Default.AppConfigFile);
-Assert(redOmitted?.Ocr?.RemoveRedSeal == true, "omitted removeRedSeal stays true");
-Assert(redOmitted?.Ocr?.SealOcr == false, "omitted sealOcr stays false");
-AppConfigFile? sealOn = JsonSerializer.Deserialize(
-    """{"ocr":{"sealOcr":true}}""", AppJsonContext.Default.AppConfigFile);
-Assert(sealOn?.Ocr?.SealOcr == true && sealOn.Ocr.RemoveRedSeal, "json sealOcr true keeps removeRedSeal default");
-AppConfigFile? sealServer = JsonSerializer.Deserialize(
-    """{"ocr":{"sealModel":"server"}}""", AppJsonContext.Default.AppConfigFile);
-Assert(sealServer?.Ocr?.SealModel == "server", "json sealModel server");
-
-using SKBitmap grayPage = new(4, 4, SKColorType.Gray8, SKAlphaType.Opaque);
-Assert(RedSealFilter.Apply(grayPage) == 0, "Gray8 pages skip red-seal removal");
-using SKBitmap colorPage = new(8, 8, SKColorType.Bgra8888, SKAlphaType.Premul);
-colorPage.Erase(new SKColor(234, 232, 230));
-colorPage.SetPixel(4, 4, new SKColor(220, 40, 30, 255));
-Assert(RedSealFilter.Apply(colorPage) >= 1, "BGRA red seal pixel is replaced before detection");
-SKColor kept = colorPage.GetPixel(4, 4);
-Assert(kept.Red == 234 && kept.Green == 232 && kept.Blue == 230, "BGRA red becomes the page paper color");
 
 Console.WriteLine("string page / count coercion and NER retries");
 string stringPage = """{"pages":[{"page":"26","ruleList":[{"ruleCode":"B06","ruleItemList":[{"companyName":"甲公司","count":"2","originText":["甲公司"]}]}]}]}""";

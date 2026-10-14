@@ -11,8 +11,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\..\Services\EntityExtractor.cs" Link="EntityExtractor.cs" />
-    <Compile Include="..\..\Services\SealRingOcr.cs" Link="SealRingOcr.cs" />
-    <Compile Include="..\..\Services\RedSealFilter.cs" Link="RedSealFilter.cs" />
     <Compile Include="..\..\Services\EntityText.cs" Link="EntityText.cs" />
     <Compile Include="..\..\Services\ChallengeResultMapper.cs" Link="ChallengeResultMapper.cs" />
     <Compile Include="..\..\Services\OcrTextDebug.cs" Link="OcrTextDebug.cs" />

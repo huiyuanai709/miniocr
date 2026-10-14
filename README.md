@@ -1,14 +1,16 @@
 # MiniOCR
 
-基于 [SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)）的 **Native AOT** PDF OCR HTTP 服务（**.NET 11 RC / `net11.0`**）。
+本机 PDF OCR 工具。基于 [SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)）的 **Native AOT** HTTP 服务（**.NET 11 RC / `net11.0`**）。
 
-从 URL 下载 PDF（不超过 300 MB），按页栅格化并识别，返回每页文本。可选调用 OpenAI 兼容接口做多模态识别，或从文本中抽取人名和公司名。
+默认是**一个进程、CPU、`ChineseV6Tiny`**。把 PDF 路径或 URL 交给 `POST /ocr`，按页栅格化（Gray8）并识别，返回每页文本。文件不超过 300 MB。人名和公司名可以交给可选的 OpenAI 兼容接口，也可以在配置里打开启发式回退。
+
+多进程集群仍然可以开，用来把同一台机器上的几个进程拼在一起。它不是默认用法，也不需要 GPU。
 
 **`ocr.mode`：**
 
-- **`local`（默认）**：本地 PP-OCRv6 **ChineseV6Medium**。人名和公司名可交给 LLM，也可在配置里打开启发式回退。
+- **`local`（默认）**：本地 PP-OCRv6 **ChineseV6Tiny**（仓库里最轻的中文包，适合笔记本 CPU 或小显存 GPU）。
 - **`llm`**：不加载本地 Paddle 模型。每页 JPEG 以 `image_url` 发给多模态 Chat Completions。
-- **`wechat`（实验，仅 Windows x64）**：调用本机已安装的微信 OCR 插件。非官方接口，只适合在自己的电脑上对比，不要当成对外服务。
+- **`wechat`（实验，仅 Windows x64）**：调用本机已安装的微信 OCR 插件。非官方接口，只适合在自己的电脑上对比。
 
 ## 环境要求
 
@@ -119,9 +121,6 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
     "textLayer": "auto",
     "renderProcesses": null,
     "useCls": false,
-    "removeRedSeal": true,
-    "sealOcr": false,
-    "sealModel": "mobile",
     "backend": "cpu",
     "vulkanDevice": "",
     "recIntraOpThreads": 1,
@@ -157,9 +156,6 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_REC_BATCH` | — | 8 | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | `ocr.detLimitSide` | `max(960, DPI×10)` | 检测输入长边上限。随 DPI 走：96 → 960，144 → 1440，150 → 1500，这样提高 DPI 不会在检测前又被缩回 960 |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | false | 方向分类 |
-| `MINIOCR_REMOVE_RED_SEAL` | `ocr.removeRedSeal` + `ocr.redSealMode` | true（`seal`） | 彩色页在检测前去掉红章，换成页角纸色或白。默认 `seal`：在 1/4 分辨率的红色掩码上找连通块，只擦掉"像印章"的块（短边 ≥ 约 14 mm，长边 ≤ 2.5 × 短边），红头文件标题、红色条款号、红色签名仍会进入识别。`all` 恢复旧行为，擦掉所有饱和红。`0` / `false` / `off` 关闭，并回到 Gray8 渲染。`ocr.sealOcr` 打开时这一步不擦章 |
-| `MINIOCR_SEAL_OCR` | `ocr.sealOcr` | false | 可选公章识别。`1` / `true` / `on` 打开，默认关闭。打开后保留红章印泥（不再在识别前擦掉），并强制彩色渲染。`local` 模式在模型能打开时走 `PaddleOcrSealAll`（检测 + 环排拉直 + ChineseV6Medium 识别），把读到的文字追加到该页文本，随现有 NER 一起抽取。模型打不开时退回红章色块 + 极坐标展开。文本层已经采纳的页只补公章，不改正文。`llm` / `wechat` 没有本地引擎，不跑这一路，但开关打开时同样不擦章 |
-| `MINIOCR_SEAL_MODEL` | `ocr.sealModel` | `mobile` | 公章检测模型。`mobile` 用 SealV4Mobile（默认，体积小）。`server` 用 SealV4Server。两者都从 fork 的 `ProjectReference` 嵌入，不从 NuGet 拉包。未识别的值按 `mobile` |
 | `MINIOCR_RENDER_ANTIALIAS` | `ocr.antiAliasing` | `all` | PDFium 平滑开关：`all` / `none` / `text,images,paths` 的子集。`none` 对应 `RENDER_NO_SMOOTH*`：扫描件从 300 DPI 缩到 96–150 DPI 时按最近邻取样，细笔画会断。只在 CPU 极紧张时才设 `none` |
 | `MINIOCR_OCR_BACKEND` | `ocr.backend` | `cpu` | `cpu` / `auto` / `vulkan` / `metal`。`metal` 仅 macOS |
 | `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空 | 设备序号或名称子串 |
@@ -187,13 +183,13 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_WECHAT_DIR` | `ocr.wechatDir` | 空 | 含 `mmmojo_64.dll` 的目录 |
 | `MINIOCR_WECHAT_INSTANCES` | `ocr.wechatInstances` | 1–3 | 插件进程数 |
 | `MINIOCR_WECHAT_FALLBACK` | `ocr.wechatFallbackToLocal` | true | 为 false 时找不到插件则退出 |
-| `MINIOCR_CHALLENGE_RESOURCE_DIR` | `challenge.resourceDir` | 空 | 比赛 PDF 目录。空则仍按 URL 下载。非空时只读，见下文 |
+| `MINIOCR_CHALLENGE_RESOURCE_DIR` | `challenge.resourceDir` | 空 | 可选的本地 PDF 目录。空（默认）时按 URL 下载。非空时只读，见下文 |
 
 未设置的引擎数、行内线程、检测线程和栅格线程按逻辑核数估算。显式环境变量或文件值优先，栅格线程上限为逻辑核数。小显存 GPU 上引擎数会降为 1。
 
-### 比赛本地 PDF（`POST /challenge`、`POST /`、同步 `POST /ocr`）
+### 可选：本地 PDF 目录（`POST /ocr` 的 `files[]`，以及 `POST /challenge`、`POST /`）
 
-部署机上文件已经在 `/home/deploy/resource/f1.pdf` 这类路径时，不必再按请求里的 URL 下载。环境变量优先于 `config.json` 的 `challenge.resourceDir`。两者都空（默认）时行为与以前相同：`files[]` 里每一项都要有 `fileId` 和绝对的 http(s) `url`。
+文件已经在本机目录里时，不必再按请求里的 URL 下载。环境变量优先于 `config.json` 的 `challenge.resourceDir`。两者都空（默认）时，`files[]` 里每一项都要有 `fileId` 和绝对的 http(s) `url`。日常本机识别更直接的是 `POST /ocr` 的 `{"path":"..."}` 或 `POST /ocr/upload`，不必设置这个目录。
 
 目录非空时：
 
@@ -218,7 +214,7 @@ curl -sS -X POST http://127.0.0.1:5080/challenge \
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/health` | 进程、配置路径和当前 OCR 开关。`ocr.mode=local` 时 `ocrModel` 为 `ChineseV6Medium`；集群打开时 `cluster.model` 同样是这个名字 |
+| `GET` | `/health` | 进程、配置路径和当前 OCR 开关。`ocr.mode=local` 时 `ocrModel` 为 `ChineseV6Tiny`；集群打开时 `cluster.model` 同样是这个名字 |
 | `POST` | `/ocr` | 同步识别。JSON 里给 `url`，或 `files`，或本机 `path` |
 | `POST` | `/ocr/upload` | `multipart` 上传一个 PDF |
 | `GET` | `/` | 纯文本接口说明 |
@@ -283,12 +279,12 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 | 来源 | 说明 |
 | --- | --- |
-| `external/SimdPaddleOCR` | fork `main` @ `1ff78ca` 的 `ProjectReference`（ChineseV6Medium，以及 SealV4Mobile / SealV4Server）。不发布、不引用 NuGet。Apache-2.0 |
+| `external/SimdPaddleOCR` | fork `main` @ `1ff78ca` 的 `ProjectReference`（ChineseV6Tiny）。不发布、不引用 NuGet。Apache-2.0 |
 | `external/PDFtoImage` | fork 的 `ProjectReference`（含 `PDFtoImage.Parallel`）。MIT |
 
-## Docker / 8×GPU
+## Docker / 多进程（可选）
 
-一台机器上跑 8 个进程，每个进程绑一张 NVIDIA GPU。需要已安装 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) 的 Linux，以及 Docker Compose v2。
+默认不需要这一节。一台机器上想把多张 GPU 或多个进程拼在一起时，才用集群。下面是 8 个进程各绑一张 NVIDIA GPU 的例子。需要已安装 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) 的 Linux，以及 Docker Compose v2。
 
 `gpu0` 是协调进程，同时自己也做识别，监听 `5080`。`gpu1`–`gpu7` 是工作进程，端口 `5081`–`5087`。容器之间用服务名互相访问（`http://gpu0:5080` 等）。
 
@@ -329,7 +325,7 @@ MINIOCR_CLUSTER_SPECULATIVE_TAIL=1
 
 上传的 PDF 没有可再次下载的地址时，协调进程把它写到 `MINIOCR_CLUSTER_SHARED_DIR`（compose 里是卷 `miniocr-jobs`，挂到 `/var/lib/miniocr/jobs`）。同机的工作进程直接打开这个文件。路径不存在或长度对不上时，仍向协调进程下载。任务结束后删除该文件；渲染进程先放开对它的映射。别的机器上看不到这个路径，所以还是走下载。
 
-比赛目录 `MINIOCR_CHALLENGE_RESOURCE_DIR` 里的 PDF 不走上面的复制：worker 就地只读打开原件，任务结束不删除。该目录不要指到 `sharedDir`。
+本地目录 `MINIOCR_CHALLENGE_RESOURCE_DIR` 里的 PDF 不走上面的复制：worker 就地只读打开原件，任务结束不删除。该目录不要指到 `sharedDir`。
 
 ### 不用 Docker：本机脚本起 8 个 GPU 进程 + 1 个 CPU 进程（128 核 + 8×4090）
 
@@ -337,7 +333,7 @@ MINIOCR_CLUSTER_SPECULATIVE_TAIL=1
 
 - **一卡一进程，并核对枚举顺序。** `MINIOCR_OCR_VULKAN_DEVICE=N` 是 Vulkan 的枚举序号，不一定等于 `nvidia-smi` 的序号（装了 lavapipe 之类软件设备时会错位）。起完后用 `nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv` 核对每张卡恰好一个进程；或者写设备名子串。
 - **按 NUMA 绑核绑内存。** 不绑的话 8 个进程各自按 128 核起线程池、GC 堆和渲染进程，互相抢核。`nvidia-smi topo -m` 里每张卡有所属的 NUMA 节点。每个节点留出最后 2 个逻辑核给 CPU OCR 进程，其余核 `taskset` 给该卡的进程，再用 `numactl --membind` 绑内存。进程内 `Environment.ProcessorCount` 跟着 cpuset 变小，`autoScaleFromCpu` 会据此收缩 raster / 渲染进程数。
-- **第 9 个进程走 CPU 后端。** 绑在留出来的核上，`MINIOCR_OCR_BACKEND=cpu`。拉模式按它自己的 pages/s 领页，不会抢走 GPU 上的整批。AVX-512 上 ChineseV6Medium 是 fp32，精度不低于 GPU fp16。不要和 GPU 进程抢同一组核。
+- **第 9 个进程走 CPU 后端。** 绑在留出来的核上，`MINIOCR_OCR_BACKEND=cpu`。拉模式按它自己的 pages/s 领页，不会抢走 GPU 上的整批。AVX-512 上 ChineseV6Tiny 是 fp32。不要和 GPU 进程抢同一组核。
 - **渲染位图走 tmpfs。** 渲染进程用 `Path.GetTempPath()` 下的文件做内存映射传位图，默认落在磁盘 `/tmp`，会产生无意义的回写。每个进程设 `TMPDIR=/dev/shm/miniocr-gpuN`（先 `mkdir -p`）。
 - **三处路径所有进程一致。** `MINIOCR_CHALLENGE_RESOURCE_DIR`、`MINIOCR_CLUSTER_SHARED_DIR`、`MINIOCR_CONFIG_PATH` 用同一个绝对路径，worker 才能就地打开 PDF，而不是向协调进程下载。
 - **Vulkan 管线缓存每卡一份。** 8 个进程写同一个缓存文件会互相覆盖，`SIMD_OCR_VK_PIPELINE_CACHE=/var/cache/miniocr/vk-gpuN`。

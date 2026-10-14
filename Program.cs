@@ -171,16 +171,11 @@ Console.WriteLine(
     $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"backend={runtimeConfig.Backend}, lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"recIntraOpThreads={runtimeConfig.RecIntraOpThreads}, recBatch={runtimeConfig.RecBatchLines}, " +
-    $"useCls={runtimeConfig.UseDirectionClassification}, removeRedSeal={runtimeConfig.RemoveRedSeal}, sealOcr={runtimeConfig.SealOcr}, sealModel={runtimeConfig.SealModel}, antiAlias={runtimeConfig.AntiAliasing}, " +
+    $"useCls={runtimeConfig.UseDirectionClassification}, antiAlias={runtimeConfig.AntiAliasing}, " +
     $"detLimitSide={runtimeConfig.DetLimitSideLength}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
     $"renderMode={runtimeConfig.RenderMode}, renderProcesses={runtimeConfig.RenderProcessCount}, " +
     $"textLayer={runtimeConfig.TextLayer}, " +
     $"wechatInstances={runtimeConfig.WeChatInstances}, wechatStatus={wechatStatus}");
-if (runtimeConfig.SealOcr && !string.Equals(runtimeConfig.Mode, "local", StringComparison.Ordinal))
-{
-    Console.WriteLine(
-        "sealOcr is on, but the SimdPaddleOCR seal pass runs only in ocr.mode=local. Red-seal erasure is still skipped.");
-}
 Console.WriteLine(
     $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
@@ -191,7 +186,6 @@ Console.WriteLine(
     $"thinking={llmConfig.Thinking}, fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
 
 OcrEngine? engine = null;
-SealOcrEngine? sealEngine = null;
 if (llmOcrMode)
 {
     Console.WriteLine($"Skipping {ClusterRuntimeConfig.LocalModelName} / PaddleOcrAll — ocr.mode=llm (vision OCR).");
@@ -210,16 +204,6 @@ else
     if (engine.EngineCount != runtimeConfig.EngineCount)
         runtimeConfig = runtimeConfig.With(engineCount: engine.EngineCount);
     Console.WriteLine($"OCR backend requested={runtimeConfig.Backend} effective={engine.EffectiveBackend}");
-    if (runtimeConfig.SealOcr)
-    {
-        sealEngine = await SealOcrEngine.CreateAsync(
-            bootstrapLogs.CreateLogger<SealOcrEngine>(),
-            runtimeConfig,
-            engine.EffectiveBackend);
-        Console.WriteLine(sealEngine.IsLoaded
-            ? $"Seal OCR: PaddleOcrSealAll model={sealEngine.Model} engines={sealEngine.EngineCount}"
-            : $"Seal OCR: {sealEngine.Model} models unavailable; using red-blob polar unwrap.");
-    }
     if (engine.EffectiveBackend == "metal" && !string.IsNullOrEmpty(engine.GpuDeviceName))
     {
         Console.WriteLine(
@@ -250,16 +234,14 @@ builder.Services.AddSingleton(challengeConfig);
 if (challengeConfig.Enabled)
 {
     Console.WriteLine(
-        $"Challenge resource dir: {challengeConfig.ResourceDir} (read-only; fileId f1 opens f1.pdf, url optional)");
+        $"Local PDF dir: {challengeConfig.ResourceDir} (read-only; fileId f1 opens f1.pdf, url optional)");
 }
 else
 {
-    Console.WriteLine("Challenge resource dir: unset (files require fileId + absolute http(s) url)");
+    Console.WriteLine("Local PDF dir: unset (POST /ocr uses url, path, or upload)");
 }
 if (engine is not null)
     builder.Services.AddSingleton(engine);
-if (sealEngine is not null)
-    builder.Services.AddSingleton(sealEngine);
 if (wechatEngine is not null)
     builder.Services.AddSingleton(wechatEngine);
 
@@ -395,8 +377,7 @@ builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
         vision: sp.GetService<LlmVisionOcr>(),
         wechat: sp.GetService<WeChatOcrEngine>(),
         cluster: sp.GetService<ClusterCoordinator>(),
-        parallelRenderer: parallelRenderer,
-        seal: sealEngine);
+        parallelRenderer: parallelRenderer);
 });
 if (clusterConfig.Enabled)
 {
@@ -433,7 +414,6 @@ lifetime.ApplicationStopping.Register(() =>
         pipeline.DisposeAsync().AsTask().GetAwaiter().GetResult();
     if (engine is not null)
         engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
-    sealEngine?.Dispose();
     if (wechatEngine is not null)
         wechatEngine.DisposeAsync().AsTask().GetAwaiter().GetResult();
 });
@@ -455,10 +435,6 @@ app.MapGet("/health", (IServiceProvider sp) =>
             DetIntraOpThreads = ocr?.DetIntraOpThreads ?? 0,
             DefaultDpi = cfg.DefaultDpi,
             UseDirectionClassification = cfg.UseDirectionClassification,
-            RemoveRedSeal = cfg.RemoveRedSeal,
-            SealOcr = cfg.SealOcr,
-            SealModel = cfg.SealOcr ? (sp.GetService<SealOcrEngine>()?.Model ?? cfg.SealModel) : "",
-            SealApi = sp.GetService<SealOcrEngine>()?.IsLoaded ?? false,
             AntiAliasing = cfg.AntiAliasing,
             RasterWorkerCount = cfg.RasterWorkerCount,
             RenderMode = cfg.RenderMode,
@@ -613,7 +589,7 @@ async Task<IResult> HandleChallengeAsync(
         AppJsonContext.Relaxed.ChallengeAckResponse);
 }
 
-// Competition primary serviceUrl path (no auth).
+// Optional batch callback. Same handler as POST / so a base URL works.
 app.MapPost("/challenge", HandleChallengeAsync);
 // Also accept POST / so serviceUrl can be the bare base URL.
 app.MapPost("/", HandleChallengeAsync);
@@ -1062,24 +1038,21 @@ app.MapPost("/ocr/upload", async Task<IResult> (
 });
 
 app.MapGet("/", () => Results.Text(
-    "MiniOcr AOT API\n" +
-    "POST /challenge  ← competition serviceUrl (also POST /)\n" +
+    "MiniOcr local OCR API  (ChineseV6Tiny)\n" +
+    "POST /ocr        sync OCR. {\"url\":\"https://.../file.pdf\"} or {\"path\":\"C:\\\\...\\\\file.pdf\"} / ?dpi=96\n" +
+    "  ?verbose=1 (or ?text=1) also returns page text and timings\n" +
+    "POST /ocr/upload multipart file field, or form field path= (local PDF, Unicode paths ok)\n" +
+    "GET  /health\n" +
+    "POST /challenge  optional batch callback (also POST /)\n" +
     "  {\"teamId\":123,\"key\":\"...\",\"callbackUrl\":\"https://...\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
     "  With MINIOCR_CHALLENGE_RESOURCE_DIR set, url may be omitted: fileId f1 reads {dir}/f1.pdf (read-only).\n" +
     "  → HTTP 200 {\"ok\":true} immediately; results POSTed async to callbackUrl\n" +
-    "POST /ocr        debug sync OCR (competition shapes; response = callback body)\n" +
-    "  {\"teamId\":0,\"key\":\"debug\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
-    "  Same resource dir: files:[{fileId:\"f1\"}] opens {dir}/f1.pdf and does not download.\n" +
-    "  or legacy {\"url\":\"https://.../file.pdf\"} or {\"path\":\"C:\\\\...\\\\file.pdf\"} / ?dpi=96\n" +
-    "  ?verbose=1 (or ?text=1) returns text, ms/page, and ruleList for pages that have rules\n" +
-    "POST /ocr/upload multipart file field, or form field path= (local PDF, Unicode paths ok)\n" +
-    "GET  /health\n" +
     "CLI  MiniOcr --compare <pdf> [--pages N] [--dpi N]   wechat vs local → wechat-vs-local.txt\n" +
     $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} " +
-    $"ocr.mode={runtimeConfig.Mode} wechat={wechatStatus} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
+    $"ocr.mode={runtimeConfig.Mode} model={(runtimeConfig.IsLlmMode || runtimeConfig.IsWeChatMode ? "" : ClusterRuntimeConfig.LocalModelName)} wechat={wechatStatus} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
-    "Env CHALLENGE: MINIOCR_CHALLENGE_RESOURCE_DIR (empty = require fileId+url; set = read-only {dir}/{fileId}.pdf)\n" +
-    "Env OCR: MINIOCR_OCR_MODE MINIOCR_OCR_BACKEND MINIOCR_OCR_VULKAN_DEVICE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_REC_INTRA_OP_THREADS MINIOCR_USE_CLS MINIOCR_REMOVE_RED_SEAL MINIOCR_RASTER_WORKERS MINIOCR_RENDER_MODE MINIOCR_RENDER_PROCESSES\n" +
+    "Env local PDF dir (optional): MINIOCR_CHALLENGE_RESOURCE_DIR (empty = require fileId+url; set = read-only {dir}/{fileId}.pdf)\n" +
+    "Env OCR: MINIOCR_OCR_MODE MINIOCR_OCR_BACKEND MINIOCR_OCR_VULKAN_DEVICE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_REC_INTRA_OP_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS MINIOCR_RENDER_MODE MINIOCR_RENDER_PROCESSES\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_API_KEYS MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_MAX_CONCURRENCY_PER_KEY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_NER_MAX_ATTEMPTS MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
     "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH MINIOCR_CLUSTER_DISTRIBUTED_NER\n" +

@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using Sdcb.SimdPaddleOCR;
 using Sdcb.SimdPaddleOCR.ModelProvider;
-using Sdcb.SimdPaddleOCR.Models.ChineseV6Medium;
+using Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny;
 
 namespace MiniOcr.Services;
 
@@ -204,7 +204,7 @@ public sealed class OcrEngine : IAsyncDisposable
             },
         };
 
-        PaddleOcrModelBundle bundle = ChineseV6MediumModels.Default;
+        PaddleOcrModelBundle bundle = ChineseV6TinyModels.Default;
         if (!config.UseDirectionClassification)
         {
             // Skip loading CLS weights entirely — saves RAM × engine count and avoids CLS compute.

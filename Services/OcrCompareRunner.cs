@@ -72,7 +72,6 @@ public static class OcrCompareRunner
 
         WeChatOcrEngine? wechat = null;
         OcrEngine? local = null;
-        SealOcrEngine? seal = null;
         try
         {
             wechat = await WeChatOcrEngine.ConnectAsync(location, config, logger, CancellationToken.None, instanceCount: 1)
@@ -80,11 +79,6 @@ public static class OcrCompareRunner
             Console.WriteLine($"Loading one {ClusterRuntimeConfig.LocalModelName} engine for the local side of the comparison...");
             local = await OcrEngine.CreateAsync(logs.CreateLogger<OcrEngine>(), config, CancellationToken.None)
                 .ConfigureAwait(false);
-            if (config.SealOcr)
-            {
-                seal = await SealOcrEngine.CreateAsync(logger, config, local.EffectiveBackend, CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
 
             var rows = new List<PageRow>(limit);
             RenderOptions render = PdfParallelOptions.CreateRenderOptions(dpi, config);
@@ -98,13 +92,11 @@ public static class OcrCompareRunner
                 if (!enumerator.MoveNext())
                     throw new InvalidOperationException($"PDFtoImage did not yield page {i + 1}.");
                 using SKBitmap bitmap = enumerator.Current;
-                if (config.EraseRedSealInk)
-                    RedSealFilter.Apply(bitmap, config.RedSealAllInk ? 0 : RedSealFilter.MinSealSideForDpi(dpi));
 
                 PageRow row = new() { Page = i + 1, Width = bitmap.Width, Height = bitmap.Height };
                 row.WeChat = await TimeAsync(() => wechat.RecognizeBitmapAsync(bitmap, CancellationToken.None))
                     .ConfigureAwait(false);
-                row.Local = await TimeAsync(() => RecognizeLocalAsync(local, seal, bitmap, config, dpi, CancellationToken.None))
+                row.Local = await TimeAsync(() => RecognizeLocalAsync(local, bitmap, CancellationToken.None))
                     .ConfigureAwait(false);
                 rows.Add(row);
                 Console.WriteLine(
@@ -131,7 +123,6 @@ public static class OcrCompareRunner
                 await wechat.DisposeAsync().ConfigureAwait(false);
             if (local is not null)
                 await local.DisposeAsync().ConfigureAwait(false);
-            seal?.Dispose();
         }
     }
 
@@ -151,58 +142,11 @@ public static class OcrCompareRunner
         }
     }
 
-    private static async Task<string> RecognizeLocalAsync(
+    private static Task<string> RecognizeLocalAsync(
         OcrEngine engine,
-        SealOcrEngine? seal,
         SKBitmap bitmap,
-        OcrRuntimeConfig config,
-        int dpi,
-        CancellationToken ct)
-    {
-        EnsureBgra(bitmap, out SKBitmap working, out bool owned);
-        try
-        {
-            string body = await RunEngineAsync(engine, working, ct).ConfigureAwait(false);
-            if (!config.SealOcr)
-                return body;
-            if (seal is { IsLoaded: true })
-            {
-                string apiText = await seal.ReadAsync(working, ct).ConfigureAwait(false);
-                return SealRingOcr.MergePageText(body, apiText);
-            }
-
-            List<SealRingOcr.SealCapture> seals = [];
-            int stride = working.RowBytes;
-            int byteCount = stride * working.Height;
-            IntPtr ptr = working.GetPixels();
-            if (ptr != IntPtr.Zero && byteCount > 0 && working.ColorType == SKColorType.Bgra8888)
-            {
-                unsafe
-                {
-                    ReadOnlySpan<byte> span = new((void*)ptr, byteCount);
-                    seals = SealRingOcr.Capture(
-                        span,
-                        working.Width,
-                        working.Height,
-                        stride,
-                        RedSealFilter.MinSealSideForDpi(dpi));
-                }
-            }
-
-            if (seals.Count == 0)
-                return body;
-            string sealText = await SealOcrPass.ReadAsync(
-                seals,
-                (image, token) => RunEngineAsync(engine, image, token),
-                ct).ConfigureAwait(false);
-            return SealRingOcr.MergePageText(body, sealText);
-        }
-        finally
-        {
-            if (owned)
-                working.Dispose();
-        }
-    }
+        CancellationToken ct) =>
+        RunEngineAsync(engine, bitmap, ct);
 
     private static async Task<string> RunEngineAsync(OcrEngine engine, SKBitmap bitmap, CancellationToken ct)
     {
@@ -211,43 +155,18 @@ public static class OcrCompareRunner
         int stride = bitmap.RowBytes;
         IntPtr pixels = bitmap.GetPixels();
         int byteCount = stride * height;
+        Sdcb.SimdPaddleOCR.ImagePixelFormat format = bitmap.ColorType == SKColorType.Gray8
+            ? Sdcb.SimdPaddleOCR.ImagePixelFormat.Gray8
+            : Sdcb.SimdPaddleOCR.ImagePixelFormat.Bgra32;
         Sdcb.SimdPaddleOCR.PaddleOcrResult result = await engine.UseAsync(ocr =>
         {
             unsafe
             {
                 ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
-                return ocr.Run(span, width, height, stride, Sdcb.SimdPaddleOCR.ImagePixelFormat.Bgra32);
+                return ocr.Run(span, width, height, stride, format);
             }
         }, ct).ConfigureAwait(false);
         return result.Text?.Replace("\r", "").Trim() ?? "";
-    }
-
-    private static async Task<string> RunEngineAsync(OcrEngine engine, SealRingOcr.SealImage image, CancellationToken ct)
-    {
-        if (image.IsEmpty)
-            return "";
-        byte[] bgra = image.Bgra;
-        int width = image.Width;
-        int height = image.Height;
-        int stride = image.Stride;
-        Sdcb.SimdPaddleOCR.PaddleOcrResult result = await engine.UseAsync(
-            ocr => ocr.Run(bgra, width, height, stride, Sdcb.SimdPaddleOCR.ImagePixelFormat.Bgra32),
-            ct).ConfigureAwait(false);
-        return result.Text?.Replace("\r", "").Trim() ?? "";
-    }
-
-    private static void EnsureBgra(SKBitmap source, out SKBitmap working, out bool owned)
-    {
-        if (source.ColorType == SKColorType.Bgra8888)
-        {
-            working = source;
-            owned = false;
-            return;
-        }
-
-        working = source.Copy(SKColorType.Bgra8888)
-            ?? throw new InvalidOperationException("Failed to convert SKBitmap to BGRA8888.");
-        owned = true;
     }
 
     private static string FormatReport(string pdf, int dpi, WeChatOcrLocation location, List<PageRow> rows)
@@ -258,7 +177,7 @@ public static class OcrCompareRunner
         var sb = new StringBuilder();
         sb.AppendLine("MiniOcr wechat vs local");
         sb.AppendLine("NOTE: WeChat OCR uses an unofficial reverse-engineered mmmojo interface.");
-        sb.AppendLine("It is for local comparison on this PC, not the competition server (ToS risk).");
+        sb.AppendLine("It is for local comparison on this PC, not a public service (ToS risk).");
         sb.AppendLine("Benchmark is single-threaded: 1 WeChatOCR process and 1 Paddle engine, pages in order.");
         sb.AppendLine("wechat_ms includes PNG encode + plugin. local_ms is Paddle Run. Page 1 includes warmup.");
         sb.AppendLine("pdf=" + pdf);
