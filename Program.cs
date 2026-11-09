@@ -805,7 +805,10 @@ app.MapPost("/ocr", async Task<IResult> (
             return null;
         }
 
-        ParallelPdfDownloader.DownloadResult download;
+        RentedBuffer? buffer = null;
+        PdfRemoteDocument? remote = null;
+        string downloadMode;
+        double downloadMs;
         string? sourceUrl;
         if (decision.Kind == ChallengeResourceFiles.SourceKind.Local)
         {
@@ -815,7 +818,9 @@ app.MapPost("/ocr", async Task<IResult> (
                 decision.LocalPath,
                 ChallengeResourceFiles.DownloadMode);
             ChallengeResourceFiles.LocalRead local = ChallengeResourceFiles.ReadLocal(decision.LocalPath!);
-            download = new ParallelPdfDownloader.DownloadResult(local.Buffer, local.Mode, local.ElapsedMs);
+            buffer = local.Buffer;
+            downloadMode = local.Mode;
+            downloadMs = local.ElapsedMs;
             sourceUrl = decision.LocalPath;
         }
         else
@@ -829,9 +834,22 @@ app.MapPost("/ocr", async Task<IResult> (
                     decision.LocalPath);
             }
 
-            services.GetService<ClusterCoordinator>()?.BeginSourcePrefetch(url);
-            download = await downloader.DownloadAsync(url, token).ConfigureAwait(false);
+            ClusterCoordinator? cluster = services.GetService<ClusterCoordinator>();
+            cluster?.BeginSourcePrefetch(url);
+            bool partialOk = cluster?.ShouldDistribute() != true;
+            PdfRemoteDocument acquired = await downloader.AcquireAsync(url, partialOk, token).ConfigureAwait(false);
+            downloadMode = acquired.Mode;
+            downloadMs = acquired.ElapsedMs;
             sourceUrl = url;
+            if (acquired.IsPartial)
+            {
+                remote = acquired;
+            }
+            else
+            {
+                buffer = acquired.DetachBuffer();
+                await acquired.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         IDisposable? traceScope = ocrTrace.Enabled
@@ -840,18 +858,21 @@ app.MapPost("/ocr", async Task<IResult> (
         PdfOcrRun run;
         try
         {
-            run = pipeline.Start(download.Buffer, download.ElapsedMs, download.Mode, token, dpi, sourceUrl);
+            run = remote is not null
+                ? pipeline.Start(remote, token, dpi, sourceUrl)
+                : pipeline.Start(buffer!, downloadMs, downloadMode, token, dpi, sourceUrl);
         }
         catch
         {
             traceScope?.Dispose();
-            download.Buffer.Dispose();
+            remote?.Dispose();
+            buffer?.Dispose();
             throw;
         }
 
         return new SequentialPdfOverlap.Started(
             run.OcrCompleted,
-            FinishDebugFileAsync(index, fileId, decision, download.Buffer, download.Mode, traceScope, run),
+            FinishDebugFileAsync(index, fileId, decision, buffer, remote, downloadMode, traceScope, run),
             run.ReleaseNext);
     }
 
@@ -859,7 +880,8 @@ app.MapPost("/ocr", async Task<IResult> (
         int index,
         string fileId,
         ChallengeResourceFiles.SourceDecision decision,
-        RentedBuffer buffer,
+        RentedBuffer? buffer,
+        PdfRemoteDocument? remote,
         string downloadMode,
         IDisposable? traceScope,
         PdfOcrRun run)
@@ -893,7 +915,8 @@ app.MapPost("/ocr", async Task<IResult> (
         finally
         {
             traceScope?.Dispose();
-            buffer.Dispose();
+            buffer?.Dispose();
+            remote?.Dispose();
         }
     }
     return Results.Json(callbackShaped, AppJsonContext.Relaxed.ChallengeCallbackBody);
