@@ -8,6 +8,7 @@
     <RootNamespace>MiniOcr.ClusterBench</RootNamespace>
     <IsPackable>false</IsPackable>
     <PublishAot>false</PublishAot>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,12 +17,14 @@
 
   <ItemGroup>
     <Using Include="Microsoft.Extensions.Logging" />
+    <ProjectReference Include="..\..\external\PDFtoImage\src\PDFtoImage\PDFtoImage.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <Compile Include="..\..\Services\ClusterPageScheduler.cs" Link="ClusterPageScheduler.cs" />
     <Compile Include="..\..\Services\ClusterPdfRange.cs" Link="ClusterPdfRange.cs" />
     <Compile Include="..\..\Services\ParallelPdfDownloader.cs" Link="ParallelPdfDownloader.cs" />
+    <Compile Include="..\..\Services\PdfRemoteDocument.cs" Link="PdfRemoteDocument.cs" />
     <Compile Include="..\..\Services\RentedBuffer.cs" Link="RentedBuffer.cs" />
   </ItemGroup>
 
