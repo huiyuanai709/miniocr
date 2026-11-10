@@ -188,7 +188,10 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
             return null;
         }
 
-        ParallelPdfDownloader.DownloadResult download;
+        RentedBuffer? buffer = null;
+        PdfRemoteDocument? remote = null;
+        string downloadMode = "";
+        double downloadMs = 0;
         string? sourceUrl;
         try
         {
@@ -201,8 +204,9 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
                     ChallengeResourceFiles.DownloadMode);
                 ChallengeResourceFiles.LocalRead local =
                     ChallengeResourceFiles.ReadLocal(decision.LocalPath!);
-                download = new ParallelPdfDownloader.DownloadResult(
-                    local.Buffer, local.Mode, local.ElapsedMs);
+                buffer = local.Buffer;
+                downloadMode = local.Mode;
+                downloadMs = local.ElapsedMs;
                 // Path lets cluster workers open the same file. It is not an http URL, so no prefetch.
                 sourceUrl = decision.LocalPath;
             }
@@ -218,14 +222,30 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
                 }
 
                 _cluster?.BeginSourcePrefetch(url);
-                download = await _downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+                // Workers prefetch the URL themselves. This node keeps a Range session when it
+                // is not also the byte source for the cluster; distribution still needs the full file.
+                bool partialOk = _cluster?.ShouldDistribute() != true;
+                PdfRemoteDocument acquired = await _downloader.AcquireAsync(url, partialOk, ct).ConfigureAwait(false);
+                downloadMode = acquired.Mode;
+                downloadMs = acquired.ElapsedMs;
                 sourceUrl = url;
+                if (acquired.IsPartial)
+                {
+                    remote = acquired;
+                }
+                else
+                {
+                    buffer = acquired.DetachBuffer();
+                    await acquired.DisposeAsync().ConfigureAwait(false);
+                }
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Challenge file failed: fileId={FileId}, path={Path}", fileId, decision.LocalPath);
             results[index] = new ChallengeFileResult { FileId = fileId, Pages = [] };
+            remote?.Dispose();
+            buffer?.Dispose();
             return null;
         }
 
@@ -237,17 +257,20 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         PdfOcrRun run;
         try
         {
-            run = _pipeline.Start(download.Buffer, download.ElapsedMs, download.Mode, ct, sourceUrl: sourceUrl);
+            run = remote is not null
+                ? _pipeline.Start(remote, ct, sourceUrl: sourceUrl)
+                : _pipeline.Start(buffer!, downloadMs, downloadMode, ct, sourceUrl: sourceUrl);
         }
         catch
         {
             traceScope?.Dispose();
-            download.Buffer.Dispose();
+            remote?.Dispose();
+            buffer?.Dispose();
             throw;
         }
 
         Task finished = FinishFileAsync(
-            job, index, fileId, decision, download.Buffer, download.Mode, traceScope, run, results);
+            job, index, fileId, decision, buffer, remote, downloadMode, traceScope, run, results);
         return new SequentialPdfOverlap.Started(run.OcrCompleted, finished, run.ReleaseNext);
     }
 
@@ -256,7 +279,8 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         int index,
         string fileId,
         ChallengeResourceFiles.SourceDecision decision,
-        RentedBuffer buffer,
+        RentedBuffer? buffer,
+        PdfRemoteDocument? remote,
         string downloadMode,
         IDisposable? traceScope,
         PdfOcrRun run,
@@ -291,7 +315,8 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         finally
         {
             traceScope?.Dispose();
-            buffer.Dispose();
+            buffer?.Dispose();
+            remote?.Dispose();
         }
     }
 

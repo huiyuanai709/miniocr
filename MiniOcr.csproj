@@ -50,9 +50,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Pinned fork master @ b577ca9. Same tree as d47fbc3 (retained PDF close);
-         that tree already includes 68e30fe (Gray8 PdfPixels, PrewarmAsync,
-         ShareSourceFile/RetainDocuments/NativeGrayscale, net11.0 runtime-async).
+    <!-- Pinned fork master @ ea25ba6 (page ranges, HTTP Range, IPdfRandomAccess).
+         Includes the retained-PDF close (d47fbc3 / b577ca9) and 68e30fe
+         (Gray8 PdfPixels, PrewarmAsync, ShareSourceFile/RetainDocuments/NativeGrayscale).
          Native PDFium / SkiaSharp assets flow as runtime assets of the core project
          (runtimes/<rid>/native); .NET copies them on publish the same way a
          PackageReference to the PDFtoImage nupkg did. Parallel re-launches this

@@ -168,13 +168,25 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         string? sourceUrl,
         CancellationToken ct,
         Action? onOcrReady,
-        Action? onGpuReady)
+        Action? onGpuReady,
+        PdfRemoteDocument? remote = null)
     {
         try
         {
+        if (remote is { IsPartial: true } && _cluster?.ShouldDistribute() == true)
+        {
+            throw new InvalidOperationException(
+                "Cluster distribution needs the full PDF downloaded; an HTTP Range session cannot be shared as bytes.");
+        }
+
         int pageCount;
-        using (MemoryStream countStream = new(pdfBytes, index: 0, count: pdfByteCount, writable: false, publiclyVisible: true))
+        if (remote?.Session is { } opened)
+            pageCount = opened.PageCount;
+        else
+        {
+            using MemoryStream countStream = new(pdfBytes, index: 0, count: pdfByteCount, writable: false, publiclyVisible: true);
             pageCount = Conversion.GetPageCount(countStream, leaveOpen: false);
+        }
 
         if (pageCount <= 0)
             throw new InvalidOperationException("PDF has no pages.");
@@ -200,7 +212,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 "OCR pipeline (llm vision): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, ocrConcurrency={Conc}, rasterWorkers={Raster}",
                 pageCount, pdfByteCount, dpi, _vision!.OcrConcurrency, _rasterWorkers);
             return await ProcessWithVisionAsync(
-                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct)
+                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct, remote)
                 .ConfigureAwait(false);
         }
 
@@ -214,7 +226,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 modeLabel: "wechat",
                 workers: _wechat.InstanceCount,
                 recognize: (image, token) => _wechat.RecognizeBitmapAsync(image.RequireBitmap(), token),
-                onOcrReady: onOcrReady)
+                onOcrReady: onOcrReady,
+                remote: remote)
                 .ConfigureAwait(false);
         }
 
@@ -227,12 +240,87 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             modeLabel: "local",
             workers: _engine.EngineCount,
             recognize: RecognizeLocalAsync,
-            onOcrReady: onOcrReady)
+            onOcrReady: onOcrReady,
+            remote: remote)
             .ConfigureAwait(false);
         }
         finally
         {
-            await ReleaseMappedPdfAsync(pdfBytes).ConfigureAwait(false);
+            if (remote is not null)
+            {
+                _logger.LogInformation(
+                    "HTTP range PDF host={Host} mode={Mode} contentLength={Length} bytesFetched={Fetched} reads={Reads}",
+                    remote.FinalUri.Host,
+                    remote.Mode,
+                    remote.Length,
+                    remote.BytesFetched,
+                    remote.RangeFetchCount);
+            }
+            else
+            {
+                await ReleaseMappedPdfAsync(pdfBytes).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Same as <see cref="Start(RentedBuffer, double, string, CancellationToken, int?, string?)"/>
+    /// for a URL opened with <see cref="ParallelPdfDownloader.AcquireAsync"/>.
+    /// A partial Range session renders through that <see cref="PDFtoImage.PdfSession"/>
+    /// (only the pages that need OCR). A full-download buffer uses the existing pipeline,
+    /// including parallel workers. The caller keeps <paramref name="remote"/> alive until
+    /// <see cref="PdfOcrRun.Response"/> completes.
+    /// </summary>
+    public PdfOcrRun Start(
+        PdfRemoteDocument remote,
+        CancellationToken ct,
+        int? dpiOverride = null,
+        string? sourceUrl = null)
+    {
+        if (!remote.IsPartial || remote.Session is null)
+        {
+            throw new InvalidOperationException(
+                "Start(PdfRemoteDocument) is the HTTP Range session path. A full download uses Start(RentedBuffer).");
+        }
+
+        TaskCompletionSource ocrGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource nextGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Stopwatch totalSw = Stopwatch.StartNew();
+        int length = remote.Length > int.MaxValue ? int.MaxValue : (int)remote.Length;
+        return new PdfOcrRun(ocrGate.Task, Run(), nextGate.Task);
+
+        void ReleaseNext(string reason)
+        {
+            if (!nextGate.TrySetResult())
+                return;
+            _logger.LogInformation("Next PDF may start ({Reason})", reason);
+        }
+
+        async Task<OcrResponse> Run()
+        {
+            try
+            {
+                return await ProcessCoreAsync(
+                    Array.Empty<byte>(), length, remote.ElapsedMs, remote.Mode, totalSw, dpiOverride, sourceUrl, ct,
+                    () =>
+                    {
+                        ocrGate.TrySetResult();
+                        ReleaseNext("ocr-complete");
+                    },
+                    () => ReleaseNext("gpu-room"),
+                    remote).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                ocrGate.TrySetException(ex);
+                nextGate.TrySetException(ex);
+                throw;
+            }
+            finally
+            {
+                ocrGate.TrySetResult();
+                nextGate.TrySetResult();
+            }
         }
     }
 
@@ -244,7 +332,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         double downloadMs,
         string downloadMode,
         Stopwatch totalSw,
-        CancellationToken ct)
+        CancellationToken ct,
+        PdfRemoteDocument? remote = null)
     {
         RenderOptions renderOptions = CreateRenderOptions(dpi);
         int concurrency = _vision!.OcrConcurrency;
@@ -294,10 +383,12 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             concurrency,
             jpegCapacity);
 
-        TextLayerPlan visionPlan = PlanTextLayer(pdfBytes, pdfByteCount, pageCount);
+        TextLayerPlan visionPlan = remote?.Session is { } remoteSession
+            ? PlanTextLayer(remoteSession, pageCount)
+            : PlanTextLayer(pdfBytes, pdfByteCount, pageCount);
         PlacePrepared(pages, visionPlan, ner: null);
         Task producer = ProduceIndicesAsync(
-            pdfBytes, pdfByteCount, visionPlan.OcrIndices, renderOptions, rasterized.Writer, ct);
+            pdfBytes, pdfByteCount, visionPlan.OcrIndices, renderOptions, rasterized.Writer, ct, remote: remote);
 
         async Task EncodeConsumerAsync()
         {
@@ -486,7 +577,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         string modeLabel,
         int workers,
         Func<PageImage, CancellationToken, Task<string>> recognize,
-        Action? onOcrReady)
+        Action? onOcrReady,
+        PdfRemoteDocument? remote = null)
     {
         s_gpuJob.Value = new GpuJob();
         try
@@ -512,10 +604,12 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             ? _llm.Begin(pageCount, llmCts.Token)
             : null;
 
-        TextLayerPlan plan = PlanTextLayer(pdfBytes, pdfByteCount, pageCount);
+        TextLayerPlan plan = remote?.Session is { } remoteSession
+            ? PlanTextLayer(remoteSession, pageCount)
+            : PlanTextLayer(pdfBytes, pdfByteCount, pageCount);
         PlacePrepared(pages, plan, ner);
         Task producer = ProduceIndicesAsync(
-            pdfBytes, pdfByteCount, plan.OcrIndices, renderOptions, rasterized.Writer, ct);
+            pdfBytes, pdfByteCount, plan.OcrIndices, renderOptions, rasterized.Writer, ct, remote: remote);
 
         async Task ConsumerAsync()
         {
@@ -861,14 +955,15 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int dpi,
         Action<OcrPageResult> onPage,
         CancellationToken ct,
-        string? sharedPdfPath = null)
+        string? sharedPdfPath = null,
+        PdfRemoteDocument? remote = null)
     {
         if (pageIndices.Count == 0)
             return;
         dpi = Math.Clamp(dpi, 36, 300);
         if (_config.IsLlmMode)
         {
-            await RecognizeIndicesVisionAsync(pdfBytes, pdfLength, pageIndices, dpi, onPage, ct)
+            await RecognizeIndicesVisionAsync(pdfBytes, pdfLength, pageIndices, dpi, onPage, ct, remote)
                 .ConfigureAwait(false);
             return;
         }
@@ -901,7 +996,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             });
 
         Task producer = ProduceIndicesAsync(
-            pdfBytes, pdfLength, indices, renderOptions, rasterized.Writer, ct, sharedPdfPath);
+            pdfBytes, pdfLength, indices, renderOptions, rasterized.Writer, ct, sharedPdfPath, remote);
 
         async Task ConsumerAsync()
         {
@@ -969,12 +1064,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         int dpi,
         Func<OcrPageResult, string, CancellationToken, ValueTask> onPage,
         CancellationToken ct,
-        string? sharedPdfPath = null)
+        string? sharedPdfPath = null,
+        PdfRemoteDocument? remote = null)
     {
         dpi = Math.Clamp(dpi, 36, 300);
         if (_config.IsLlmMode)
         {
-            await RecognizeFeedVisionAsync(pdfBytes, pdfLength, pages, dpi, onPage, ct).ConfigureAwait(false);
+            await RecognizeFeedVisionAsync(pdfBytes, pdfLength, pages, dpi, onPage, ct, remote).ConfigureAwait(false);
             return;
         }
 
@@ -1005,7 +1101,7 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             });
 
         Task producer = ProduceFeedAsync(
-            pdfBytes, pdfLength, pages, renderOptions, rasterized.Writer, ct, sharedPdfPath);
+            pdfBytes, pdfLength, pages, renderOptions, rasterized.Writer, ct, sharedPdfPath, remote);
 
         async Task ConsumerAsync()
         {
@@ -1081,7 +1177,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         RenderOptions renderOptions,
         ChannelWriter<(int Index, string BatchId, PageImage Image, double RasterMs)> writer,
         CancellationToken ct,
-        string? sharedPdfPath = null)
+        string? sharedPdfPath = null,
+        PdfRemoteDocument? remote = null)
     {
         try
         {
@@ -1113,9 +1210,13 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                         SingleReader = true,
                         FullMode = BoundedChannelFullMode.Wait,
                     });
-                Task rendering = DispatchRenderAsync(
-                    pdfBytes, pdfLength, indices.ToArray(), renderOptions, chunk.Writer, ct,
-                    completeWriter: true, sharedPdfPath: sharedPdfPath);
+                int[] batchPages = indices.ToArray();
+                Task rendering = remote is not null
+                    ? RenderRemotePagesAsync(
+                        remote, batchPages, renderOptions, chunk.Writer, ct, completeWriter: true)
+                    : DispatchRenderAsync(
+                        pdfBytes, pdfLength, batchPages, renderOptions, chunk.Writer, ct,
+                        completeWriter: true, sharedPdfPath: sharedPdfPath);
                 await foreach (var (index, bitmap, rasterMs) in chunk.Reader.ReadAllAsync(ct).ConfigureAwait(false))
                 {
                     string id = batchOf.TryGetValue(index, out string? found) ? found : "";
@@ -1145,7 +1246,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         ChannelReader<(string BatchId, int Page)> pages,
         int dpi,
         Func<OcrPageResult, string, CancellationToken, ValueTask> onPage,
-        CancellationToken ct)
+        CancellationToken ct,
+        PdfRemoteDocument? remote = null)
     {
         List<(string BatchId, int Index)> chunk = new(8);
         await foreach (var (batchId, page) in pages.ReadAllAsync(ct).ConfigureAwait(false))
@@ -1183,7 +1285,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                     string id = batchOf.TryGetValue(page.Page - 1, out string? found) ? found : "";
                     onPage(page, id, ct).AsTask().GetAwaiter().GetResult();
                 },
-                ct).ConfigureAwait(false);
+                ct,
+                remote).ConfigureAwait(false);
         }
     }
 
@@ -1193,7 +1296,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         IReadOnlyList<int> pageIndices,
         int dpi,
         Action<OcrPageResult> onPage,
-        CancellationToken ct)
+        CancellationToken ct,
+        PdfRemoteDocument? remote = null)
     {
         if (_vision is null || !_vision.IsUsable)
             throw new InvalidOperationException("ocr.mode=llm requires a usable LLM.");
@@ -1209,7 +1313,8 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
-        Task producer = ProduceIndicesAsync(pdfBytes, pdfLength, indices, renderOptions, rasterized.Writer, ct);
+        Task producer = ProduceIndicesAsync(
+            pdfBytes, pdfLength, indices, renderOptions, rasterized.Writer, ct, remote: remote);
         int concurrency = Math.Clamp(Math.Min(_vision.OcrConcurrency, Math.Max(1, indices.Length)), 1, 64);
 
         async Task ConsumerAsync()
@@ -1260,8 +1365,11 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         RenderOptions renderOptions,
         ChannelWriter<(int, PageImage, double)> writer,
         CancellationToken ct,
-        string? sharedPdfPath = null) =>
-        DispatchRenderAsync(pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct, sharedPdfPath: sharedPdfPath);
+        string? sharedPdfPath = null,
+        PdfRemoteDocument? remote = null) =>
+        remote is not null
+            ? RenderRemotePagesAsync(remote, pageIndices, renderOptions, writer, ct, completeWriter: true)
+            : DispatchRenderAsync(pdfBytes, pdfLength, pageIndices, renderOptions, writer, ct, sharedPdfPath: sharedPdfPath);
 
     private string LogTextHash(OcrPageResult?[] pages)
     {
@@ -1518,11 +1626,18 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
     /// </summary>
     private TextLayerPlan PlanTextLayer(byte[] pdfBytes, int pdfLength, int pageCount)
     {
-        int[] every = new int[Math.Max(0, pageCount)];
-        for (int i = 0; i < every.Length; i++)
-            every[i] = i;
         if (!_config.TextLayerEnabled || pageCount <= 0)
-            return new TextLayerPlan { Prepared = new OcrPageResult?[pageCount], OcrIndices = every };
+            return PlanTextLayerDisabled(pageCount);
+
+        using MemoryStream stream = new(pdfBytes, 0, pdfLength, writable: false, publiclyVisible: true);
+        using PdfSession session = PdfSession.Open(stream, leaveOpen: true);
+        return PlanTextLayer(session, pageCount);
+    }
+
+    private TextLayerPlan PlanTextLayer(PdfSession session, int pageCount)
+    {
+        if (!_config.TextLayerEnabled || pageCount <= 0)
+            return PlanTextLayerDisabled(pageCount);
 
         PdfTextLayer.Thresholds thresholds = new(
             _config.TextLayerMinChars,
@@ -1532,10 +1647,11 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         OcrPageResult?[] prepared = new OcrPageResult?[pageCount];
         List<int> ocr = new(pageCount);
         Stopwatch sw = Stopwatch.StartNew();
+        int[] every = new int[pageCount];
+        for (int i = 0; i < every.Length; i++)
+            every[i] = i;
         try
         {
-            using MemoryStream stream = new(pdfBytes, 0, pdfLength, writable: false, publiclyVisible: true);
-            using PdfSession session = PdfSession.Open(stream, leaveOpen: true);
             int limit = Math.Min(pageCount, session.PageCount);
             for (int i = 0; i < limit; i++)
             {
@@ -1619,6 +1735,14 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             OcrIndices = ocr.ToArray(),
             AnalyzeMs = sw.Elapsed.TotalMilliseconds,
         };
+    }
+
+    private static TextLayerPlan PlanTextLayerDisabled(int pageCount)
+    {
+        int[] every = new int[Math.Max(0, pageCount)];
+        for (int i = 0; i < every.Length; i++)
+            every[i] = i;
+        return new TextLayerPlan { Prepared = new OcrPageResult?[pageCount], OcrIndices = every };
     }
 
     /// <summary>
@@ -1934,11 +2058,27 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
 
             if (UseNativeGrayPixels)
             {
+                // Packed Gray8 has no Range overload. A contiguous span still renders only those pages.
+                IEnumerable<int> selection = PdfPageSpan.TryContiguous(pageIndices, out int grayFirst, out int graySpan)
+                    ? Enumerable.Range(grayFirst, graySpan)
+                    : pageIndices;
                 await foreach (PdfPixels pixels in processor.ToImagesPixelsAsync(
-                    stream, pageIndices, leaveOpen: true, options: renderOptions, cancellationToken: ct)
+                    stream, selection, leaveOpen: true, options: renderOptions, cancellationToken: ct)
                     .ConfigureAwait(false))
                 {
                     await PublishAsync(PageImage.FromPixels(pixels)).ConfigureAwait(false);
+                }
+            }
+            else if (PdfPageSpan.TryContiguous(pageIndices, out int firstPage, out int pageSpan))
+            {
+                await foreach (SKBitmap bitmap in processor.ToImagesAsync(
+                    stream,
+                    pages: firstPage..(firstPage + pageSpan),
+                    leaveOpen: true,
+                    options: renderOptions,
+                    cancellationToken: ct).ConfigureAwait(false))
+                {
+                    await PublishAsync(PageImage.FromBitmap(bitmap)).ConfigureAwait(false);
                 }
             }
             else
@@ -1965,6 +2105,103 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Renders an HTTP Range session. PDFium on one <see cref="PdfSession"/> is not re-entrant,
+    /// so pages are produced one at a time and only the requested indices are rendered.
+    /// </summary>
+    private async Task RenderRemotePagesAsync(
+        PdfRemoteDocument remote,
+        int[] pageIndices,
+        RenderOptions renderOptions,
+        ChannelWriter<(int, PageImage, double)> writer,
+        CancellationToken ct,
+        bool completeWriter)
+    {
+        try
+        {
+            if (pageIndices.Length == 0)
+                return;
+            PdfSession session = remote.Session
+                ?? throw new InvalidOperationException("HTTP Range PDF has no open session.");
+
+            bool pixels = _engine is not null && !_config.IsLlmMode && !_config.IsWeChatMode;
+            await remote.RenderGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (pixels)
+                {
+                    foreach (int page in pageIndices)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        Stopwatch sw = Stopwatch.StartNew();
+                        PdfPixels rendered = session.RenderPixels(page, renderOptions);
+                        sw.Stop();
+                        PageImage image = PageImage.FromPixels(rendered);
+                        image.Dpi = renderOptions.Dpi;
+                        try
+                        {
+                            await writer.WriteAsync((page, image, sw.Elapsed.TotalMilliseconds), ct)
+                                .ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            image.Dispose();
+                            throw;
+                        }
+                    }
+                }
+                else
+                {
+                    // RenderPages(Range) ignores RenderOptions. Keep dpi/grayscale via the options overload.
+                    // Contiguous spans still render only that span (Enumerable.Range), not the other pages.
+                    IEnumerable<int> selection = PdfPageSpan.TryContiguous(pageIndices, out int first, out int span)
+                        ? Enumerable.Range(first, span)
+                        : pageIndices;
+                    using IEnumerator<SKBitmap> enumerator =
+                        session.RenderPages(selection, renderOptions).GetEnumerator();
+                    int idx = 0;
+                    while (idx < pageIndices.Length)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        Stopwatch sw = Stopwatch.StartNew();
+                        if (!enumerator.MoveNext())
+                        {
+                            throw new InvalidOperationException(
+                                $"PDFtoImage yielded {idx} pages, expected {pageIndices.Length}.");
+                        }
+
+                        SKBitmap bitmap = enumerator.Current;
+                        sw.Stop();
+                        int page = pageIndices[idx++];
+                        PageImage image = PageImage.FromBitmap(bitmap);
+                        try
+                        {
+                            image.Dpi = renderOptions.Dpi;
+                            await writer.WriteAsync((page, image, sw.Elapsed.TotalMilliseconds), ct)
+                                .ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            image.Dispose();
+                            while (enumerator.MoveNext())
+                                enumerator.Current.Dispose();
+                            throw;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                remote.RenderGate.Release();
+            }
+        }
+        finally
+        {
+            if (completeWriter)
+                writer.TryComplete();
+        }
+    }
+
     private async Task ProduceInProcessAsync(
         byte[] pdfBytes,
         int pdfLength,
@@ -1977,39 +2214,55 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
             return;
 
         int workers = InProcessRasterWorkers(_rasterWorkers, pageIndices.Length);
+        int chunk = (pageIndices.Length + workers - 1) / workers;
         Task[] tasks = new Task[workers];
         for (int w = 0; w < workers; w++)
         {
             int workerId = w;
             tasks[w] = Task.Run(async () =>
             {
+                int start = workerId * chunk;
+                if (start >= pageIndices.Length)
+                    return;
+                int take = Math.Min(chunk, pageIndices.Length - start);
+                int[] mine = new int[take];
+                Array.Copy(pageIndices, start, mine, 0, take);
+
                 using MemoryStream local = new(
                     pdfBytes, index: 0, count: pdfLength, writable: false, publiclyVisible: true);
-                List<int> mine = new((pageIndices.Length + workers - 1) / workers);
-                for (int i = workerId; i < pageIndices.Length; i += workers)
-                    mine.Add(pageIndices[i]);
-                if (mine.Count == 0)
-                    return;
+                if (PdfPageSpan.TryContiguous(mine, out int first, out int span))
+                {
+                    using IEnumerator<SKBitmap> enumerator = Conversion.ToImages(
+                        local,
+                        pages: first..(first + span),
+                        leaveOpen: true,
+                        options: renderOptions).GetEnumerator();
+                    await PublishAsync(enumerator, mine).ConfigureAwait(false);
+                }
+                else
+                {
+                    using PdfSession session = PdfSession.Open(local, leaveOpen: true);
+                    using IEnumerator<SKBitmap> enumerator =
+                        session.RenderPages(mine, renderOptions).GetEnumerator();
+                    await PublishAsync(enumerator, mine).ConfigureAwait(false);
+                }
 
-                IEnumerator<SKBitmap> enumerator =
-                    Conversion.ToImages(local, mine, leaveOpen: true, options: renderOptions)
-                        .GetEnumerator();
-                try
+                async Task PublishAsync(IEnumerator<SKBitmap> enumerator, int[] pages)
                 {
                     int idx = 0;
-                    while (idx < mine.Count)
+                    while (idx < pages.Length)
                     {
                         ct.ThrowIfCancellationRequested();
                         Stopwatch sw = Stopwatch.StartNew();
                         if (!enumerator.MoveNext())
                         {
                             throw new InvalidOperationException(
-                                $"PDFtoImage yielded {idx} pages, expected {mine.Count}.");
+                                $"PDFtoImage yielded {idx} pages, expected {pages.Length}.");
                         }
 
                         SKBitmap bitmap = enumerator.Current;
                         sw.Stop();
-                        int pageIndex = mine[idx++];
+                        int pageIndex = pages[idx++];
                         PageImage image = PageImage.FromBitmap(bitmap);
                         try
                         {
@@ -2025,10 +2278,6 @@ public sealed class PdfOcrPipeline : IAsyncDisposable
                             throw;
                         }
                     }
-                }
-                finally
-                {
-                    enumerator.Dispose();
                 }
             }, ct);
         }

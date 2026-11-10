@@ -1,6 +1,9 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Net;
 using System.Net.Http.Headers;
+using PDFtoImage;
+using PDFtoImage.Exceptions;
 
 namespace MiniOcr.Services;
 
@@ -31,6 +34,35 @@ public sealed class ParallelPdfDownloader
         CancellationToken ct,
         Action<HttpRequestMessage>? prepare)
     {
+        PdfRemoteDocument doc = await AcquireAsync(url, partialOk: false, ct, prepare).ConfigureAwait(false);
+        try
+        {
+            RentedBuffer buffer = doc.DetachBuffer();
+            return new DownloadResult(buffer, doc.Mode, doc.ElapsedMs);
+        }
+        finally
+        {
+            await doc.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Opens a remote PDF. Redirects are followed first; Range requests go to the final URL
+    /// (signed query parameters on that hop are kept). When the server accepts Range and
+    /// <paramref name="partialOk"/> is true, the result is a <see cref="PdfSession"/> over a
+    /// <see cref="PdfByteRangeStream"/> and the rest of the file is fetched only as pages are read.
+    /// Otherwise the result is a full download (<c>http-full-fallback</c> when Range is missing,
+    /// <c>http-range-full</c> when the caller asked for every byte of a Range-capable URL).
+    /// </summary>
+    public Task<PdfRemoteDocument> AcquireAsync(string url, bool partialOk, CancellationToken ct) =>
+        AcquireAsync(url, partialOk, ct, prepare: null);
+
+    public async Task<PdfRemoteDocument> AcquireAsync(
+        string url,
+        bool partialOk,
+        CancellationToken ct,
+        Action<HttpRequestMessage>? prepare)
+    {
         if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) ||
             (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
         {
@@ -38,57 +70,269 @@ public sealed class ParallelPdfDownloader
         }
 
         Stopwatch sw = Stopwatch.StartNew();
+        Uri final = await ResolveFinalUriAsync(uri, prepare, ct).ConfigureAwait(false);
+        if (!UriEquals(uri, final))
+        {
+            _logger.LogInformation(
+                "PDF URL redirected; later Range requests use host {Host}",
+                final.Host);
+        }
 
-        long? contentLength = null;
-        bool acceptRanges = false;
+        // Per-request headers (cluster auth) cannot be attached by PdfHttpByteRangeProvider.
+        if (prepare is not null)
+            return await AcquirePreparedFullAsync(final, prepare, sw, ct).ConfigureAwait(false);
 
         try
         {
-            using HttpRequestMessage head = new(HttpMethod.Head, uri);
-            prepare?.Invoke(head);
+            PdfHttpByteRangeProvider? provider = await PdfHttpByteRangeProvider.CreateAsync(
+                final,
+                _http,
+                allowFullDownloadFallback: true,
+                ct).ConfigureAwait(false);
+            try
+            {
+                if (provider.Length <= 0 || provider.Length > MaxBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"PDF exceeds {MaxBytes} byte cap ({provider.Length} bytes).");
+                }
+
+                if (!provider.SupportsRange)
+                {
+                    RentedBuffer buffer = CopyProvider(provider);
+                    sw.Stop();
+                    _logger.LogInformation(
+                        "PDF server does not accept Range; full download host={Host} bytes={Bytes} ms={Ms:F0}",
+                        final.Host,
+                        buffer.Length,
+                        sw.Elapsed.TotalMilliseconds);
+                    PdfHttpByteRangeProvider? consumed = provider;
+                    provider = null!;
+                    consumed.Dispose();
+                    return new PdfRemoteDocument(
+                        "http-full-fallback",
+                        sw.Elapsed.TotalMilliseconds,
+                        final,
+                        supportsRange: false,
+                        buffer.Length,
+                        buffer,
+                        session: null,
+                        rangeStream: null,
+                        provider: null);
+                }
+
+                if (!partialOk)
+                {
+                    long length = provider.Length;
+                    provider.Dispose();
+                    provider = null!;
+                    try
+                    {
+                        return await AcquireRangedFullAsync(final, length, prepare: null, sw, ct).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (IsAcquireFallback(ex, ct))
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Parallel Range download failed for {Host}; falling back to a single stream",
+                            final.Host);
+                        return await AcquireSingleDocumentAsync(
+                            final, prepare: null, sw, ct, "http-range-single-fallback").ConfigureAwait(false);
+                    }
+                }
+
+                PdfByteRangeStream stream = await PdfByteRangeStream.OpenAsync(
+                    provider,
+                    cancellationToken: ct).ConfigureAwait(false);
+                PdfSession session;
+                try
+                {
+                    session = PdfSession.Open(stream, leaveOpen: false);
+                }
+                catch
+                {
+                    stream.Dispose();
+                    throw;
+                }
+
+                sw.Stop();
+                _logger.LogInformation(
+                    "PDF HTTP Range session host={Host} contentLength={Bytes} probed={Probed} reads={Reads} ms={Ms:F0}",
+                    final.Host,
+                    provider.Length,
+                    stream.BytesFetched,
+                    stream.RangeFetchCount,
+                    sw.Elapsed.TotalMilliseconds);
+                PdfHttpByteRangeProvider owned = provider;
+                provider = null!;
+                return new PdfRemoteDocument(
+                    "http-range",
+                    sw.Elapsed.TotalMilliseconds,
+                    final,
+                    supportsRange: true,
+                    owned.Length,
+                    buffer: null,
+                    session,
+                    stream,
+                    owned);
+            }
+            finally
+            {
+                provider?.Dispose();
+            }
+        }
+        catch (Exception ex) when (IsAcquireFallback(ex, ct))
+        {
+            _logger.LogWarning(ex, "HTTP Range open failed for {Host}; falling back to a full download", final.Host);
+            return await AcquireSingleDocumentAsync(final, prepare: null, sw, ct, "http-range-single-fallback").ConfigureAwait(false);
+        }
+    }
+
+    private static bool IsAcquireFallback(Exception ex, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+            return false;
+        return ex is PdfHttpRangeException
+            or PdfByteRangeException
+            or HttpRequestException
+            or IOException
+            or TimeoutException
+            or TaskCanceledException;
+    }
+
+    /// <summary>
+    /// Follows redirects without a Range header and returns the URL that actually answered.
+    /// Subsequent Range requests must use this URI: a signed query string is often different.
+    /// </summary>
+    private async Task<Uri> ResolveFinalUriAsync(Uri uri, Action<HttpRequestMessage>? prepare, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        prepare?.Invoke(request);
+        using HttpResponseMessage response = await _http.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        Uri final = response.RequestMessage?.RequestUri ?? uri;
+        if (response.StatusCode is HttpStatusCode.NotFound)
+            return final;
+        // Body is unused. Disposing here aborts it so a redirect hop is not a full download.
+        return final;
+    }
+
+    private async Task<PdfRemoteDocument> AcquirePreparedFullAsync(
+        Uri final,
+        Action<HttpRequestMessage> prepare,
+        Stopwatch sw,
+        CancellationToken ct)
+    {
+        long? contentLength = null;
+        bool acceptRanges = false;
+        try
+        {
+            using HttpRequestMessage head = new(HttpMethod.Head, final);
+            prepare(head);
             using HttpResponseMessage headResp = await _http.SendAsync(
                 head, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            Uri afterHead = headResp.RequestMessage?.RequestUri ?? final;
+            if (!UriEquals(afterHead, final))
+                final = afterHead;
             if (headResp.IsSuccessStatusCode)
             {
                 contentLength = headResp.Content.Headers.ContentLength;
                 acceptRanges = SupportsAcceptRanges(headResp);
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
-            _logger.LogDebug(ex, "HEAD failed for {Url}; falling back to GET", url);
+            _logger.LogDebug(ex, "HEAD failed for {Host}; falling back to GET", final.Host);
         }
 
         if (contentLength is > MaxBytes)
             throw new InvalidOperationException($"PDF exceeds {MaxBytes} byte cap ({contentLength} bytes).");
 
-        DownloadResult result;
         if (contentLength is > 0 && acceptRanges)
         {
             try
             {
-                RentedBuffer buffer = await DownloadRangedAsync(uri, contentLength.Value, prepare, ct).ConfigureAwait(false);
-                sw.Stop();
-                result = new DownloadResult(buffer, "parallel-ranges", sw.Elapsed.TotalMilliseconds);
+                return await AcquireRangedFullAsync(final, contentLength.Value, prepare, sw, ct).ConfigureAwait(false);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
-                _logger.LogWarning(ex, "Ranged download failed; falling back to single stream for {Uri}", uri);
-                RentedBuffer buffer = await DownloadSingleAsync(uri, contentLength, prepare, ct).ConfigureAwait(false);
-                sw.Stop();
-                result = new DownloadResult(buffer, "single-presized-fallback", sw.Elapsed.TotalMilliseconds);
+                _logger.LogWarning(ex, "Ranged download failed; falling back to single stream for {Host}", final.Host);
+                return await AcquireSingleDocumentAsync(final, prepare, sw, ct, "single-presized-fallback").ConfigureAwait(false);
             }
-        }
-        else
-        {
-            RentedBuffer buffer = await DownloadSingleAsync(uri, contentLength, prepare, ct).ConfigureAwait(false);
-            sw.Stop();
-            string mode = contentLength is > 0 ? "single-presized" : "single-grow";
-            result = new DownloadResult(buffer, mode, sw.Elapsed.TotalMilliseconds);
         }
 
-        return result;
+        string mode = contentLength is > 0 ? "single-presized" : "single-grow";
+        return await AcquireSingleDocumentAsync(final, prepare, sw, ct, mode).ConfigureAwait(false);
     }
+
+    private async Task<PdfRemoteDocument> AcquireRangedFullAsync(
+        Uri final,
+        long length,
+        Action<HttpRequestMessage>? prepare,
+        Stopwatch sw,
+        CancellationToken ct)
+    {
+        if (length <= 0 || length > MaxBytes)
+            throw new InvalidOperationException($"PDF exceeds {MaxBytes} byte cap ({length} bytes).");
+
+        RentedBuffer buffer = await DownloadRangedAsync(final, length, prepare, ct).ConfigureAwait(false);
+        sw.Stop();
+        _logger.LogInformation(
+            "PDF full download via HTTP Range host={Host} bytes={Bytes} ms={Ms:F0}",
+            final.Host,
+            buffer.Length,
+            sw.Elapsed.TotalMilliseconds);
+        return new PdfRemoteDocument(
+            "http-range-full",
+            sw.Elapsed.TotalMilliseconds,
+            final,
+            supportsRange: true,
+            buffer.Length,
+            buffer,
+            session: null,
+            rangeStream: null,
+            provider: null);
+    }
+
+    private async Task<PdfRemoteDocument> AcquireSingleDocumentAsync(
+        Uri final,
+        Action<HttpRequestMessage>? prepare,
+        Stopwatch sw,
+        CancellationToken ct,
+        string mode)
+    {
+        RentedBuffer buffer = await DownloadSingleAsync(final, knownLength: null, prepare, ct).ConfigureAwait(false);
+        sw.Stop();
+        return new PdfRemoteDocument(
+            mode,
+            sw.Elapsed.TotalMilliseconds,
+            final,
+            supportsRange: false,
+            buffer.Length,
+            buffer,
+            session: null,
+            rangeStream: null,
+            provider: null);
+    }
+
+    private RentedBuffer CopyProvider(PdfHttpByteRangeProvider provider)
+    {
+        int size = checked((int)provider.Length);
+        byte[] rented = _pool.Rent(size);
+        try
+        {
+            provider.Read(0, rented, 0, size);
+            return new RentedBuffer(rented, size, _pool);
+        }
+        catch
+        {
+            _pool.Return(rented);
+            throw;
+        }
+    }
+
+    private static bool UriEquals(Uri left, Uri right) =>
+        Uri.Compare(left, right, UriComponents.AbsoluteUri, UriFormat.SafeUnescaped, StringComparison.Ordinal) == 0;
 
     private static bool SupportsAcceptRanges(HttpResponseMessage resp)
     {
@@ -134,7 +378,7 @@ public sealed class ParallelPdfDownloader
                         using HttpResponseMessage resp = await _http.SendAsync(
                             req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
                         resp.EnsureSuccessStatusCode();
-                        if (resp.StatusCode != System.Net.HttpStatusCode.PartialContent)
+                        if (resp.StatusCode != HttpStatusCode.PartialContent)
                         {
                             throw new InvalidOperationException(
                                 $"Expected 206 for range {start}-{end}, got {(int)resp.StatusCode}.");

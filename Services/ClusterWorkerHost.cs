@@ -28,7 +28,7 @@ public sealed class ClusterWorkerHost : IHostedService
     /// <summary>Jobs whose OCR claim loop is still running. NER-only tails stay in <see cref="_sessions"/> but drop out of here.</summary>
     private readonly ConcurrentDictionary<string, byte> _ocrSlots = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte[]> _pdfCache = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, Task<byte[]>> _urlFetches = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Task<PdfUrlBody>> _urlFetches = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _recentlyLeft = new(StringComparer.Ordinal);
     private readonly object _urlFetchOrderGate = new();
     private readonly List<string> _urlFetchOrder = [];
@@ -331,6 +331,7 @@ public sealed class ClusterWorkerHost : IHostedService
         Task? nerTask = null;
         byte[]? renderPdf = null;
         string? sharedPdfPath = null;
+        PdfUrlBody? urlBody = null;
         var stages = new WorkerStageTotals();
         try
         {
@@ -351,18 +352,28 @@ public sealed class ClusterWorkerHost : IHostedService
                     : sharedPdfPath is not null ? "shared-file" : DescribePdfSource(sourceUrl));
             bool cached = false;
             byte[]? pdf = null;
-            Task<byte[]>? shared = null;
+            Task<PdfUrlBody>? shared = null;
+            PdfRemoteDocument? remote = null;
             if (sharedPdfPath is null)
             {
                 cached = TryGetCachedPdf(jobId, out pdf);
                 if (!cached && !string.IsNullOrWhiteSpace(sourceUrl))
                 {
-                    Task<byte[]> fetch = GetOrStartUrlFetch(sourceUrl.Trim());
+                    Task<PdfUrlBody> fetch = GetOrStartUrlFetch(sourceUrl.Trim());
                     if (fetch.IsCompletedSuccessfully)
                     {
-                        pdf = await fetch.ConfigureAwait(false);
-                        RememberPdf(jobId, pdf);
-                        cached = true;
+                        urlBody = HoldUrlBody(fetch.Result);
+                        if (urlBody?.Bytes is { } ready)
+                        {
+                            pdf = ready;
+                            RememberPdf(jobId, pdf);
+                            cached = true;
+                        }
+                        else if (urlBody?.Remote is not null)
+                        {
+                            remote = urlBody.Remote;
+                            cached = true;
+                        }
                     }
                     else if (!fetch.IsCompleted)
                         shared = fetch;
@@ -391,7 +402,16 @@ public sealed class ClusterWorkerHost : IHostedService
                 {
                     try
                     {
-                        pdf = await shared.WaitAsync(ct).ConfigureAwait(false);
+                        urlBody = HoldUrlBody(await shared.WaitAsync(ct).ConfigureAwait(false));
+                        if (urlBody?.Remote is not null)
+                            remote = urlBody.Remote;
+                        else if (urlBody?.Bytes is { } fetched)
+                            pdf = fetched;
+                        else
+                        {
+                            pdf = await DownloadPdfWithRetryAsync(coordinatorUrl, jobId, sourceUrl: null, ct)
+                                .ConfigureAwait(false);
+                        }
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
                     {
@@ -411,16 +431,41 @@ public sealed class ClusterWorkerHost : IHostedService
 
                 download.Stop();
                 stages.DownloadMs = download.Elapsed.TotalMilliseconds;
-                RememberPdf(jobId, pdf);
-                _logger.LogInformation(
-                    "Cluster worker {NodeId} job {JobId} PDF downloaded bytes={Bytes} ms={Ms:F0} via={Source}",
-                    _self.NodeId,
-                    jobId,
-                    pdf.Length,
-                    download.Elapsed.TotalMilliseconds,
-                    DescribePdfSource(sourceUrl));
+                if (remote is null && pdf is not null)
+                    RememberPdf(jobId, pdf);
+                if (remote is not null)
+                {
+                    _logger.LogInformation(
+                        "Cluster worker {NodeId} job {JobId} PDF HTTP Range host={Host} contentLength={Bytes} probed={Probed} ms={Ms:F0}",
+                        _self.NodeId,
+                        jobId,
+                        remote.FinalUri.Host,
+                        remote.Length,
+                        remote.BytesFetched,
+                        download.Elapsed.TotalMilliseconds);
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "Cluster worker {NodeId} job {JobId} PDF downloaded bytes={Bytes} ms={Ms:F0} via={Source}",
+                        _self.NodeId,
+                        jobId,
+                        pdf!.Length,
+                        download.Elapsed.TotalMilliseconds,
+                        DescribePdfSource(sourceUrl));
+                }
                 if (!await JoinWithRetryAsync(coordinatorUrl, jobId, downloading: false, ct).ConfigureAwait(false))
                     return;
+            }
+            else if (remote is not null)
+            {
+                _logger.LogInformation(
+                    "Cluster worker {NodeId} job {JobId} PDF Range session ready host={Host} contentLength={Bytes} probed={Probed}",
+                    _self.NodeId,
+                    jobId,
+                    remote.FinalUri.Host,
+                    remote.Length,
+                    remote.BytesFetched);
             }
             else
             {
@@ -433,7 +478,12 @@ public sealed class ClusterWorkerHost : IHostedService
 
             byte[] pdfBytes;
             int renderLength;
-            if (sharedPdfPath is not null)
+            if (remote is not null)
+            {
+                pdfBytes = [];
+                renderLength = remote.Length > int.MaxValue ? int.MaxValue : (int)remote.Length;
+            }
+            else if (sharedPdfPath is not null)
             {
                 pdfBytes = [];
                 renderLength = pdfLength;
@@ -449,7 +499,7 @@ public sealed class ClusterWorkerHost : IHostedService
             {
                 localDone += await RunPipelinedOcrAsync(
                     coordinatorUrl, jobId, dpi, pageCount, pdfBytes, renderLength, sharedPdfPath,
-                    started, progressAt, stages, ct).ConfigureAwait(false);
+                    started, progressAt, stages, ct, remote).ConfigureAwait(false);
             }
             else
             while (!ct.IsCancellationRequested)
@@ -498,7 +548,8 @@ public sealed class ClusterWorkerHost : IHostedService
                         dpi,
                         results.Add,
                         ct,
-                        sharedPdfPath).ConfigureAwait(false);
+                        sharedPdfPath,
+                        remote).ConfigureAwait(false);
                     foreach (OcrPageResult page in results)
                         stages.AddPage(page.RasterizeMs, page.OcrMs);
                     long postStart = StageClock.Stamp();
@@ -582,6 +633,19 @@ public sealed class ClusterWorkerHost : IHostedService
             _sessions.TryRemove(jobId, out _);
             _recentlyLeft[jobId] = DateTimeOffset.UtcNow.UtcTicks;
             sessionCts.Dispose();
+            if (urlBody?.Remote is { } doneRemote)
+            {
+                _logger.LogInformation(
+                    "Cluster worker {NodeId} job {JobId} HTTP Range done host={Host} bytesFetched={Fetched} reads={Reads} contentLength={Length}",
+                    _self.NodeId,
+                    jobId,
+                    doneRemote.FinalUri.Host,
+                    doneRemote.BytesFetched,
+                    doneRemote.RangeFetchCount,
+                    doneRemote.Length);
+            }
+
+            ReleaseUrlBody(urlBody);
             double rate = localDone / Math.Max(0.001, (DateTimeOffset.UtcNow - started).TotalSeconds);
             StageLog.WorkerDone(
                 _logger,
@@ -653,7 +717,8 @@ public sealed class ClusterWorkerHost : IHostedService
         DateTimeOffset started,
         DateTimeOffset progressAt,
         WorkerStageTotals stages,
-        CancellationToken ct)
+        CancellationToken ct,
+        PdfRemoteDocument? remote = null)
     {
         int depth = Math.Max(4, _self.Capacity + Math.Max(0, _config.RenderAheadPages));
         Channel<(string BatchId, int Page)> feed = Channel.CreateBounded<(string, int)>(
@@ -739,7 +804,8 @@ public sealed class ClusterWorkerHost : IHostedService
                     dpi,
                     (page, batchId, token) => new ValueTask(posts.Writer.WriteAsync((batchId, page), token).AsTask()),
                     pipeCts.Token,
-                    sharedPdfPath).ConfigureAwait(false);
+                    sharedPdfPath,
+                    remote).ConfigureAwait(false);
             }
             finally
             {
@@ -1000,17 +1066,19 @@ public sealed class ClusterWorkerHost : IHostedService
     }
 
     /// <summary>
-    /// One download per source URL, shared by the prefetch notify and the later job session.
+    /// One open per source URL, shared by the prefetch notify and the later job session.
+    /// Range-capable servers stay on <see cref="PdfRemoteDocument"/> (head/tail now, pages later).
+    /// Servers without Range keep a full byte copy for the parallel renderer.
     /// </summary>
-    private Task<byte[]> GetOrStartUrlFetch(string url)
+    private Task<PdfUrlBody> GetOrStartUrlFetch(string url)
     {
-        if (_urlFetches.TryGetValue(url, out Task<byte[]>? existing))
+        if (_urlFetches.TryGetValue(url, out Task<PdfUrlBody>? existing))
             return existing;
 
-        var gate = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource<PdfUrlBody>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!_urlFetches.TryAdd(url, gate.Task))
         {
-            return _urlFetches.TryGetValue(url, out Task<byte[]>? winner)
+            return _urlFetches.TryGetValue(url, out Task<PdfUrlBody>? winner)
                 ? winner
                 : GetOrStartUrlFetch(url);
         }
@@ -1022,30 +1090,38 @@ public sealed class ClusterWorkerHost : IHostedService
         return gate.Task;
     }
 
-    private async Task FinishUrlFetchAsync(string url, TaskCompletionSource<byte[]> gate)
+    private async Task FinishUrlFetchAsync(string url, TaskCompletionSource<PdfUrlBody> gate)
     {
         try
         {
-            byte[] bytes = await DownloadUrlForShareAsync(url).ConfigureAwait(false);
-            gate.TrySetResult(bytes);
+            PdfUrlBody body = await DownloadUrlForShareAsync(url).ConfigureAwait(false);
+            gate.TrySetResult(body);
         }
         catch (Exception ex)
         {
-            _urlFetches.TryRemove(new KeyValuePair<string, Task<byte[]>>(url, gate.Task));
+            _urlFetches.TryRemove(new KeyValuePair<string, Task<PdfUrlBody>>(url, gate.Task));
             lock (_urlFetchOrderGate)
                 _urlFetchOrder.Remove(url);
             gate.TrySetException(ex);
         }
     }
 
-    private async Task<byte[]> DownloadUrlForShareAsync(string url)
+    private async Task<PdfUrlBody> DownloadUrlForShareAsync(string url)
     {
         Exception? last = null;
         for (int attempt = 0; attempt < 3; attempt++)
         {
             try
             {
-                return await DownloadExactAsync(url, prepare: null, _cts.Token).ConfigureAwait(false);
+                PdfRemoteDocument doc = await _downloader.AcquireAsync(url, partialOk: true, _cts.Token)
+                    .ConfigureAwait(false);
+                if (doc.IsPartial)
+                    return new PdfUrlBody { Remote = doc };
+
+                byte[] exact = new byte[doc.Buffer!.Length];
+                doc.Buffer.Span.CopyTo(exact);
+                await doc.DisposeAsync().ConfigureAwait(false);
+                return new PdfUrlBody { Bytes = exact };
             }
             catch (OperationCanceledException) when (_cts.IsCancellationRequested)
             {
@@ -1066,6 +1142,30 @@ public sealed class ClusterWorkerHost : IHostedService
         throw last ?? new HttpRequestException("PDF prefetch failed");
     }
 
+    private PdfUrlBody? HoldUrlBody(PdfUrlBody body)
+    {
+        lock (_urlFetchOrderGate)
+        {
+            if (body.Disposed)
+                return null;
+            body.Users++;
+            return body;
+        }
+    }
+
+    private void ReleaseUrlBody(PdfUrlBody? body)
+    {
+        if (body is null)
+            return;
+        lock (_urlFetchOrderGate)
+        {
+            if (body.Users > 0)
+                body.Users--;
+            if (body.Evicted && body.Users == 0)
+                body.Dispose();
+        }
+    }
+
     private void TrimUrlFetches(string keep)
     {
         lock (_urlFetchOrderGate)
@@ -1075,16 +1175,37 @@ public sealed class ClusterWorkerHost : IHostedService
             {
                 string key = _urlFetchOrder[i];
                 if (string.Equals(key, keep, StringComparison.Ordinal) ||
-                    !_urlFetches.TryGetValue(key, out Task<byte[]>? task) ||
-                    !task.IsCompletedSuccessfully)
+                    !_urlFetches.TryGetValue(key, out Task<PdfUrlBody>? task) ||
+                    !task.IsCompletedSuccessfully ||
+                    task.Result.Users > 0)
                 {
                     i++;
                     continue;
                 }
 
+                PdfUrlBody body = task.Result;
+                body.Evicted = true;
                 _urlFetchOrder.RemoveAt(i);
-                _urlFetches.TryRemove(new KeyValuePair<string, Task<byte[]>>(key, task));
+                _urlFetches.TryRemove(new KeyValuePair<string, Task<PdfUrlBody>>(key, task));
+                body.Dispose();
             }
+        }
+    }
+
+    private sealed class PdfUrlBody : IDisposable
+    {
+        public byte[]? Bytes { get; init; }
+        public PdfRemoteDocument? Remote { get; init; }
+        public int Users;
+        public bool Evicted;
+        public bool Disposed { get; private set; }
+
+        public void Dispose()
+        {
+            if (Disposed)
+                return;
+            Disposed = true;
+            Remote?.Dispose();
         }
     }
 

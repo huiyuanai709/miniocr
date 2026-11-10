@@ -83,15 +83,17 @@ public static class OcrCompareRunner
             var rows = new List<PageRow>(limit);
             RenderOptions render = PdfParallelOptions.CreateRenderOptions(dpi, config);
 
+            using var stream = new MemoryStream(pdf, writable: false);
+            using IEnumerator<SKBitmap> pages = Conversion.ToImages(
+                stream,
+                pages: 0..limit,
+                leaveOpen: true,
+                options: render).GetEnumerator();
             for (int i = 0; i < limit; i++)
             {
-                using var stream = new MemoryStream(pdf, writable: false);
-                using IEnumerator<SKBitmap> enumerator = Conversion
-                    .ToImages(stream, [i], leaveOpen: true, options: render)
-                    .GetEnumerator();
-                if (!enumerator.MoveNext())
+                if (!pages.MoveNext())
                     throw new InvalidOperationException($"PDFtoImage did not yield page {i + 1}.");
-                using SKBitmap bitmap = enumerator.Current;
+                using SKBitmap bitmap = pages.Current;
 
                 PageRow row = new() { Page = i + 1, Width = bitmap.Width, Height = bitmap.Height };
                 row.WeChat = await TimeAsync(() => wechat.RecognizeBitmapAsync(bitmap, CancellationToken.None))
