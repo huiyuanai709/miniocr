@@ -19,6 +19,7 @@
     <Compile Include="..\..\Services\PdfRemoteDocument.cs" Link="PdfRemoteDocument.cs" />
     <Compile Include="..\..\Services\RentedBuffer.cs" Link="RentedBuffer.cs" />
     <Compile Include="..\..\Services\PdfPageSpan.cs" Link="PdfPageSpan.cs" />
+    <Compile Include="..\..\Models\PdfPageSpec.cs" Link="PdfPageSpec.cs" />
   </ItemGroup>
 
 </Project>

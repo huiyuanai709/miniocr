@@ -258,8 +258,8 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
         try
         {
             run = remote is not null
-                ? _pipeline.Start(remote, ct, sourceUrl: sourceUrl)
-                : _pipeline.Start(buffer!, downloadMs, downloadMode, ct, sourceUrl: sourceUrl);
+                ? _pipeline.Start(remote, ct, sourceUrl: sourceUrl, pages: job.Pages)
+                : _pipeline.Start(buffer!, downloadMs, downloadMode, ct, sourceUrl: sourceUrl, pages: job.Pages);
         }
         catch
         {
@@ -295,7 +295,10 @@ public sealed class ChallengeJobService : IHostedService, IDisposable
                 string entry = string.IsNullOrEmpty(job.TraceEntry) ? "challenge" : job.TraceEntry;
                 _trace.Text(
                     entry, requestId, fileId, decision.Url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
-                    job.TeamId, downloadMode, path: decision.LocalPath);
+                    job.TeamId, downloadMode, path: decision.LocalPath,
+                    requestedPages: ocr.RequestedPages, processedPages: ocr.ProcessedPages,
+                    documentPages: ocr.DocumentPages, bytesFetched: ocr.BytesFetched,
+                    rangeReads: ocr.RangeReads);
             }
 
             ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(fileId, ocr);
@@ -415,4 +418,6 @@ public sealed class ChallengeJob
     public string RequestId { get; init; } = "";
     /// <summary><c>challenge</c> or <c>root</c>, matching the HTTP path that accepted the job.</summary>
     public string TraceEntry { get; init; } = "challenge";
+    /// <summary>Optional page range for every file. Null OCRs each whole PDF.</summary>
+    public PdfPageSpec? Pages { get; init; }
 }

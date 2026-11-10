@@ -430,6 +430,25 @@ public sealed class ClusterCoordinator : IHostedService
             string.IsNullOrWhiteSpace(error) ? "failed" : error);
     }
 
+    /// <summary>
+    /// Pages outside <paramref name="selected"/> start done, so claims and parallel
+    /// render leases never include them. Text-layer pages that are inside the
+    /// selection stay done as well.
+    /// </summary>
+    private static int[] WithPageLimit(int pageCount, int[] selected, int[] alreadyDone)
+    {
+        HashSet<int> keep = new(selected);
+        HashSet<int> done = new(alreadyDone);
+        List<int> merged = new(Math.Max(0, pageCount - selected.Length) + alreadyDone.Length);
+        for (int i = 0; i < pageCount; i++)
+        {
+            if (!keep.Contains(i) || done.Contains(i))
+                merged.Add(i);
+        }
+
+        return merged.ToArray();
+    }
+
     private static int[] TextLayerIndexes(IReadOnlyList<OcrPageResult>? pages, int pageCount)
     {
         if (pages is null || pages.Count == 0 || pageCount <= 0)
@@ -459,12 +478,17 @@ public sealed class ClusterCoordinator : IHostedService
         Func<ClusterJob, CancellationToken, Task>? alongside = null,
         Func<ChannelReader<(string BatchId, int Page)>, ClusterJob, CancellationToken, Task>? recognizeFeed = null,
         Action? onOcrReady = null,
-        Action? onGpuReady = null)
+        Action? onGpuReady = null,
+        int[]? limitToZeroBased = null,
+        string? requestedPages = null,
+        string? processedPages = null)
     {
         string id = Guid.NewGuid().ToString("N");
         List<ClusterRemote> remotes = _registry.Remotes();
         bool streamClassify = alongside is not null;
         int[] precompleted = streamClassify ? [] : TextLayerIndexes(textLayerPages, pageCount);
+        if (limitToZeroBased is not null)
+            precompleted = WithPageLimit(pageCount, limitToZeroBased, precompleted);
         var scheduler = new ClusterPageScheduler(new ClusterScheduleOptions
         {
             PageCount = pageCount,
@@ -553,6 +577,15 @@ public sealed class ClusterCoordinator : IHostedService
         }
 
         job.Ner = ner;
+        if (limitToZeroBased is not null && ner is not null)
+        {
+            for (int i = 0; i < pageCount; i++)
+            {
+                if (Array.BinarySearch(limitToZeroBased, i) < 0)
+                    ner.AddPage(new OcrPageResult { Page = i + 1, Text = "" });
+            }
+        }
+
         job.SetAccepted(page =>
         {
             onAccepted(page);
@@ -568,7 +601,16 @@ public sealed class ClusterCoordinator : IHostedService
         _jobs[id] = job;
 
         WarnModelMismatch(remotes, dpi);
-        _trace?.ClusterJob(id, traceSource, pageCount);
+        _trace?.ClusterJob(id, traceSource, pageCount, requestedPages, processedPages);
+        if (requestedPages is not null)
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} page range: requested={Requested} processed={Processed} documentPages={Pages}",
+                id,
+                requestedPages,
+                processedPages,
+                pageCount);
+        }
         string sourceLabel = preserveShared
             ? ChallengeResourceFiles.DownloadMode
             : string.IsNullOrWhiteSpace(sourceUrl) ? "coordinator-only" : "origin+coordinator";
@@ -964,6 +1006,8 @@ public sealed class ClusterCoordinator : IHostedService
             {
                 JobId = id,
                 PageCount = pageCount,
+                RequestedPages = requestedPages,
+                ProcessedPages = processedPages,
                 ElapsedMs = Math.Round(elapsed, 1),
                 Nodes = breakdown,
                 NerGroups = nerGroups,

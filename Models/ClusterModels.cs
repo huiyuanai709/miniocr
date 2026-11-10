@@ -123,6 +123,10 @@ public sealed class ClusterLastJobHealth
 {
     public string JobId { get; set; } = "";
     public int PageCount { get; set; }
+    /// <summary>Canonical page request when the job was limited. Omitted for a whole document.</summary>
+    public string? RequestedPages { get; set; }
+    /// <summary>Pages the scheduler actually ran, after clamping. Omitted for a whole document.</summary>
+    public string? ProcessedPages { get; set; }
     public double ElapsedMs { get; set; }
     public string PageTextSha256 { get; set; } = "";
     public int NerGroups { get; set; }
