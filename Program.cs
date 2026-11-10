@@ -487,7 +487,7 @@ async Task<IResult> HandleChallengeAsync(
     {
         logger.LogWarning(ex, "Challenge JSON parse failed");
         return Results.Json(
-            new ChallengeAckResponse { Ok = false, Error = "Invalid JSON body." },
+            new ChallengeAckResponse { Ok = false, Error = InvalidJsonMessage(ex) },
             AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
@@ -545,6 +545,19 @@ async Task<IResult> HandleChallengeAsync(
             statusCode: StatusCodes.Status400BadRequest);
     }
 
+    PdfPageSpec? challengePages;
+    try
+    {
+        challengePages = PdfPageSpec.Combine(body.Pages, QueryPages(httpRequest));
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = ex.Message },
+            AppJsonContext.Relaxed.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
     ChallengeJob job = new()
     {
         TeamId = body.TeamId,
@@ -553,6 +566,7 @@ async Task<IResult> HandleChallengeAsync(
         Files = files,
         RequestId = requestId,
         TraceEntry = traceEntry,
+        Pages = challengePages,
     };
 
     // Non-blocking enqueue when possible; if queue full, brief wait then still ack
@@ -614,7 +628,7 @@ app.MapPost("/ocr", async Task<IResult> (
     {
         logger.LogWarning(ex, "Debug /ocr JSON parse failed");
         return Results.Json(
-            new ChallengeAckResponse { Ok = false, Error = "Invalid JSON body." },
+            new ChallengeAckResponse { Ok = false, Error = InvalidJsonMessage(ex) },
             AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
@@ -623,6 +637,19 @@ app.MapPost("/ocr", async Task<IResult> (
     {
         return Results.Json(
             new ChallengeAckResponse { Ok = false, Error = "Empty body." },
+            AppJsonContext.Relaxed.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    PdfPageSpec? pageSpec;
+    try
+    {
+        pageSpec = PdfPageSpec.Combine(body.Pages, QueryPages(httpRequest));
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = ex.Message },
             AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
@@ -678,14 +705,17 @@ app.MapPost("/ocr", async Task<IResult> (
                 ? OcrTraceLog.BeginScope(requestId, "ocr", "f1", body.TeamId)
                 : null;
             OcrResponse ocr = await pipeline
-                .ProcessAsync(buffer, downloadMs: 0, downloadMode: "local-file", ct, dpi)
+                .ProcessAsync(buffer, downloadMs: 0, downloadMode: "local-file", ct, dpi, pages: pageSpec)
                 .ConfigureAwait(false);
 
             if (ocrTrace.Enabled)
             {
                 ocrTrace.Text(
                     "ocr", requestId, "f1", url: null, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
-                    body.TeamId, "local-file", path: body.Path);
+                    body.TeamId, "local-file", path: body.Path,
+                    requestedPages: ocr.RequestedPages, processedPages: ocr.ProcessedPages,
+                    documentPages: ocr.DocumentPages, bytesFetched: ocr.BytesFetched,
+                    rangeReads: ocr.RangeReads);
             }
 
             return FinishDebug(body.TeamId, body.Key, "f1", ocr, verbose, config.Mode);
@@ -716,10 +746,12 @@ app.MapPost("/ocr", async Task<IResult> (
                 Error = challenge.Enabled
                     ? "Required: files[{fileId}] (url optional when the challenge resource directory is set), " +
                       "legacy { url, dpi? }, or { path } (local PDF, non-ASCII paths ok). " +
-                      "Optional: teamId, key, callbackUrl (ignored for sync). Add ?verbose=1 for page text and ms/page."
+                      "Optional: teamId, key, callbackUrl (ignored for sync), pages (1-10, 5-12, or 1,3,5-8; ?pages= does the same). " +
+                      "Add ?verbose=1 for page text and ms/page."
                     : "Required: files[{fileId,url}] (competition shape), legacy { url, dpi? }, " +
                       "or { path } (local PDF, non-ASCII paths ok). " +
-                      "Optional: teamId, key, callbackUrl (ignored for sync). Add ?verbose=1 for page text and ms/page.",
+                      "Optional: teamId, key, callbackUrl (ignored for sync), pages (1-10, 5-12, or 1,3,5-8; ?pages= does the same). " +
+                      "Add ?verbose=1 for page text and ms/page.",
             },
             AppJsonContext.Relaxed.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
@@ -859,8 +891,8 @@ app.MapPost("/ocr", async Task<IResult> (
         try
         {
             run = remote is not null
-                ? pipeline.Start(remote, token, dpi, sourceUrl)
-                : pipeline.Start(buffer!, downloadMs, downloadMode, token, dpi, sourceUrl);
+                ? pipeline.Start(remote, token, dpi, sourceUrl, pageSpec)
+                : pipeline.Start(buffer!, downloadMs, downloadMode, token, dpi, sourceUrl, pageSpec);
         }
         catch
         {
@@ -893,7 +925,10 @@ app.MapPost("/ocr", async Task<IResult> (
             {
                 ocrTrace.Text(
                     "ocr", requestId, fileId, decision.Url, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
-                    body.TeamId, downloadMode, path: decision.LocalPath);
+                    body.TeamId, downloadMode, path: decision.LocalPath,
+                    requestedPages: ocr.RequestedPages, processedPages: ocr.ProcessedPages,
+                    documentPages: ocr.DocumentPages, bytesFetched: ocr.BytesFetched,
+                    rangeReads: ocr.RangeReads);
             }
 
             if (files.Count == 1)
@@ -970,6 +1005,22 @@ app.MapPost("/ocr/upload", async Task<IResult> (
 
     dpi ??= config.DefaultDpi;
     bool verbose = WantsVerbose(httpRequest);
+    string? formPages = form.TryGetValue("pages", out Microsoft.Extensions.Primitives.StringValues pagesForm)
+        ? pagesForm.FirstOrDefault() ?? ""
+        : null;
+    PdfPageSpec? pageSpec;
+    try
+    {
+        pageSpec = PdfPageSpec.Combine(formPages, QueryPages(httpRequest));
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = ex.Message },
+            AppJsonContext.Relaxed.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
     string requestId = OcrTraceLog.NewRequestId();
     string? uploadName = null;
     string? uploadPath = null;
@@ -1031,14 +1082,17 @@ app.MapPost("/ocr/upload", async Task<IResult> (
             ? OcrTraceLog.BeginScope(requestId, "ocr-upload", fileId)
             : null;
         OcrResponse ocr = await pipeline
-            .ProcessAsync(buffer, downloadMs: 0, downloadMode: "upload", ct, dpi)
+            .ProcessAsync(buffer, downloadMs: 0, downloadMode: "upload", ct, dpi, pages: pageSpec)
             .ConfigureAwait(false);
 
         if (ocrTrace.Enabled)
         {
             ocrTrace.Text(
                 "ocr-upload", requestId, fileId, url: null, ocr.PageCount, OcrTracePages.Copy(ocr.Pages),
-                downloadMode: "upload", path: uploadPath, fileName: uploadName);
+                downloadMode: "upload", path: uploadPath, fileName: uploadName,
+                requestedPages: ocr.RequestedPages, processedPages: ocr.ProcessedPages,
+                documentPages: ocr.DocumentPages, bytesFetched: ocr.BytesFetched,
+                rangeReads: ocr.RangeReads);
         }
 
         return FinishDebug(teamId: 0, key: "debug", fileId, ocr, verbose, config.Mode);
@@ -1063,14 +1117,28 @@ app.MapPost("/ocr/upload", async Task<IResult> (
 app.MapGet("/", () => Results.Text(
     "MiniOcr local OCR API  (ChineseV6Tiny)\n" +
     "POST /ocr        sync OCR. {\"url\":\"https://.../file.pdf\"} or {\"path\":\"C:\\\\...\\\\file.pdf\"} / ?dpi=96\n" +
-    "  ?verbose=1 (or ?text=1) also returns page text and timings\n" +
-    "POST /ocr/upload multipart file field, or form field path= (local PDF, Unicode paths ok)\n" +
+    "  pages          optional 1-based inclusive range. Omit it to OCR the whole PDF.\n" +
+    "                 \"pages\":\"1-10\" (first 10), \"5-12\", \"1,3,5-8\", or \"pages\":[5,6,7,12]\n" +
+    "                 Same value as ?pages= when the JSON field is omitted. Body wins when both are set.\n" +
+    "                 One range applies to every file in the request. Page numbers in the result stay the PDF's.\n" +
+    "                 Empty, non-numeric, inverted (12-5), or a page below 1 is HTTP 400.\n" +
+    "                 If the PDF is shorter, pages past the end are dropped (1-10 on a 7-page PDF is 1-7, pagesClamped=true).\n" +
+    "                 A range that starts after the last page is HTTP 400.\n" +
+    "                 HTTP URLs use the Range session when this node is not distributing the job: only those pages are\n" +
+    "                 rendered, and bytes are fetched on demand (http-range). Fallbacks stay http-full-fallback,\n" +
+    "                 http-range-full, and http-range-single-fallback. A distributed job still downloads the whole PDF,\n" +
+    "                 then every node (including parallel render workers) OCRs only the requested pages.\n" +
+    "  ?verbose=1 (or ?text=1) also returns page text, timings, requestedPages, processedPages, documentPages,\n" +
+    "                 source (download mode), bytesFetched, and rangeReads for a Range session.\n" +
+    "POST /ocr/upload multipart file field, or form field path= (local PDF, Unicode paths ok). Optional form/query pages=\n" +
     "GET  /health\n" +
     "POST /challenge  optional batch callback (also POST /)\n" +
-    "  {\"teamId\":123,\"key\":\"...\",\"callbackUrl\":\"https://...\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
+    "  {\"teamId\":123,\"key\":\"...\",\"callbackUrl\":\"https://...\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}],\"pages\":\"1-10\"}\n" +
+    "  pages is optional and uses the same 1-based syntax as POST /ocr (or ?pages=). Omit it for the whole PDF.\n" +
     "  With MINIOCR_CHALLENGE_RESOURCE_DIR set, url may be omitted: fileId f1 reads {dir}/f1.pdf (read-only).\n" +
     "  → HTTP 200 {\"ok\":true} immediately; results POSTed async to callbackUrl\n" +
-    "CLI  MiniOcr --compare <pdf> [--pages N] [--dpi N]   wechat vs local → wechat-vs-local.txt\n" +
+    "CLI  MiniOcr --compare <pdf> [--pages N] [--dpi N]   wechat vs local, first N pages only → wechat-vs-local.txt\n" +
+    "     OCR of a file or URL is POST /ocr (pages=1-10 / 5-12 / 1,3,5-8). --compare --pages N is not that range.\n" +
     $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} " +
     $"ocr.mode={runtimeConfig.Mode} model={(runtimeConfig.IsLlmMode || runtimeConfig.IsWeChatMode ? "" : ClusterRuntimeConfig.LocalModelName)} wechat={wechatStatus} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
@@ -1122,6 +1190,24 @@ static string FirstLine(string message)
 
 static bool WantsVerbose(HttpRequest request) =>
     request.Query.ContainsKey("verbose") || request.Query.ContainsKey("text");
+
+static string? QueryPages(HttpRequest request)
+{
+    if (!request.Query.TryGetValue("pages", out Microsoft.Extensions.Primitives.StringValues value))
+        return null;
+    return value.FirstOrDefault() ?? "";
+}
+
+static string InvalidJsonMessage(Exception ex)
+{
+    for (Exception? cur = ex; cur is not null; cur = cur.InnerException)
+    {
+        if (cur.Message.StartsWith("pages", StringComparison.Ordinal))
+            return cur.Message;
+    }
+
+    return "Invalid JSON body.";
+}
 
 static IResult FinishDebug(int teamId, string? key, string fileId, OcrResponse ocr, bool verbose, string mode)
 {

@@ -182,7 +182,12 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
     }
 
     /// <summary>Link a cluster job id to the HTTP request scope, if one is flowing.</summary>
-    public void ClusterJob(string jobId, string? sourceUrl, int pageCount)
+    public void ClusterJob(
+        string jobId,
+        string? sourceUrl,
+        int pageCount,
+        string? requestedPages = null,
+        string? processedPages = null)
     {
         if (!Enabled || string.IsNullOrWhiteSpace(jobId))
             return;
@@ -198,6 +203,8 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
                 JobId = jobId,
                 Url = string.IsNullOrWhiteSpace(sourceUrl) ? null : sourceUrl,
                 PageCount = pageCount,
+                RequestedPages = requestedPages,
+                ProcessedPages = processedPages,
             });
         }
         catch
@@ -220,7 +227,12 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
         int? teamId = null,
         string? downloadMode = null,
         string? path = null,
-        string? fileName = null)
+        string? fileName = null,
+        string? requestedPages = null,
+        string? processedPages = null,
+        int? documentPages = null,
+        long? bytesFetched = null,
+        int? rangeReads = null)
     {
         if (!Enabled)
             return;
@@ -238,6 +250,11 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
                 DownloadMode = NullIfEmpty(downloadMode),
                 PageCount = pageCount,
                 Pages = pages ?? [],
+                RequestedPages = requestedPages,
+                ProcessedPages = processedPages,
+                DocumentPages = documentPages,
+                BytesFetched = bytesFetched,
+                RangeReads = rangeReads,
             });
         }
         catch
@@ -390,6 +407,8 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
             WriteHead(w, item.At, "job", item.Entry, item.RequestId, item.TeamId, item.FileId);
             w.WriteString("jobId", item.JobId);
             w.WriteNumber("pageCount", item.PageCount);
+            WriteOpt(w, "requestedPages", item.RequestedPages);
+            WriteOpt(w, "processedPages", item.ProcessedPages);
             if (!string.IsNullOrEmpty(item.Url))
                 w.WriteString("url", item.Url);
         }, ct);
@@ -410,6 +429,11 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
             WriteOpt(w, "fileName", item.FileName);
             WriteOpt(w, "downloadMode", item.DownloadMode);
             w.WriteNumber("pageCount", item.PageCount);
+            WriteOpt(w, "documentPages", item.DocumentPages);
+            WriteOpt(w, "requestedPages", item.RequestedPages);
+            WriteOpt(w, "processedPages", item.ProcessedPages);
+            WriteOpt(w, "bytesFetched", item.BytesFetched);
+            WriteOpt(w, "rangeReads", item.RangeReads);
             w.WriteNumber("loggedPages", pages.Length);
             w.WriteNumber("chars", chars);
             w.WriteNumber("maxChars", _maxChars);
@@ -473,6 +497,18 @@ public sealed class OcrTraceLog : IHostedService, IDisposable
     {
         if (!string.IsNullOrEmpty(value))
             w.WriteString(name, value);
+    }
+
+    private static void WriteOpt(Utf8JsonWriter w, string name, int? value)
+    {
+        if (value is int n)
+            w.WriteNumber(name, n);
+    }
+
+    private static void WriteOpt(Utf8JsonWriter w, string name, long? value)
+    {
+        if (value is long n)
+            w.WriteNumber(name, n);
     }
 
     private async ValueTask WriteObjectAsync(FileStream stream, Action<Utf8JsonWriter> write, CancellationToken ct)
@@ -613,6 +649,8 @@ internal sealed class OcrTraceJobItem : OcrTraceItem
     public string JobId { get; init; } = "";
     public string? Url { get; init; }
     public int PageCount { get; init; }
+    public string? RequestedPages { get; init; }
+    public string? ProcessedPages { get; init; }
 }
 
 internal sealed class OcrTraceTextItem : OcrTraceItem
@@ -627,6 +665,11 @@ internal sealed class OcrTraceTextItem : OcrTraceItem
     public string? DownloadMode { get; init; }
     public int PageCount { get; init; }
     public OcrTracePage[] Pages { get; init; } = [];
+    public string? RequestedPages { get; init; }
+    public string? ProcessedPages { get; init; }
+    public int? DocumentPages { get; init; }
+    public long? BytesFetched { get; init; }
+    public int? RangeReads { get; init; }
 }
 
 internal sealed class OcrTraceFlush : OcrTraceItem

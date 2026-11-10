@@ -1,5 +1,8 @@
 using System.Net;
+using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using MiniOcr.Models;
 using MiniOcr.Services;
 using PDFtoImage;
 using SkiaSharp;
@@ -26,6 +29,8 @@ ILogger<ParallelPdfDownloader> logger = logs.CreateLogger<ParallelPdfDownloader>
 await TestRangeFollowsRedirect(pdf, pageCount, logger);
 await TestFullFallbackWhenRangeMissing(pdf, logger);
 await TestContiguousSpan();
+TestPageSpec(pageCount);
+await TestRenderRequestedPages(pdf, pageCount, logger);
 
 Console.WriteLine("pdf-range-smoke ok");
 
@@ -92,6 +97,185 @@ static Task TestContiguousSpan()
     if (PdfPageSpan.TryContiguous([0, 2], out _, out _))
         throw new InvalidOperationException("sparse pages were treated as contiguous");
     return Task.CompletedTask;
+}
+
+static void TestPageSpec(int documentPages)
+{
+    if (PdfPageSpec.Parse(null) is not null)
+        throw new InvalidOperationException("omitted pages must mean the whole document");
+    if (PdfPageSpec.Combine(null, null) is not null)
+        throw new InvalidOperationException("missing body and query must mean the whole document");
+
+    Expect("1-10", PdfPageSpec.Parse("1-10")!.Canonical, "first 10");
+    Expect("5-12", PdfPageSpec.Parse(" 5 - 12 ")!.Canonical, "mid range");
+    Expect("1,3,5-8", PdfPageSpec.Parse("1,3,5-8")!.Canonical, "list");
+    Expect("1-5", PdfPageSpec.Parse("1-3,2-5")!.Canonical, "overlapping ranges merge");
+    Expect("1-3,7-8", PdfPageSpec.Parse("8,7,7,1-3")!.Canonical, "pages are sorted and deduped");
+    Expect("5-7,12", PdfPageSpec.FromPageNumbers([12, 5, 6, 7, 6]).Canonical, "array becomes the same list");
+
+    PdfPageSpec? queryWins = PdfPageSpec.Combine(null, "5-12");
+    if (queryWins?.Canonical != "5-12")
+        throw new InvalidOperationException("query pages are used when the body omits them");
+    if (PdfPageSpec.Combine("1-10", "5-12")?.Canonical != "1-10")
+        throw new InvalidOperationException("body pages win over the query");
+
+    PdfPageWindow first = PdfPageSpec.Parse("1-2")!.Resolve(documentPages);
+    if (first.Clamped || first.Processed != "1-2" || !first.ZeroBased.SequenceEqual([0, 1]))
+        throw new InvalidOperationException("1-2 did not resolve to a 0-based prefix");
+
+    if (documentPages >= 3)
+    {
+        PdfPageWindow mid = PdfPageSpec.Parse("2-4")!.Resolve(documentPages);
+        if (mid.Clamped || mid.Processed != "2-4" || !mid.ZeroBased.SequenceEqual([1, 2, 3]))
+            throw new InvalidOperationException("mid-document range was not 0-based [1,2,3]");
+    }
+
+    PdfPageWindow clamped = PdfPageSpec.Parse("1-10")!.Resolve(3);
+    if (!clamped.Clamped || clamped.Processed != "1-3" || clamped.DocumentPages != 3)
+        throw new InvalidOperationException($"1-10 on a 3-page PDF should clamp to 1-3, got {clamped.Processed} clamped={clamped.Clamped}");
+
+    PdfPageWindow partialList = PdfPageSpec.Parse("1,3,100")!.Resolve(7);
+    if (!partialList.Clamped || partialList.Processed != "1,3" || !partialList.ZeroBased.SequenceEqual([0, 2]))
+        throw new InvalidOperationException("pages past the end of a mixed list should be dropped");
+
+    ExpectThrow("pages is empty.", () => PdfPageSpec.Parse(""));
+    ExpectThrow("pages is empty.", () => PdfPageSpec.Parse("   "));
+    ExpectThrow("pages contains an empty entry.", () => PdfPageSpec.Parse("1,,2"));
+    ExpectThrow("pages contains an empty entry.", () => PdfPageSpec.Parse("1-2,"));
+    ExpectThrow("pages value 'abc' is not a page number.", () => PdfPageSpec.Parse("abc"));
+    ExpectThrow("pages value '1a' is not a page number.", () => PdfPageSpec.Parse("1a"));
+    ExpectThrow("pages range 12-5 is inverted.", () => PdfPageSpec.Parse("12-5"));
+    ExpectThrow("pages start at 1.", () => PdfPageSpec.Parse("0"));
+    ExpectThrow("pages start at 1.", () => PdfPageSpec.Parse("0-2"));
+    ExpectThrow("pages is empty.", () => PdfPageSpec.FromPageNumbers([]));
+    ExpectThrow("outside this PDF", () => PdfPageSpec.Parse("5-12")!.Resolve(3));
+    ExpectThrow("outside this PDF", () => PdfPageSpec.Parse("8-12")!.Resolve(7));
+    ExpectThrow("outside this PDF", () => PdfPageSpec.Parse("100")!.Resolve(7));
+
+    Expect("5-7,12", ReadPages("[12, 5, 6, 7]"), "JSON array");
+    Expect("5-12", ReadPages("\"5-12\""), "JSON string");
+    Expect("4", ReadPages("4"), "JSON number");
+    ExpectThrow("pages array items must be integers.", () => ReadPages("[1, \"x\"]"));
+    ExpectThrow("pages is empty.", () => ReadPages("[]"));
+    ExpectThrow("pages start at 1.", () => ReadPages("[0, 1]"));
+    ExpectThrow("pages must be a string", () => ReadPages("{\"a\":1}"));
+}
+
+static async Task TestRenderRequestedPages(byte[] pdf, int documentPages, ILogger<ParallelPdfDownloader> logger)
+{
+    if (documentPages < 3)
+        throw new InvalidOperationException("sample PDF needs at least 3 pages to prove a mid-document range");
+
+    PdfPageWindow first = PdfPageSpec.Parse("1-2")!.Resolve(documentPages);
+    int prefix = CountRange(pdf, first.ZeroBased[0], first.ZeroBased.Length);
+    if (prefix != 2)
+        throw new InvalidOperationException($"first 2 pages rendered {prefix}");
+
+    PdfPageWindow mid = PdfPageSpec.Parse("2-4")!.Resolve(documentPages);
+    if (!PdfPageSpan.TryContiguous(mid.ZeroBased, out int midFirst, out int midCount) || midFirst != 1 || midCount != 3)
+        throw new InvalidOperationException("pages 2-4 should be one 0-based span starting at 1");
+    int midRendered = CountRange(pdf, midFirst, midCount);
+    if (midRendered != 3)
+        throw new InvalidOperationException($"pages 2-4 rendered {midRendered}");
+
+    PdfPageWindow list = PdfPageSpec.Parse("1,3")!.Resolve(documentPages);
+    int listed = CountList(pdf, list.ZeroBased);
+    if (listed != 2)
+        throw new InvalidOperationException($"page list rendered {listed}");
+
+    using var server = PdfServer.Start(pdf, supportRange: true, redirect: true);
+    using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
+    var downloader = new ParallelPdfDownloader(http, logger);
+    using PdfRemoteDocument remote = await downloader.AcquireAsync(server.StartUrl, partialOk: true, CancellationToken.None);
+    if (remote.Session is null || remote.Mode != "http-range")
+        throw new InvalidOperationException("URL page range should stay on the Range session, mode=" + remote.Mode);
+
+    PdfPageWindow remoteMid = PdfPageSpec.Parse("2-3")!.Resolve(remote.Session.PageCount);
+    int remoteCount = 0;
+    foreach (SKBitmap bitmap in remote.Session.RenderPages(remoteMid.ZeroBased, new RenderOptions(Dpi: 36)))
+    {
+        using SKBitmap page = bitmap;
+        remoteCount++;
+        if (page.Width <= 0)
+            throw new InvalidOperationException("range render produced an empty page");
+    }
+
+    if (remoteCount != remoteMid.ZeroBased.Length)
+        throw new InvalidOperationException($"URL range rendered {remoteCount}, expected {remoteMid.ZeroBased.Length}");
+    if (remote.BytesFetched >= remote.Length)
+        throw new InvalidOperationException(
+            $"rendering pages {remoteMid.Processed} fetched the whole file ({remote.BytesFetched}/{remote.Length})");
+    if (remote.RangeFetchCount <= 0)
+        throw new InvalidOperationException("rendering a page range recorded no Range reads");
+    foreach (Hit hit in server.Hits)
+    {
+        if (hit.Range is null)
+            continue;
+        if (!hit.PathAndQuery.StartsWith("/final.pdf?sig=changed", StringComparison.Ordinal))
+            throw new InvalidOperationException("page-range Range was not sent to the final URL: " + hit.PathAndQuery);
+    }
+}
+
+static int CountRange(byte[] pdf, int first, int count)
+{
+    int rendered = 0;
+    using var stream = new MemoryStream(pdf, writable: false);
+    foreach (SKBitmap bitmap in Conversion.ToImages(
+        stream,
+        pages: first..(first + count),
+        leaveOpen: true,
+        options: new RenderOptions(Dpi: 36)))
+    {
+        using SKBitmap page = bitmap;
+        rendered++;
+    }
+
+    return rendered;
+}
+
+static int CountList(byte[] pdf, int[] zeroBased)
+{
+    int rendered = 0;
+    using var stream = new MemoryStream(pdf, writable: false);
+    using PdfSession session = PdfSession.Open(stream, leaveOpen: true);
+    foreach (SKBitmap bitmap in session.RenderPages(zeroBased, new RenderOptions(Dpi: 36)))
+    {
+        using SKBitmap page = bitmap;
+        rendered++;
+    }
+
+    return rendered;
+}
+
+static string ReadPages(string json)
+{
+    var reader = new Utf8JsonReader(Encoding.UTF8.GetBytes(json));
+    if (!reader.Read())
+        throw new InvalidOperationException("empty JSON");
+    return new PdfPageSpecJsonConverter().Read(ref reader, typeof(string), new JsonSerializerOptions())
+        ?? throw new InvalidOperationException("converter returned null for " + json);
+}
+
+static void Expect(string want, string got, string name)
+{
+    if (want != got)
+        throw new InvalidOperationException($"{name}: expected {want}, got {got}");
+}
+
+static void ExpectThrow(string snippet, Action action)
+{
+    try
+    {
+        action();
+    }
+    catch (Exception ex) when (ex is ArgumentException or JsonException)
+    {
+        if (!ex.Message.Contains(snippet, StringComparison.Ordinal))
+            throw new InvalidOperationException($"expected '{snippet}' in '{ex.Message}'");
+        return;
+    }
+
+    throw new InvalidOperationException("expected an error containing " + snippet);
 }
 
 file sealed class Hit

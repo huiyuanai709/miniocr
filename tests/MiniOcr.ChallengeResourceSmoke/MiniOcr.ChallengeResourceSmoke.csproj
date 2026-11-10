@@ -15,6 +15,7 @@
     <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
     <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
     <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />
+    <Compile Include="..\..\Models\PdfPageSpec.cs" Link="PdfPageSpec.cs" />
     <Compile Include="..\..\Models\ClusterModels.cs" Link="ClusterModels.cs" />
   </ItemGroup>
 </Project>

@@ -40,6 +40,7 @@ public static class ChallengeResultMapper
 
     public static ChallengeFileResult BuildFileResult(string fileId, OcrResponse ocr)
     {
+        ChallengeFileResult result;
         // Vision OCR may already attach contest-shaped ruleList per page.
         if (ocr.Pages.Any(p => p.RuleList is { Count: > 0 }))
         {
@@ -56,13 +57,28 @@ public static class ChallengeResultMapper
                 });
             }
 
-            return new ChallengeFileResult { FileId = fileId, Pages = pages };
+            result = new ChallengeFileResult { FileId = fileId, Pages = pages };
+        }
+        else
+        {
+            OcrEntities entities = ocr.Entities ?? new OcrEntities();
+            List<string> companies = entities.Companies.Select(c => c.Name).Where(n => n.Length > 0).ToList();
+            List<string> persons = entities.Persons.Select(p => p.Name).Where(n => n.Length > 0).ToList();
+            result = BuildFileResult(fileId, ocr.Pages, companies, persons);
         }
 
-        OcrEntities entities = ocr.Entities ?? new OcrEntities();
-        List<string> companies = entities.Companies.Select(c => c.Name).Where(n => n.Length > 0).ToList();
-        List<string> persons = entities.Persons.Select(p => p.Name).Where(n => n.Length > 0).ToList();
-        return BuildFileResult(fileId, ocr.Pages, companies, persons);
+        // Whole-document jobs keep the previous JSON: fileId + pages only.
+        if (string.IsNullOrEmpty(ocr.RequestedPages))
+            return result;
+
+        result.RequestedPages = ocr.RequestedPages;
+        result.ProcessedPages = ocr.ProcessedPages;
+        result.DocumentPages = ocr.DocumentPages;
+        result.PagesClamped = ocr.PagesClamped;
+        result.DownloadMode = string.IsNullOrEmpty(ocr.DownloadMode) ? null : ocr.DownloadMode;
+        result.BytesFetched = ocr.BytesFetched;
+        result.RangeReads = ocr.RangeReads;
+        return result;
     }
 
     public static ChallengeFileResult BuildFileResult(

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace MiniOcr.Models;
 
 /// <summary>
@@ -23,6 +25,15 @@ public sealed class OcrDebugRequest
     /// Used when <see cref="Files"/> and <see cref="Url"/> are empty.
     /// </summary>
     public string? Path { get; set; }
+
+    /// <summary>
+    /// 1-based pages to OCR. Omit to process the whole document.
+    /// String <c>1-10</c>, <c>5-12</c>, or <c>1,3,5-8</c>, or an array of those numbers.
+    /// The same value may be sent as <c>?pages=</c> when this field is omitted.
+    /// Applies to every file in the request.
+    /// </summary>
+    [JsonConverter(typeof(PdfPageSpecJsonConverter))]
+    public string? Pages { get; set; }
 }
 
 /// <summary>
@@ -35,7 +46,20 @@ public sealed class OcrTextDebugResponse
     public string Mode { get; set; } = "";
     public string Source { get; set; } = "";
     public int Dpi { get; set; }
+    /// <summary>Pages actually OCR'd. Equals <see cref="DocumentPages"/> when no range was requested.</summary>
     public int PageCount { get; set; }
+    /// <summary>Page count of the PDF. Present when the caller sent <c>pages</c>.</summary>
+    public int? DocumentPages { get; set; }
+    /// <summary>Canonical requested range, for example <c>1-10</c> or <c>5-12</c>. Omitted when the caller asked for the whole document.</summary>
+    public string? RequestedPages { get; set; }
+    /// <summary>Pages actually processed after clamping to the PDF. Same shape as <see cref="RequestedPages"/>.</summary>
+    public string? ProcessedPages { get; set; }
+    /// <summary>True when the PDF was shorter than the request and the tail was dropped.</summary>
+    public bool? PagesClamped { get; set; }
+    /// <summary>Bytes read for this PDF. For an HTTP Range session this is the demand-fetched total, not the content length.</summary>
+    public long? BytesFetched { get; set; }
+    /// <summary>HTTP Range reads. Present for a Range session (<c>source</c> <c>http-range</c>).</summary>
+    public int? RangeReads { get; set; }
     public double MsPerPage { get; set; }
     public OcrTimings Timings { get; set; } = new();
     public string TextLayerMode { get; set; } = "auto";
@@ -140,7 +164,20 @@ public sealed class OcrEntities
 public sealed class OcrResponse
 {
     public bool Ok { get; set; }
+    /// <summary>Pages actually OCR'd. The PDF page count when the caller omitted <c>pages</c>.</summary>
     public int PageCount { get; set; }
+    /// <summary>PDF page count. Set only when the caller sent <c>pages</c>.</summary>
+    public int? DocumentPages { get; set; }
+    /// <summary>Canonical request, for example <c>5-12</c>. Null when the whole document was requested.</summary>
+    public string? RequestedPages { get; set; }
+    /// <summary>Pages actually processed, after clamping a range that ran past the last page.</summary>
+    public string? ProcessedPages { get; set; }
+    /// <summary>True when some requested pages were past the end of the PDF and were dropped.</summary>
+    public bool? PagesClamped { get; set; }
+    /// <summary>Bytes held or fetched. For HTTP Range this is <c>bytesFetched</c>, not the content length.</summary>
+    public long? BytesFetched { get; set; }
+    /// <summary>Range GETs performed by an HTTP Range session. Null for a full download or a local file.</summary>
+    public int? RangeReads { get; set; }
     public long PdfBytes { get; set; }
     public string DownloadMode { get; set; } = "";
     public int Dpi { get; set; }

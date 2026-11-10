@@ -234,6 +234,26 @@ curl -sS -X POST http://127.0.0.1:5080/ocr/upload \
 
 `?verbose=1` 时响应带有规则的页的文本、耗时和 `ruleList`，没有规则的页不出现，页码保持不变。本机文件用 `{"path":"/absolute/path/to/file.pdf"}`。
 
+### 只识别一部分页
+
+`pages` 不写时，行为和以前一样：整份 PDF 都做识别。页码从 1 开始，区间两头都包含。字符串、JSON 数组、查询参数是同一种页列表，不是两套语法。
+
+| 想要的页 | JSON | 查询或表单 |
+| --- | --- | --- |
+| 前 10 页 | `"pages":"1-10"` 或 `"pages":[1,2,3,4,5,6,7,8,9,10]` | `?pages=1-10` |
+| 第 5 到第 12 页 | `"pages":"5-12"` | `?pages=5-12` |
+| 不连续的几页 | `"pages":"1,3,5-8"` 或 `"pages":[1,3,5,6,7,8]` | `?pages=1,3,5-8` |
+
+`POST /ocr`、`POST /ocr/upload`、`POST /challenge` 和 `POST /` 都认这个字段。JSON（或上传表单）里写了 `pages` 就以它为准；没写再用 `?pages=`，和 `dpi` 一样。一次请求里的每个文件用同一个范围。结果里的页码仍是 PDF 原来的页码，不是从 1 重新编号。
+
+这些情况直接返回 400，不会去下载或栅格化：空的 `pages`、非数字、颠倒的区间（`12-5`）、小于 1 的页码。PDF 比请求短、但请求和文档还有重叠时，把超出末页的部分丢掉：7 页的文件请求 `1-10` 会处理 `1-7`，请求 `5-12` 会处理 `5-7`，并带上 `pagesClamped: true`。整段都落在末页之后（7 页的文件请求 `8-12`）返回 400。
+
+HTTP URL、并且这次任务没有分给集群时，走原来的 Range 会话：只栅格化这些页，读到哪一页再拉哪一段，不会因为指定了页范围就整份下载或整份栅格。Range 不可用时的回退不变，仍是 `http-full-fallback`、`http-range-full`、`http-range-single-fallback`。任务分给集群时，协调进程仍先拿到完整 PDF（Range 会话不能当字节发给 worker），但无论哪台机器渲染，包括并行渲染进程打开的那份本地文件，都只处理请求的页。
+
+`?verbose=1` 多这几个字段：`requestedPages`、`processedPages`、`documentPages`、`pagesClamped`（只有被截短时出现）、`source`（下载方式）、`bytesFetched`。Range 会话还有 `rangeReads`。不带 `verbose` 时，只有请求里写了页范围，这些字段才会出现在每个文件的结果上；没写页范围的响应和以前相同。
+
+`MiniOcr --compare --pages N` 仍是对比工具的「前 N 页」，不是上面这个页范围。识别文件或 URL 用 `POST /ocr`。
+
 ### 识别追踪日志
 
 默认开启。每条进来的文件 URL，以及该次任务识别出的文本，写到一份 JSONL。不经过控制台，也不在 OCR 或集群认领循环里写盘。
