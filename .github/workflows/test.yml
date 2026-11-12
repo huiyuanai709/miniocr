@@ -21,8 +21,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "11.0.x"
-          dotnet-quality: preview
-
       - name: Build (PDFtoImage + SimdPaddleOCR project references)
         run: dotnet build ./MiniOcr.csproj -c Release
 
@@ -68,8 +66,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "11.0.x"
-          dotnet-quality: preview
-
       - name: Publish Native AOT metal smoke (osx-arm64)
         run: |
           set -euo pipefail

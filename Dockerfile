@@ -9,7 +9,7 @@
 #   docker compose build --build-arg ILC_INSTRUCTION_SET=avx2
 FROM ubuntu:24.04 AS build
 
-ARG DOTNET_VERSION=11.0.100-rc.1.26425.128
+ARG DOTNET_VERSION=11.0.100
 ARG ILC_INSTRUCTION_SET=avx512v2
 
 ENV DEBIAN_FRONTEND=noninteractive

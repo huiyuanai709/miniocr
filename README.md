@@ -1,6 +1,6 @@
 # MiniOCR
 
-本机 PDF OCR 工具。基于 [SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)）的 **Native AOT** HTTP 服务（**.NET 11 RC / `net11.0`**）。
+本机 PDF OCR 工具。基于 [SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)）的 **Native AOT** HTTP 服务（**.NET 11 GA / `net11.0`**）。
 
 默认是**一个进程、CPU、`ChineseV6Tiny`**。把 PDF 路径或 URL 交给 `POST /ocr`，按页栅格化（Gray8）并识别，返回每页文本。文件不超过 300 MB。人名和公司名可以交给可选的 OpenAI 兼容接口，也可以在配置里打开启发式回退。
 
@@ -15,15 +15,15 @@
 ## 环境要求
 
 - Windows / Linux / macOS（x64 与 ARM64）。CI 产出多平台 Native AOT 包
-- [.NET 11 RC SDK](https://dotnet.microsoft.com/download/dotnet/11.0)
+- [.NET 11 SDK](https://dotnet.microsoft.com/download/dotnet/11.0)（`11.0.100` GA）
 - Native AOT 需要本机 C 工具链（`gcc` / `clang` 以及 zlib）
 - **x64** 默认 **AVX2**，另有 **AVX-512** 包；**ARM64** 使用 NEON 基线
 
-### 安装 .NET 11 RC（Linux）
+### 安装 .NET 11（Linux）
 
 ```bash
 curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-bash /tmp/dotnet-install.sh --version 11.0.100-rc.1.26425.128 --install-dir "$HOME/.dotnet"
+bash /tmp/dotnet-install.sh --version 11.0.100 --install-dir "$HOME/.dotnet"
 export DOTNET_ROOT="$HOME/.dotnet"
 export PATH="$HOME/.dotnet:$PATH"
 dotnet --list-sdks
