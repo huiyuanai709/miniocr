@@ -97,10 +97,8 @@ jobs:
       - name: Setup .NET 11 RC
         uses: actions/setup-dotnet@v4
         with:
-          # Project TFM is net11.0; install latest 11.0.x preview/RC
+          # Project TFM is net11.0; install latest 11.0.x GA
           dotnet-version: "11.0.x"
-          dotnet-quality: preview
-
       - name: Publish (${{ matrix.rid }}${{ matrix.suffix }})
         shell: bash
         run: |
@@ -244,10 +242,8 @@ jobs:
       - name: Setup .NET 11 RC
         uses: actions/setup-dotnet@v4
         with:
-          # Project TFM is net11.0; install latest 11.0.x preview/RC
+          # Project TFM is net11.0; install latest 11.0.x GA
           dotnet-version: "11.0.x"
-          dotnet-quality: preview
-
       - name: Publish (${{ matrix.rid }}${{ matrix.suffix }})
         shell: bash
         run: |
