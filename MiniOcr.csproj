@@ -50,9 +50,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Pinned fork master @ ea25ba6 (page ranges, HTTP Range, IPdfRandomAccess).
-         Includes the retained-PDF close (d47fbc3 / b577ca9) and 68e30fe
-         (Gray8 PdfPixels, PrewarmAsync, ShareSourceFile/RetainDocuments/NativeGrayscale).
+    <!-- Pinned fork master @ 8f3f6e8 (upstream sungaila/PDFtoImage through d457d4d).
+         Keeps page ranges, HTTP Range, IPdfRandomAccess, PdfSession.RenderPages,
+         Gray8 PdfPixels, PrewarmAsync, and ShareSourceFile/RetainDocuments/NativeGrayscale.
+         This pin also brings PDFium 158.0.8125, SkiaSharp 4.153.1, and 64 KB stream reads.
+         .NET 11 package versions stay at 11.0.0.
          Native PDFium / SkiaSharp assets flow as runtime assets of the core project
          (runtimes/<rid>/native); .NET copies them on publish the same way a
          PackageReference to the PDFtoImage nupkg did. Parallel re-launches this
