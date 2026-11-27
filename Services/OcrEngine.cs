@@ -119,7 +119,11 @@ public sealed class OcrEngine : IAsyncDisposable
         if (effective != "metal" && config.Backend is "vulkan" or "auto")
         {
             if (!string.IsNullOrWhiteSpace(config.VulkanDevice))
+            {
+                // Kept so a configured device still reaches the library. This pin
+                // ignores DeviceSelector and uses the first discrete GPU.
                 OcrVulkan.DeviceSelector = config.VulkanDevice;
+            }
             backend = config.Backend == "vulkan" ? OcrBackend.Vulkan : OcrBackend.Auto;
             if (OcrVulkan.TryProbe() is { } gpu)
             {

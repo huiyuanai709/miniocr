@@ -9,8 +9,10 @@
     TargetFrameworks, so the override is what restore and the outer build see.
     PDFtoImage.Parallel already sets a single TargetFramework of net11.0, so
     it does not need this narrowing. SimdPaddleOCR ships its own nearer
-    Directory.Build.targets and does not import this file. Inner builds
-    already have TargetFramework set, so they are left alone.
+    Directory.Build.targets and does not import this file. Leave that project
+    on net10.0 and netstandard2.0; this net11 host consumes the net10.0 asset.
+    Do not add a TargetFramework override for Sdcb.SimdPaddleOCR or SimdOnnx.
+    Inner builds already have TargetFramework set, so they are left alone.
   -->
   <PropertyGroup Condition="'$(MSBuildProjectName)' == 'PDFtoImage' and $([System.String]::Copy('$(MSBuildProjectDirectory)').Replace('\','/').EndsWith('external/PDFtoImage/src/PDFtoImage')) and '$(TargetFramework)' == ''">
     <TargetFrameworks>net11.0</TargetFrameworks>
