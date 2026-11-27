@@ -37,7 +37,11 @@ public sealed class OcrRuntimeConfig
     public string Backend { get; init; } = "cpu";
     /// <summary>Recognizer intra-op threads per engine. <c>0</c> lets the library choose.</summary>
     public int RecIntraOpThreads { get; init; } = 1;
-    /// <summary>Vulkan device index or name substring. Empty picks the first discrete GPU.</summary>
+    /// <summary>
+    /// Forwarded to <c>OcrVulkan.DeviceSelector</c>. The pinned library ignores
+    /// that selector and uses the first discrete GPU, so this does not choose a card.
+    /// Give the process one visible device instead.
+    /// </summary>
     public string VulkanDevice { get; init; } = "";
     public int DetLimitSideLength { get; init; }
     public bool AutoScaleFromCpu { get; init; }

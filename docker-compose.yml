@@ -1,6 +1,7 @@
 # Eight processes, one host GPU each.
-# NVIDIA_VISIBLE_DEVICES hides the other cards, so Vulkan index 0 inside
-# every container is that service's host card. Do not set vulkanDevice to 1–7.
+# The library ignores OcrVulkan.DeviceSelector and uses the first discrete GPU.
+# NVIDIA_VISIBLE_DEVICES hides the other cards, so that GPU is this service's
+# host card. Do not set vulkanDevice to 1–7.
 name: miniocr
 
 x-miniocr: &miniocr

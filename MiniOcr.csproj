@@ -61,10 +61,14 @@
          executable as a worker (CoreCLR startup hook, Native AOT module initializer). -->
     <ProjectReference Include="external/PDFtoImage/src/PDFtoImage/PDFtoImage.csproj" />
     <ProjectReference Include="external/PDFtoImage/src/Parallel/Parallel.csproj" />
-    <!-- Pinned fork main @ 1ff78ca. Body OCR is the lightest Chinese bundle,
-         ChineseV6Tiny (PP-OCRv6 tiny), so a laptop CPU or a small GPU can run
-         a single local process. The package is not on NuGet; consume it only
-         through ProjectReference. Default backend stays CPU. -->
+    <!-- Pinned fork main @ b2ec47388ce2244149e482ae357f7211571f9ede
+         (upstream sdcb/SimdPaddleOCR through 91f1d14, package 3.0.0,
+         net10.0 and netstandard2.0). This net11 host references the net10.0
+         asset. Do not retarget the library from external/Directory.Build.targets.
+         Nested external/SimdOnnx is required; init submodules recursively.
+         Body OCR stays the lightest Chinese bundle, ChineseV6Tiny (PP-OCRv6 tiny).
+         The package is not on NuGet; consume it only through ProjectReference.
+         Default backend stays CPU. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
     <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny.csproj" />
   </ItemGroup>

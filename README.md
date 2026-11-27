@@ -158,7 +158,7 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | `MINIOCR_USE_CLS` | `ocr.useCls` | false | 方向分类 |
 | `MINIOCR_RENDER_ANTIALIAS` | `ocr.antiAliasing` | `all` | PDFium 平滑开关：`all` / `none` / `text,images,paths` 的子集。`none` 对应 `RENDER_NO_SMOOTH*`：扫描件从 300 DPI 缩到 96–150 DPI 时按最近邻取样，细笔画会断。只在 CPU 极紧张时才设 `none` |
 | `MINIOCR_OCR_BACKEND` | `ocr.backend` | `cpu` | `cpu` / `auto` / `vulkan` / `metal`。`metal` 仅 macOS |
-| `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空 | 设备序号或名称子串 |
+| `MINIOCR_OCR_VULKAN_DEVICE` | `ocr.vulkanDevice` | 空 | 仍写入 `OcrVulkan.DeviceSelector`。当前库忽略该选择器，使用第一块独显。多卡时让进程只看见一张卡（容器 `device_ids` / `NVIDIA_VISIBLE_DEVICES`） |
 | `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 按核数 | 进程内栅格线程，上限为逻辑核数。`parallel` 时用于回退 |
 | `MINIOCR_RENDER_MODE` | `ocr.renderMode` | `parallel` | `parallel` 或 `inprocess` |
 | `MINIOCR_RENDER_PROCESSES` | `ocr.renderProcesses` | 1–4 | 并行渲染进程数 |
@@ -299,7 +299,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 | 来源 | 说明 |
 | --- | --- |
-| `external/SimdPaddleOCR` | fork `main` @ `1ff78ca` 的 `ProjectReference`（ChineseV6Tiny）。不发布、不引用 NuGet。Apache-2.0 |
+| `external/SimdPaddleOCR` | fork `main` @ `b2ec473`（上游至 `91f1d14`，包 3.0.0，`net10.0`）的 `ProjectReference`（ChineseV6Tiny）。须递归初始化，含 `external/SimdOnnx`。不发布、不引用 NuGet。Apache-2.0 |
 | `external/PDFtoImage` | fork 的 `ProjectReference`（含 `PDFtoImage.Parallel`）。MIT |
 
 ## Docker / 多进程（可选）
@@ -308,7 +308,7 @@ AOT 包请整目录保留可执行文件和 `libSkiaSharp` / `pdfium`。
 
 `gpu0` 是协调进程，同时自己也做识别，监听 `5080`。`gpu1`–`gpu7` 是工作进程，端口 `5081`–`5087`。容器之间用服务名互相访问（`http://gpu0:5080` 等）。
 
-主机上的卡号由 compose 里的 `device_ids` / `NVIDIA_VISIBLE_DEVICES` 决定。容器里只能看到这一张卡，所以每个进程的 `MINIOCR_OCR_VULKAN_DEVICE` 都是 `0`，不要写成 `1`–`7`。
+主机上的卡号由 compose 里的 `device_ids` / `NVIDIA_VISIBLE_DEVICES` 决定。当前库忽略 `OcrVulkan.DeviceSelector`，进程使用第一块独显。容器里只能看到这一张卡，所以那就是本进程的卡。`MINIOCR_OCR_VULKAN_DEVICE` 仍设为 `0`，不要写成 `1`–`7`；写成别的值也不会换卡。
 
 默认镜像基于 Ubuntu 24.04（运行时需要 glibc 2.38 和 `libicu74`）。GitHub Release 里的 linux-x64 zip 另在 Ubuntu 20.04 容器中构建，链接 glibc 2.31。`Dockerfile` 在构建阶段用仓库源码做 `linux-x64` Native AOT 发布，指令集是 AVX-512（`avx512v2`），再把产物放进运行镜像，并带上 Vulkan loader、字体和 PDFium/Skia 依赖。构建前要初始化子模块，否则缺少 `external/SimdPaddleOCR` 和 `external/PDFtoImage`。密钥只从环境变量进入进程，不写进镜像：
 
@@ -351,12 +351,12 @@ MINIOCR_CLUSTER_SPECULATIVE_TAIL=1
 
 同一台机器上直接起 8 个 `MiniOcr` 进程时，每个进程都能看到全部 128 个核和 8 张卡，和容器里的情况不同，有几件事要在启动脚本里做：
 
-- **一卡一进程，并核对枚举顺序。** `MINIOCR_OCR_VULKAN_DEVICE=N` 是 Vulkan 的枚举序号，不一定等于 `nvidia-smi` 的序号（装了 lavapipe 之类软件设备时会错位）。起完后用 `nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv` 核对每张卡恰好一个进程；或者写设备名子串。
+- **一卡一进程。** 当前库忽略 `MINIOCR_OCR_VULKAN_DEVICE` / `OcrVulkan.DeviceSelector`，每个进程都用自己看见的第一块独显。容器用 `device_ids` / `NVIDIA_VISIBLE_DEVICES` 藏起其他卡。本机直接起多个进程时，这个环境变量不会把进程绑到第 N 张卡，必须让该进程的 Vulkan 枚举里只剩下目标卡。起完后用 `nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv` 核对每张卡恰好一个进程。
 - **按 NUMA 绑核绑内存。** 不绑的话 8 个进程各自按 128 核起线程池、GC 堆和渲染进程，互相抢核。`nvidia-smi topo -m` 里每张卡有所属的 NUMA 节点。每个节点留出最后 2 个逻辑核给 CPU OCR 进程，其余核 `taskset` 给该卡的进程，再用 `numactl --membind` 绑内存。进程内 `Environment.ProcessorCount` 跟着 cpuset 变小，`autoScaleFromCpu` 会据此收缩 raster / 渲染进程数。
 - **第 9 个进程走 CPU 后端。** 绑在留出来的核上，`MINIOCR_OCR_BACKEND=cpu`。拉模式按它自己的 pages/s 领页，不会抢走 GPU 上的整批。AVX-512 上 ChineseV6Tiny 是 fp32。不要和 GPU 进程抢同一组核。
 - **渲染位图走 tmpfs。** 渲染进程用 `Path.GetTempPath()` 下的文件做内存映射传位图，默认落在磁盘 `/tmp`，会产生无意义的回写。每个进程设 `TMPDIR=/dev/shm/miniocr-gpuN`（先 `mkdir -p`）。
 - **三处路径所有进程一致。** `MINIOCR_CHALLENGE_RESOURCE_DIR`、`MINIOCR_CLUSTER_SHARED_DIR`、`MINIOCR_CONFIG_PATH` 用同一个绝对路径，worker 才能就地打开 PDF，而不是向协调进程下载。
-- **Vulkan 管线缓存每卡一份。** 8 个进程写同一个缓存文件会互相覆盖，`SIMD_OCR_VK_PIPELINE_CACHE=/var/cache/miniocr/vk-gpuN`。
+- **没有落盘的 Vulkan 管线缓存。** `PipelineCachePath` 为空，`PipelineCacheRestored` 为 false。`SIMD_OCR_VK_PIPELINE_CACHE` 不再生效。
 
 一个可直接套用的片段（`gpu0` 是协调进程，`cpu0` 是第 9 个进程）。每个 NUMA 节点核数 ≤ 4 时不要再往外切核，CPU 进程也就不要起。
 
@@ -382,7 +382,9 @@ for N in 0 1 2 3 4 5 6 7; do
     GPU_CPUS=$(IFS=,; echo "${CPUS[*]:0:${#CPUS[@]}-2}")
     CPU_CPUS+=("${CPUS[@]: -2}")
   fi
-  mkdir -p /dev/shm/miniocr-gpu$N /var/cache/miniocr/vk-gpu$N
+  mkdir -p /dev/shm/miniocr-gpu$N
+  # OcrVulkan.DeviceSelector is ignored: restrict this process to GPU $N first.
+  # The library uses the first discrete device that process can see.
   MINIOCR_CONFIG_PATH=/opt/miniocr/config.json \
   MINIOCR_CLUSTER_ENABLED=1 \
   MINIOCR_CLUSTER_ROLE=$([ $N -eq 0 ] && echo coordinator || echo worker) \
@@ -391,7 +393,7 @@ for N in 0 1 2 3 4 5 6 7; do
   MINIOCR_CLUSTER_COORDINATOR_URL=http://127.0.0.1:5080 \
   MINIOCR_CLUSTER_WORKERS=$WORKERS \
   MINIOCR_CLUSTER_TOKEN=... MINIOCR_LLM_API_KEY=... \
-  MINIOCR_OCR_BACKEND=vulkan MINIOCR_OCR_VULKAN_DEVICE=$N \
+  MINIOCR_OCR_BACKEND=vulkan \
   MINIOCR_ENGINES=8 MINIOCR_LINE_WORKERS=4 MINIOCR_DET_THREADS=4 \
   MINIOCR_DPI=144 \
   MINIOCR_LLM_PAGES_PER_REQUEST=5 \
@@ -399,7 +401,6 @@ for N in 0 1 2 3 4 5 6 7; do
   MINIOCR_CHALLENGE_RESOURCE_DIR=/data/resource \
   MINIOCR_CLUSTER_SHARED_DIR=/var/lib/miniocr/jobs \
   TMPDIR=/dev/shm/miniocr-gpu$N \
-  SIMD_OCR_VK_PIPELINE_CACHE=/var/cache/miniocr/vk-gpu$N \
   numactl --membind=$NODE taskset -c "$GPU_CPUS" ./MiniOcr --urls http://0.0.0.0:$((5080+N)) &
 done
 
